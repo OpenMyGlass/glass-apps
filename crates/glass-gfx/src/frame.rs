@@ -273,9 +273,22 @@ impl Frame {
         std::fs::write(path, bytes).map_err(|e| ImageError(e.to_string()))
     }
 
+    /// Draws the glyphs of `run` in `color` (rasterized with fontdue, source-over).
+    pub fn draw_glyph_run(&mut self, run: &crate::text::GlyphRun<'_>, color: Color) {
+        for g in &run.glyphs {
+            let (m, bitmap) = run.font.rasterize(g.ch, run.size);
+            if m.width == 0 || m.height == 0 {
+                continue;
+            }
+            let gx = g.x + m.xmin;
+            let gy = g.baseline - (m.ymin + m.height as i32);
+            self.blend_coverage(&bitmap, m.width, m.height, gx, gy, color);
+        }
+    }
+
     /// Blends coverage values (`0..=255`, one per pixel, `w` per row) of `color` at
     /// `(x, y)`; used by the text renderer. Parts outside the frame are clipped.
-    pub(crate) fn blend_coverage(
+    pub fn blend_coverage(
         &mut self,
         coverage: &[u8],
         w: usize,
