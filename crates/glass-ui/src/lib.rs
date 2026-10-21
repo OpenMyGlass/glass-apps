@@ -11,6 +11,6 @@ pub mod input;
 pub mod style;
 pub mod timeline;
 
-pub use card::{Card, CardContent, CardId, RenderContext};
+pub use card::{Card, CardContent, CardId, CardImage, RenderContext};
 pub use input::{GestureKind, InputEvent};
 pub use timeline::{Action, Timeline, CARDS_PER_PAD_WIDTH};

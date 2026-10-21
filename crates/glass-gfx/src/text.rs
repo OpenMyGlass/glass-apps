@@ -179,7 +179,9 @@ pub fn draw_box(
 ) -> usize {
     let (ascent, descent) = line_metrics(font, size);
     let step = size * line_height;
-    let fit = if rect.h < ascent + descent {
+    let fit = if step <= 0.0 || !step.is_finite() {
+        max_lines.min(1)
+    } else if rect.h < ascent + descent {
         0
     } else {
         1 + ((rect.h - ascent - descent) / step).floor() as usize

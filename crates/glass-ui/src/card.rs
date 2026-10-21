@@ -30,10 +30,18 @@ pub enum CardContent {
     },
     /// A full-bleed image with a caption in the footer; a placeholder when `image` is `None`.
     Image {
-        image: Option<Arc<Frame>>,
+        image: Option<CardImage>,
         caption: String,
         timestamp_s: i64,
     },
+}
+
+/// An image shown by a card. `id` names the picture: a new picture needs a new id, which is
+/// what tells the timeline to re-render the card (the pixels are not compared).
+#[derive(Clone, Debug)]
+pub struct CardImage {
+    pub id: u64,
+    pub frame: Arc<Frame>,
 }
 
 impl CardContent {
@@ -80,7 +88,7 @@ pub fn clock_text(hour: u8, minute: u8) -> String {
 
 /// Footer time: "just now", "5 minutes ago", "1 hour ago", "yesterday", "3 days ago".
 pub fn relative_time(now_s: i64, then_s: i64) -> String {
-    let age = (now_s - then_s).max(0);
+    let age = now_s.saturating_sub(then_s).max(0);
     let plural = |n: i64, unit: &str| {
         if n == 1 {
             format!("1 {unit} ago")
@@ -128,7 +136,7 @@ pub fn render_key(card: &Card, ctx: &RenderContext) -> u64 {
             timestamp_s,
         } => {
             3u8.hash(&mut h);
-            image.as_ref().map(Arc::as_ptr).hash(&mut h);
+            image.as_ref().map(|i| i.id).hash(&mut h);
             caption.hash(&mut h);
             relative_time(ctx.now_s, *timestamp_s).hash(&mut h);
         }
@@ -196,7 +204,7 @@ pub fn render_card(card: &Card, ctx: &RenderContext, width: u32, height: u32) ->
             timestamp_s,
         } => {
             match image {
-                Some(img) => {
+                Some(CardImage { frame: img, .. }) => {
                     // Cover: scale to fill the card, cropping the longer side.
                     let s = (w / img.width() as f32).max(h / img.height() as f32);
                     let (iw, ih) = (img.width() as f32 * s, img.height() as f32 * s);

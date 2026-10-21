@@ -127,3 +127,33 @@ fn long_body_text_shrinks_and_ellipsizes() {
         }
     }
 }
+
+#[test]
+fn image_render_key_follows_the_image_id_not_its_address() {
+    use glass_gfx::Frame;
+    use glass_ui::card::CardImage;
+    use std::sync::Arc;
+    let card = |id: u64| {
+        let mut f = Frame::new(4, 4);
+        f.fill(Color::WHITE);
+        Card::new(
+            1,
+            CardContent::Image {
+                image: Some(CardImage {
+                    id,
+                    frame: Arc::new(f),
+                }),
+                caption: "c".into(),
+                timestamp_s: 0,
+            },
+        )
+    };
+    assert_eq!(render_key(&card(7), &ctx(0)), render_key(&card(7), &ctx(0)));
+    assert_ne!(render_key(&card(7), &ctx(0)), render_key(&card(8), &ctx(0)));
+}
+
+#[test]
+fn relative_time_survives_extreme_timestamps() {
+    assert_eq!(relative_time(i64::MIN, i64::MAX), "just now");
+    assert!(relative_time(i64::MAX, i64::MIN).ends_with("days ago"));
+}
