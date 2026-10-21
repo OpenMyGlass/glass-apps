@@ -105,7 +105,9 @@ struct Release {
 }
 
 struct Layer {
-    key: u64,
+    /// The render key the layer was painted for; `None` while it is being painted (a
+    /// failed paint leaves it to be painted again).
+    key: Option<u64>,
     id: LayerId,
 }
 
@@ -241,7 +243,7 @@ impl Timeline {
         self.ctx = ctx;
         let stale = self.layers.iter().any(|(id, layer)| {
             self.index_of(*id)
-                .is_some_and(|i| render_key(&self.cards[i], &ctx) != layer.key)
+                .is_some_and(|i| Some(render_key(&self.cards[i], &ctx)) != layer.key)
         });
         if stale {
             self.dirty = true;
@@ -531,7 +533,7 @@ impl Timeline {
         let card_id = self.cards[index].id;
         let key = render_key(&self.cards[index], &self.ctx);
         let id = match self.layers.get(&card_id) {
-            Some(l) if l.key == key => return Ok(l.id),
+            Some(l) if l.key == Some(key) => return Ok(l.id),
             Some(l) => l.id,
             None => {
                 while self.layers.len() >= MAX_RESIDENT_LAYERS {
@@ -543,11 +545,11 @@ impl Timeline {
             }
         };
         // Recorded before painting so that a failed paint does not leak the layer.
-        self.layers.insert(card_id, Layer { key: 0, id });
+        self.layers.insert(card_id, Layer { key: None, id });
         let (card, ctx) = (&self.cards[index], self.ctx);
         comp.paint_layer(id, &mut |p: &mut dyn Painter| paint_card(card, &ctx, p))?;
         self.renders += 1;
-        self.layers.insert(card_id, Layer { key, id });
+        self.layers.insert(card_id, Layer { key: Some(key), id });
         Ok(id)
     }
 

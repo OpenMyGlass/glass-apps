@@ -11,6 +11,9 @@ use glass_gfx::{Color, Compositor, Display, Frame, GfxError, LayerId, Painter, P
 use glow::HasContext;
 use std::collections::HashMap;
 
+/// `GL_MAX_TEXTURE_SIZE` of the PowerVR SGX540; the assertion layer never allows more.
+pub const SGX540_MAX_TEXTURE_SIZE: u32 = 2048;
+
 /// Renderer options.
 #[derive(Clone, Copy, Debug)]
 pub struct GlesOptions {
@@ -48,6 +51,7 @@ pub struct GlInfo {
     pub renderer: String,
     pub version: String,
     pub shading_language: String,
+    /// `GL_MAX_TEXTURE_SIZE` as queried.
     pub max_texture_size: u32,
     /// Whether fragment shaders have `highp` floats.
     pub fragment_highp: bool,
@@ -88,6 +92,8 @@ pub struct GlesCompositor {
     res: Resources,
     screen: Target,
     layers: HashMap<LayerId, Target>,
+    /// Layers dropped while the context could not be made current; freed later.
+    orphans: Vec<Target>,
     next_id: u64,
     options: GlesOptions,
     info: GlInfo,
@@ -133,6 +139,13 @@ impl GlesCompositor {
                 info.version
             )));
         }
+        // With the checks on, the SGX540's limit applies even where the GL allows more
+        // (llvmpipe: 16384), so CI catches textures the device would reject.
+        let max = if options.sgx540_checks {
+            max.min(SGX540_MAX_TEXTURE_SIZE)
+        } else {
+            max
+        };
         let gl = Gl::new(raw, options.sgx540_checks, max);
         let res = Resources::new(gl, max).map_err(gl_err)?;
         let screen = create_target(&res.gl, width, height, true, false).map_err(gl_err)?;
@@ -140,6 +153,7 @@ impl GlesCompositor {
             res,
             screen,
             layers: HashMap::new(),
+            orphans: Vec::new(),
             next_id: 1,
             options,
             info,
@@ -159,6 +173,12 @@ impl GlesCompositor {
 
     pub fn info(&self) -> &GlInfo {
         &self.info
+    }
+
+    /// The texture size limit in use: the queried one, capped at
+    /// [`SGX540_MAX_TEXTURE_SIZE`] when the assertion layer is on.
+    pub fn max_texture_size(&self) -> u32 {
+        self.res.max_texture_size
     }
 
     /// The format a layer was created with.
@@ -182,9 +202,12 @@ impl GlesCompositor {
         f(&self.res.gl)
     }
 
-    fn current(&self) -> Result<(), GfxError> {
+    fn current(&mut self) -> Result<(), GfxError> {
         if !self.egl.is_current() {
             self.egl.make_current().map_err(gl_err)?;
+        }
+        for t in self.orphans.drain(..) {
+            delete_target(&self.res.gl, &t);
         }
         Ok(())
     }
@@ -327,8 +350,15 @@ impl Compositor for GlesCompositor {
 
     fn drop_layer(&mut self, id: LayerId) {
         if let Some(t) = self.layers.remove(&id) {
-            if self.current().is_ok() {
-                delete_target(&self.res.gl, &t);
+            match self.current() {
+                Ok(()) => delete_target(&self.res.gl, &t),
+                Err(e) => {
+                    eprintln!(
+                        "glass-gfx-gles: layer {} kept until the context is current: {e}",
+                        id.0
+                    );
+                    self.orphans.push(t);
+                }
             }
         }
     }
@@ -352,6 +382,8 @@ impl Compositor for GlesCompositor {
             raw.clear_color(bg[0], bg[1], bg[2], bg[3]);
             raw.clear(glow::COLOR_BUFFER_BIT);
         }
+        // The target is an FBO, so pixel row 0 is memory row 0 and no flip is needed. The
+        // window-surface target of M3 needs a y-flip here (GL window row 0 is the bottom).
         self.res.use_program(Which::Texture, sw, sh);
         for p in layers {
             let t = &self.layers[&p.layer];
@@ -413,6 +445,9 @@ impl Drop for GlesCompositor {
     fn drop(&mut self) {
         if self.current().is_err() {
             return;
+        }
+        for t in self.orphans.drain(..) {
+            delete_target(&self.res.gl, &t);
         }
         for (_, t) in self.layers.drain() {
             delete_target(&self.res.gl, &t);

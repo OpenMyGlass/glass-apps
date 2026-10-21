@@ -211,7 +211,8 @@ impl Resources {
         self.atlas.clears
     }
 
-    /// Uses `p` for a target of `w`×`h` pixels (pixel (0,0) is the first row in memory).
+    /// Uses `p` for a target of `w`×`h` pixels (pixel (0,0) is the first row in memory,
+    /// which holds for FBOs; a window surface, M3, needs the y axis flipped).
     pub(crate) fn use_program(&self, which: Which, w: u32, h: u32) {
         let p = self.program(which);
         let raw = self.gl.raw();
@@ -359,6 +360,11 @@ impl GlesPainter<'_> {
             return Ok(None);
         }
         let (w, h) = (m.width as u32, m.height as u32);
+        if w > self.res.atlas.size || h > self.res.atlas.size {
+            // Larger than the whole atlas: not drawn, and no reason to clear the atlas.
+            self.res.atlas.glyphs.insert(key, None);
+            return Ok(None);
+        }
         let (x, y) = self.res.atlas.packer.alloc(w, h).ok_or(())?;
         let gl = &self.res.gl;
         gl.active_texture(0);
@@ -487,7 +493,7 @@ impl Painter for GlesPainter<'_> {
                     self.res.atlas.glyphs.clear();
                     self.res.atlas.clears += 1;
                     self.begin_glyphs(color);
-                    // A glyph larger than the whole atlas is not drawn.
+                    // Fits in an empty atlas (larger glyphs were turned away above).
                     self.glyph(run, pg.ch).unwrap_or(None)
                 }
             };

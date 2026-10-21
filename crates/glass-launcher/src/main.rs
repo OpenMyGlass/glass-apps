@@ -72,6 +72,12 @@ fn parse_args() -> Result<Args, String> {
     if a.headless && a.window {
         return Err("--headless and --window exclude each other".into());
     }
+    if a.headless && a.script.is_none() {
+        return Err("--headless needs --script".into());
+    }
+    if a.headless && a.out.is_none() {
+        return Err("--headless needs --out".into());
+    }
     Ok(a)
 }
 
@@ -178,21 +184,28 @@ fn run_window(_: &Args) -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    let result = parse_args().and_then(|args| {
-        if args.headless {
-            run_headless(&args)
-        } else {
-            run_window(&args)
-        }
-    });
-    match result {
-        Ok(()) => ExitCode::SUCCESS,
+    let args = match parse_args() {
+        Ok(a) => a,
         Err(e) => {
+            // Bad arguments (or --help): the usage text.
             if !e.is_empty() {
                 eprintln!("glass-launcher: {e}");
             }
             eprintln!("{USAGE}");
-            ExitCode::from(2)
+            return ExitCode::from(2);
+        }
+    };
+    let result = if args.headless {
+        run_headless(&args)
+    } else {
+        run_window(&args)
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            // A runtime error (renderer, files, display): the message only.
+            eprintln!("glass-launcher: {e}");
+            ExitCode::FAILURE
         }
     }
 }

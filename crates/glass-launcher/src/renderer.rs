@@ -4,6 +4,9 @@
 //!   EGL or GL failure is a hard error; `software` must be asked for.
 //! - Host builds with GLES support: the default is `gles` when EGL initializes, else
 //!   `software`, with a log line.
+//! - GPU-1 renders GLES frames off screen and reads them back into the display (PNG files,
+//!   the host window), on device builds too; rendering into the device's window surface
+//!   without read-back comes with the Android wrapper (M3).
 //! - Builds without the `gles` feature (the static musl debug build, where `dlopen` cannot
 //!   work): `software` only; asking for `gles` is an error.
 
@@ -28,7 +31,10 @@ impl std::str::FromStr for Renderer {
     }
 }
 
-/// Whether this is a device build (no fallback from GLES).
+/// Whether this is a device build (no fallback from GLES): Android, or Linux on 32- or
+/// 64-bit ARM. This is decided by the target only, so a Linux ARM development board or a
+/// Raspberry Pi counts as a device too; such hosts pass `--renderer software` when they
+/// have no EGL.
 pub const DEVICE_BUILD: bool = cfg!(any(
     target_os = "android",
     all(

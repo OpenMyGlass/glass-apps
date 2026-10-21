@@ -135,25 +135,39 @@ impl EglContext {
                 &[egl::CONTEXT_CLIENT_VERSION, 2, egl::NONE],
             )
             .map_err(|e| egl_err("eglCreateContext", e))?;
-        let surface = if surfaceless_ctx {
-            setup.push_str(", no surface");
-            None
-        } else {
-            setup.push_str(", pbuffer");
-            Some(
-                egl.create_pbuffer_surface(
-                    display,
-                    config,
-                    &[egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE],
-                )
-                .map_err(|e| egl_err("eglCreatePbufferSurface", e))?,
-            )
+        let mut surface = None;
+        let rest = (|| {
+            if surfaceless_ctx {
+                setup.push_str(", no surface");
+            } else {
+                setup.push_str(", pbuffer");
+                surface = Some(
+                    egl.create_pbuffer_surface(
+                        display,
+                        config,
+                        &[egl::WIDTH, 1, egl::HEIGHT, 1, egl::NONE],
+                    )
+                    .map_err(|e| egl_err("eglCreatePbufferSurface", e))?,
+                );
+            }
+            egl.make_current(display, surface, surface, Some(context))
+                .map_err(|e| egl_err("eglMakeCurrent", e))?;
+            // SAFETY: the system's GLES2 library.
+            unsafe { libloading::Library::new(GLES_LIBRARY) }
+                .map_err(|e| format!("cannot load {GLES_LIBRARY}: {e}"))
+        })();
+        let gles = match rest {
+            Ok(g) => g,
+            Err(e) => {
+                // Do not leak the context and surface of a failed set-up.
+                let _ = egl.make_current(display, None, None, None);
+                if let Some(s) = surface {
+                    let _ = egl.destroy_surface(display, s);
+                }
+                let _ = egl.destroy_context(display, context);
+                return Err(e);
+            }
         };
-        egl.make_current(display, surface, surface, Some(context))
-            .map_err(|e| egl_err("eglMakeCurrent", e))?;
-        // SAFETY: the system's GLES2 library.
-        let gles = unsafe { libloading::Library::new(GLES_LIBRARY) }
-            .map_err(|e| format!("cannot load {GLES_LIBRARY}: {e}"))?;
         Ok(EglContext {
             egl,
             display,

@@ -337,23 +337,37 @@ fn text_after_the_atlas_was_refilled() {
     let mut c = compositor();
     let id = c.create_layer(640, 360, true).unwrap();
     let font = fonts::font(Weight::Light);
-    let mut size = 60.0;
-    while c.atlas_clears() == 0 {
-        c.paint_layer(id, &mut |p: &mut dyn Painter| {
+    let line = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let paint_at = |size: f32| {
+        move |p: &mut dyn Painter| {
             p.clear(Color::BLACK);
-            let (run, _) = text::layout_line(
-                font,
-                size,
-                0.0,
-                200.0,
-                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789",
-            );
+            let (run, _) = text::layout_line(font, size, 0.0, 200.0, line);
             p.draw_glyph_run(&run, Color::WHITE);
-        })
-        .unwrap();
+        }
+    };
+    let mut size = 60.0;
+    loop {
+        c.paint_layer(id, &mut paint_at(size)).unwrap();
+        if c.atlas_clears() > 0 {
+            break;
+        }
         size += 3.0;
         assert!(size < 2000.0, "atlas never filled");
     }
+    // The run whose glyphs filled the atlas was drawn partly before and partly after the
+    // refill: it must still match the software path.
+    c.compose(Color::BLACK, &[Placement::at(id, 0, 0)]).unwrap();
+    let mut s = SoftwareCompositor::new(640, 360);
+    let sid = s.create_layer(640, 360, true).unwrap();
+    s.paint_layer(sid, &mut paint_at(size)).unwrap();
+    s.compose(Color::BLACK, &[Placement::at(sid, 0, 0)])
+        .unwrap();
+    compare(
+        &format!("atlas-refill-run-{size}px"),
+        &c.read_frame().unwrap(),
+        s.frame(),
+        Tolerance::Strict,
+    );
     c.drop_layer(id);
     check_golden(
         "text",
@@ -412,7 +426,8 @@ fn image_at_its_own_size_matches_software() {
     );
 }
 
-/// A photo larger than GL_MAX_TEXTURE_SIZE is downscaled on the CPU before upload (the
+/// A photo larger than the texture limit (2048, the SGX540's, with the checks on) is
+/// downscaled on the CPU before upload (the
 /// assertion layer would reject the upload otherwise); a smooth image stays close to the
 /// software path, which filters the full-size image.
 #[test]
@@ -421,7 +436,12 @@ fn large_photo_is_downscaled_before_upload() {
         return;
     }
     let mut c = compositor();
-    let max = c.info().max_texture_size;
+    let max = c.max_texture_size();
+    assert_eq!(
+        max,
+        2048.min(c.info().max_texture_size),
+        "SGX540 limit under checks"
+    );
     let card = image_card(gradient(max + 952, (max + 952) * 2 / 3));
     let g = render_card_gles(&mut c, &card);
     let s = render_card(&card, &ctx(), 640, 360);
@@ -464,7 +484,7 @@ fn sgx540_assertion_layer_rejects_violations() {
         return;
     }
     let mut c = compositor();
-    let max = c.info().max_texture_size;
+    let max = c.max_texture_size();
     let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         c.with_gl(|gl| gl.generate_mipmap())
     }));
