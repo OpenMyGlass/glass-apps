@@ -6,7 +6,7 @@ Roadmap phase R5 of OpenMyGlass ([glass-rom roadmap](https://github.com/OpenMyGl
 
 - **No Android dependency in the apps.** The UI and app logic run on route 1 (open Android) and route 2 (plain Linux). They talk to Glass services only through the [glass-services interface](https://github.com/OpenMyGlass/glass-services/blob/main/docs/api.md), and draw only through a thin graphics layer.
 - **Android glue in its own module** (later milestone): the launcher wrapper (a `HOME` activity that hands its `Surface` to the native UI), intents to open Android apps, and the camera and audio paths that need Android services.
-- **Hardware:** two Cortex-A9 at up to 1 GHz, SGX540 (GLES2) on Android only; on plain Linux the PowerVR user-space libraries do not work (they are built for bionic), so rendering is in software there. The display is 640×360.
+- **Hardware:** two Cortex-A9 at up to 1 GHz, SGX540 (GLES2). The UI renders on the GPU on both routes: on Android through the PowerVR libraries, on plain Linux through libhybris loading the same libraries (owner decision 2026-10-22, see [`2026-10-22-gpu-rendering.md`](2026-10-22-gpu-rendering.md)). The display is 640×360.
 - **Clean room:** Glass behaviour comes from public documentation (GDK reference, Glass design guidelines: cards, timeline, menus, typography); no stock APK is decompiled for this phase.
 
 ## Decisions
@@ -15,14 +15,16 @@ Roadmap phase R5 of OpenMyGlass ([glass-rom roadmap](https://github.com/OpenMyGl
 
 The same as glass-services ([its plan](https://github.com/OpenMyGlass/glass-services/blob/main/docs/plans/2026-10-21-r4-glass-services.md)), so the apps use the `glass-api` crate directly, and one toolchain cross-builds both repos.
 
-### UI: our own small card renderer on a software framebuffer
+### UI: our own small card renderer
+
+> **Changed on 2026-10-22:** the owner decided that the UI renders on the GPU on every system. The GLES2 back end is now the primary renderer and the software path below is for tests, host development and debugging. See [`2026-10-22-gpu-rendering.md`](2026-10-22-gpu-rendering.md).
 
 | Option | For | Against |
 |---|---|---|
 | **Own renderer** on `tiny-skia` (BSD-3-Clause) and `fontdue` (MIT, Apache-2.0 or Zlib) (chosen) | Pure Rust, no C dependencies, cross-builds trivially; the Glass UI is simple (full-screen cards, large text, images, a horizontal timeline); a retained layer per card makes scrolling a blit; deterministic output, so tests compare pixels | We write layout and animation ourselves |
 | Slint | Declarative, embedded-friendly, software renderer | On embedded devices the choice is GPLv3 or a paid licence (the royalty-free licence excludes embedded systems): awkward for an Apache-2.0 project others may redistribute |
 | LVGL | MIT, made for software rendering on small CPUs | C: the UI would be written in C or through immature bindings |
-| Qt, GTK, Flutter | Complete toolkits | Large; need GLES for good performance, which plain Linux lacks |
+| Qt, GTK, Flutter | Complete toolkits | Large; heavy dependency trees for a 640×360 card UI |
 | egui, iced | Rust | Immediate mode (egui) redraws everything each frame; iced pulls in winit and a large dependency tree |
 
 The cost of software rendering at 640×360: one frame is 230,400 pixels (900 KiB in RGBA8888). A card is rendered once into its own layer; while the timeline scrolls, a frame is two layer blits, a few milliseconds on a Cortex-A9 (blits are plain memory copies). Text and images are drawn only when a card changes. tiny-skia has SIMD only for x86 and AArch64, so on armv7 card rendering runs its scalar path: it must stay off the scroll path (cards are rendered ahead, when they change or come next to the visible one), and only the visible card and its neighbours keep a layer (about 900 KiB each), so memory stays bounded.
@@ -35,10 +37,10 @@ The `glass-gfx` crate defines a `Frame` (an RGBA8888 pixel buffer of the display
 |---|---|---|
 | Headless (PNG files, in-memory) | tests, CI | M1 |
 | Host window (`minifb`, behind a Cargo feature) | development on a desktop, with the keyboard driving gestures through the mock | M1 |
-| Linux framebuffer (`/dev/fb0`, `mmap`, the pixel format reported by `FBIOGET_VSCREENINFO`; double buffering through `yres_virtual` and `FBIOPAN_DISPLAY`, `FBIO_WAITFORVSYNC` when the driver has it; one conversion pass from premultiplied RGBA to the panel's format per frame, measured) | route 2 | M2 |
+| Linux framebuffer, debug fallback only (`/dev/fb0`, `mmap`, the pixel format reported by `FBIOGET_VSCREENINFO`; double buffering through `yres_virtual` and `FBIOPAN_DISPLAY`, `FBIO_WAITFORVSYNC` when the driver has it; one conversion pass from premultiplied RGBA to the panel's format per frame, measured) | route 2 | M2 |
 | DRM dumb buffers (`omapdrm`) | route 2 on a mainline kernel (glass-mainline) | later |
-| Android `ANativeWindow` (software lock and post), in the Android glue | route 1 | M3 |
-| GLES2 (upload the frame or the card layers as textures) | route 1, if measurements show the software path is too slow or too costly in battery | later, optional |
+| Android `ANativeWindow` (EGL window surface for the GLES2 renderer; software lock and post only as a debug fallback), in the Android glue | route 1 | M3 |
+| GLES2 (card layers as textures, scrolling as textured quads) | **primary renderer** on routes 1 and 2 (libhybris on route 2); host tests on Mesa | GPU-1, see [`2026-10-22-gpu-rendering.md`](2026-10-22-gpu-rendering.md) |
 
 ### Fonts
 
@@ -69,7 +71,9 @@ Glass used Roboto Light and Thin. We bundle **Inter** (Rasmus Andersson, SIL Ope
 
 ## Later milestones
 
-- **M2:** settings (head wake, wink, screen timeout through `SetSettings`; Wi-Fi and Bluetooth through a small platform trait), Linux framebuffer back end, menus.
+- **GPU-1** (before M1b): the GLES2 renderer becomes the primary path, see [`2026-10-22-gpu-rendering.md`](2026-10-22-gpu-rendering.md).
+- **M1b:** the launcher connects to `glassd` (see item 3 above).
+- **M2:** settings (head wake, wink, screen timeout through `SetSettings`; Wi-Fi and Bluetooth through a small platform trait), menus; the Linux framebuffer back end only as a debug fallback.
 - **M3:** Android glue (launcher wrapper, `ANativeWindow`, intents), setup (pairing with the OpenMyGlass phone app), dictation.
 - **M4:** camera (through the platform: Android camera API or V4L2/Ducati on Linux), voice hotword and commands.
 
