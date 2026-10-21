@@ -15,8 +15,8 @@
 
 use crate::App;
 use glass_api::proto::{
-    client_frame, screen_request, service_frame, GestureKind as ProtoKind, Screen, ScreenRequest,
-    ScreenState, ServiceFrame, Settings, Topic,
+    client_frame, screen_request, service_frame, ErrorCode, GestureKind as ProtoKind, Screen,
+    ScreenRequest, ScreenState, ServiceFrame, Settings, Topic,
 };
 use glass_api::{Client, ClientError};
 use glass_gfx::{Display, GfxError};
@@ -160,6 +160,11 @@ impl Session {
     /// Connects, says hello, subscribes and asks for the input focus.
     pub fn connect(path: &Path) -> Result<Session, ClientError> {
         let mut client = Client::connect_as(path, CLIENT_NAME)?;
+        if client.welcome().api_version < 1 {
+            return Err(ClientError::Handshake(Box::new(ServiceFrame {
+                body: Some(service_frame::Body::Welcome(client.welcome().clone())),
+            })));
+        }
         client.subscribe(&TOPICS)?;
         client.acquire_focus()?;
         Ok(Session {
@@ -216,13 +221,23 @@ impl Session {
             return Ok(());
         }
         match body {
-            service_frame::Body::FocusState(f) => self.focused = f.focused,
+            service_frame::Body::FocusState(f) => {
+                // glassd sends FocusState{false} before the final Scroll{ended, cancelled},
+                // which is then no longer ours: end the touch here.
+                if self.focused && !f.focused {
+                    app.cancel_touch();
+                }
+                self.focused = f.focused;
+            }
             service_frame::Body::ScreenState(s) => apply_screen(app, &s),
             service_frame::Body::Settings(s) => self.settings = Some(s),
-            service_frame::Body::Error(e) => self.log.push(format!(
-                "glassd error {}: {} (seq {})",
-                e.code, e.message, e.seq
-            )),
+            service_frame::Body::Error(e) => {
+                let code = ErrorCode::try_from(e.code)
+                    .map(|c| c.as_str_name().to_string())
+                    .unwrap_or_else(|_| format!("error code {}", e.code));
+                self.log
+                    .push(format!("glassd {code}: {} (seq {})", e.message, e.seq));
+            }
             // Wear and the rest: subscribed for later milestones.
             _ => {}
         }
@@ -238,7 +253,8 @@ impl Session {
         };
         self.handle(first, app)?;
         n += 1;
-        // Frames already in the buffer or the socket, without waiting.
+        // Frames already decoded or already in the socket: a 1 µs deadline reads what is
+        // there and does not wait for more.
         while let Some(f) = self.client.recv(Some(Duration::from_micros(1)))? {
             self.handle(f, app)?;
             n += 1;
@@ -332,13 +348,26 @@ pub fn run<D: Display>(
                     path.display(),
                     d.as_millis()
                 ));
-                // Keep the clock current while waiting (no input arrives).
-                step(app, display)?;
-                std::thread::sleep(options.max_wait.map_or(d, |m| d.min(m)));
+                // Until the retry: keep the clock current (no input arrives) and, with a
+                // window, its events polled every `max_wait`.
+                let retry_at = Instant::now() + d;
+                loop {
+                    step(app, display)?;
+                    let left = retry_at.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    std::thread::sleep(options.max_wait.map_or(left, |m| left.min(m)));
+                    if !keep_going(display) {
+                        return Ok(());
+                    }
+                }
                 continue;
             }
         };
         options.backoff.reset();
+        // A touch from before the connection was lost never ends: drop it.
+        app.cancel_touch();
         log(&format!(
             "connected to glassd at {} (capabilities: {})",
             path.display(),

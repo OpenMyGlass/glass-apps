@@ -374,6 +374,36 @@ fn input_pauses_while_another_client_holds_the_focus() {
     });
 }
 
+#[test]
+fn focus_loss_mid_drag_returns_the_drag_to_its_start() {
+    let (m, mut s, mut a) = connected();
+    let home = a.timeline().home_index();
+    m.publish_body(Body::Scroll(Scroll {
+        displacement: 0.35,
+        delta: 0.35,
+        fingers: 1,
+        timestamp_us: 2,
+        ..Default::default()
+    }));
+    pump_until(&mut s, &mut a, |_, a| {
+        a.timeline().position() > home as f32 + 0.5
+    });
+    // An app takes the focus mid-touch: glassd sends FocusState{false}, then the final
+    // Scroll{ended, cancelled}, which the launcher no longer accepts as input.
+    let mut other = Client::connect_as(m.path(), "an-app").unwrap();
+    other.subscribe(&[Topic::Gesture]).unwrap();
+    other.acquire_focus().unwrap();
+    pump_until(&mut s, &mut a, |s, _| !s.focused());
+    pump_for(&mut s, &mut a, Duration::from_millis(200));
+    a.step(1.0, ctx());
+    assert!(
+        !a.is_animating(),
+        "settled: the loop does not keep waking at 60 Hz"
+    );
+    assert_eq!(a.timeline().current_index(), home);
+    assert_eq!(a.timeline().position(), home as f32);
+}
+
 // ---- the loop: reconnection ----
 
 /// Points `link` at `target` (a symlink, so the launcher's socket path stays the same while
@@ -403,6 +433,15 @@ fn the_loop_reconnects_when_glassd_restarts() {
             })
         };
         let connected_first = named(&first);
+        // A touch is in progress when glassd goes away: its end never arrives.
+        first.publish_body(Body::Scroll(Scroll {
+            displacement: 0.2,
+            delta: 0.2,
+            fingers: 1,
+            timestamp_us: 2,
+            ..Default::default()
+        }));
+        std::thread::sleep(Duration::from_millis(200));
         // glassd goes away; a new one comes up at the same path.
         drop(first);
         std::thread::sleep(Duration::from_millis(300));
@@ -452,4 +491,38 @@ fn the_loop_reconnects_when_glassd_restarts() {
     );
     assert!(display.presented() >= 1);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without glassd, a window keeps being polled every `max_wait` while the loop waits for
+/// the next attempt, and each real attempt is logged once with its true delay.
+#[test]
+fn waiting_to_reconnect_keeps_polling_and_logs_each_attempt_once() {
+    let missing = std::env::temp_dir().join(format!("glass-no-glassd-{}.sock", std::process::id()));
+    let mut a = App::new(demo::timeline(), ctx());
+    let mut display = HeadlessDisplay::new(640, 360);
+    let start = Instant::now();
+    let mut polls = 0u32;
+    let mut lines = vec![];
+    run(
+        &missing,
+        &mut a,
+        &mut display,
+        ctx,
+        LoopOptions {
+            fps: 60,
+            max_wait: Some(Duration::from_millis(10)),
+            backoff: Backoff::new(Duration::from_millis(200), Duration::from_millis(400)),
+        },
+        |_: &mut HeadlessDisplay| {
+            polls += 1;
+            start.elapsed() < Duration::from_millis(500)
+        },
+        |l| lines.push(l.to_string()),
+    )
+    .unwrap();
+    let attempts: Vec<&String> = lines.iter().filter(|l| l.contains("unavailable")).collect();
+    assert_eq!(attempts.len(), 2, "{lines:#?}");
+    assert!(attempts[0].contains("retrying in 200 ms"), "{lines:#?}");
+    assert!(attempts[1].contains("retrying in 400 ms"), "{lines:#?}");
+    assert!(polls >= 20, "polled {polls} times");
 }

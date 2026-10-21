@@ -4,7 +4,8 @@
 //! glass-launcher --headless --script FILE --out DIR [--fps N] [--time HH:MM] [--now UNIX_S]
 //!                [--renderer gles|software]
 //! glass-launcher [--window] [--time HH:MM] [--renderer gles|software]   (needs `window`)
-//! glass-launcher --glassd [SOCKET] [--out DIR | --window] [--time HH:MM] [--renderer R]
+//! glass-launcher --glassd [SOCKET] [--out DIR | --window] [--fps N] [--time HH:MM]
+//!                [--renderer R]
 //! ```
 
 use glass_gfx::HeadlessDisplay;
@@ -20,7 +21,8 @@ usage:
   glass-launcher --headless --script FILE --out DIR [--fps N] [--time HH:MM] [--now UNIX_S]
                  [--renderer gles|software]
   glass-launcher [--window] [--time HH:MM] [--renderer gles|software]   (needs the `window` feature)
-  glass-launcher --glassd [SOCKET] [--out DIR | --window] [--time HH:MM] [--renderer R]
+  glass-launcher --glassd [SOCKET] [--out DIR | --window] [--fps N] [--time HH:MM]
+                 [--renderer R]
 
   --headless      run a mock input script and write the frames as PNG files
   --script FILE   commands in the glassd --mock syntax (tap, swipe forward, scroll 0.3, wait 200ms, ...)
@@ -32,7 +34,9 @@ usage:
                   Enter/Space = tap, Down = swipe down, Up = swipe up, Esc = quit
   --glassd [SOCK] take input and the screen state from glassd (glass-services); SOCKET
                   defaults to $GLASS_SERVICES_SOCKET, else the platform's glassd socket.
-                  Frames go to --out DIR as PNG files, to a --window, or nowhere (memory).
+                  Frames go to --out DIR as PNG files (every changed frame, without a
+                  limit: for short development runs), to a --window, or nowhere (memory).
+                  --fps is the frame rate while the timeline moves (default 60).
                   Reconnects when glassd restarts
   --renderer R    gles (GPU, the default) or software (debugging aid). On the device a
                   failing EGL is an error; on a host without EGL the default is software";

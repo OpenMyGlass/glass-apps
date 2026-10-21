@@ -98,6 +98,12 @@ impl App {
         self.shown = false;
     }
 
+    /// Ends a touch whose end will not arrive (focus lost, glassd gone); see
+    /// [`glass_ui::Timeline::cancel_touch`].
+    pub fn cancel_touch(&mut self) {
+        self.timeline.cancel_touch();
+    }
+
     /// Whether the timeline is moving (frames are due at the frame rate).
     pub fn is_animating(&self) -> bool {
         !self.timeline.is_settled()
