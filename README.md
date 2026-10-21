@@ -11,7 +11,7 @@ Plans and decisions are in [`docs/plans/`](docs/plans/).
 | [`glass-gfx`](crates/glass-gfx) | The `Painter` (draw commands) and `Compositor` (layers, frames) traits; text layout into whole-pixel glyph runs shared by both renderers (single line, wrapping, ellipsis); the software renderer: `Frame` (RGBA8888, premultiplied), `SkiaPainter` (tiny-skia, fontdue), `SoftwareCompositor`; the `Display` trait with a headless back end (memory, PNG files) and a host window back end (`window` feature, minifb) |
 | [`glass-gfx-gles`](crates/glass-gfx-gles) | The GLES2 renderer: EGL and GLES loaded at run time (khronos-egl, glow), off-screen contexts (Mesa surfaceless or pbuffer), `GlesPainter` (distance-function rounded rects, CPU-downscaled image textures, ALPHA glyph atlas), `GlesCompositor` (FBO texture layers), the SGX540 assertion layer |
 | [`glass-ui`](crates/glass-ui) | Cards (home clock, text, settings entry, image) in Glass style, drawn through `Painter`; the timeline: gestures, live drag from `Scroll`, settle animation, cached per-card layers through `Compositor` (at most 4); `InputEvent` mirroring the glass-services messages |
-| [`glass-launcher`](crates/glass-launcher) | The launcher binary: mock scripts headless, or a host window driven by the keyboard; `--renderer gles\|software`. Connecting to `glassd` through `glass-api` comes in a later change |
+| [`glass-launcher`](crates/glass-launcher) | The launcher binary: a `glassd` client (`--glassd`, through glass-services' `glass-api`: focus, gestures, screen state, reconnection), mock scripts headless, or a host window driven by the keyboard; `--renderer gles\|software` |
 
 ## Running on a desktop
 
@@ -30,6 +30,19 @@ Headless, with a mock script in the `glassd --mock` syntax (`tap`, `swipe forwar
 ```sh
 cargo run -p glass-launcher -- --headless --script examples/demo.script --out /tmp/frames --time 10:42
 ```
+
+### Against `glassd --mock`
+
+The launcher takes its input and the screen state from `glassd` of [glass-services](https://github.com/OpenMyGlass/glass-services) with `--glassd [SOCKET]` (default: `$GLASS_SERVICES_SOCKET`, else `/run/glassd/glassd.sock` on Linux and `/dev/socket/glassd` on Android). On a desktop, in two terminals (keep the socket path short: Unix socket paths are limited to about 100 bytes):
+
+```sh
+# terminal 1, in a glass-services checkout: type commands such as tap, swipe forward, swipe down, scroll 0.3
+cargo run -p glassd -- --mock --socket /tmp/glassd.sock -v
+# terminal 2, here: a host window (or --out DIR for PNG files, or neither)
+cargo run -p glass-launcher --features window -- --glassd /tmp/glassd.sock
+```
+
+In this mode the keyboard does nothing; `glassd` owns the screen: a one-finger swipe down on the home card sends `ScreenRequest{ACTION_SLEEP}`, nothing is drawn while the screen is off, and on a wake the launcher shows the home card unless the last sleep was a timeout or a gesture (nudge, two-finger swipe down) at most 5 s ago (a swipe wake always shows home). Input is ignored while another client holds the input focus. If `glassd` goes away the launcher reconnects, with a delay from 100 ms doubling up to 5 s. The loop blocks on the socket: one frame at a time while the timeline moves, until the next minute (the home clock) at rest, and with no timeout while the screen is off. `tools/e2e_glassd.sh GLASSD LAUNCHER` runs a scripted session (CI runs it in the `host` job against glassd built at the pinned revision).
 
 ## Tests
 
@@ -72,8 +85,12 @@ The device builds (`armv7-linux-androideabi`, `armv7-unknown-linux-gnueabihf`, `
 | khronos-egl (GLES builds) | MIT OR Apache-2.0 |
 | glow (GLES builds) | MIT OR Apache-2.0 OR Zlib |
 | libloading (GLES builds) | ISC |
+| glass-api (glass-services, pinned git revision) | Apache-2.0 |
+| prost | Apache-2.0 |
+| bytes | MIT |
+| anyhow, either, itertools | MIT OR Apache-2.0 |
 
-The host window back end (`window` feature, not part of device builds) adds minifb (MIT OR Apache-2.0) and, on Linux, X11 and Wayland client crates (MIT; ISC for libloading; Unlicense OR MIT for memchr; MIT OR Apache-2.0 with the Unicode-3.0 terms for unicode-ident). `tools/check_licenses.sh` checks the full dependency tree of each build in CI against this permissive set.
+The host window back end (`window` feature, not part of device builds) adds minifb (MIT OR Apache-2.0) and, on Linux, X11 and Wayland client crates (MIT; ISC for libloading; Unlicense OR MIT for memchr; MIT OR Apache-2.0 with the Unicode-3.0 terms for unicode-ident). glass-api generates its message types at build time with prost-build and protox (no `protoc`); these run on the build host only (Apache-2.0, MIT OR Apache-2.0, Unlicense OR MIT for memchr and aho-corasick, and prost-derive's proc-macro crates). `tools/check_licenses.sh` checks the full dependency tree of each build in CI against this permissive set.
 
 Fonts: Inter 4.1 Light, SIL Open Font License 1.1, in [`assets/fonts/`](assets/fonts/) with the licence and the checksums of the release files.
 

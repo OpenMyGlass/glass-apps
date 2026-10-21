@@ -43,6 +43,12 @@ jobs:
         with:
           name: demo-frames
           path: frames/
+      - name: End-to-end with glassd --mock (glass-services at the pinned rev)
+        run: |
+          rev=$(sed -n 's/^glass-api = .*rev = "\([0-9a-f]*\)".*/\1/p' Cargo.toml)
+          echo "glass-services rev: $rev"
+          cargo install --locked --git https://github.com/OpenMyGlass/glass-services --rev "$rev" glassd --root target/glassd
+          tools/e2e_glassd.sh target/glassd/bin/glassd target/release/glass-launcher
       - name: Licences of the dependencies
         run: |
           tools/check_licenses.sh -p glass-launcher --target x86_64-unknown-linux-gnu --features window
