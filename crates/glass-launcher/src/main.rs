@@ -4,12 +4,13 @@
 //! glass-launcher --headless --script FILE --out DIR [--fps N] [--time HH:MM] [--now UNIX_S]
 //!                [--renderer gles|software]
 //! glass-launcher [--window] [--time HH:MM] [--renderer gles|software]   (needs `window`)
+//! glass-launcher --glassd [SOCKET] [--out DIR | --window] [--time HH:MM] [--renderer R]
 //! ```
 
 use glass_gfx::HeadlessDisplay;
 use glass_launcher::renderer::{compositor_for, Renderer};
 use glass_launcher::script::{parse, Runner};
-use glass_launcher::{clock, demo, App};
+use glass_launcher::{clock, demo, glassd, App};
 use glass_ui::RenderContext;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,6 +20,7 @@ usage:
   glass-launcher --headless --script FILE --out DIR [--fps N] [--time HH:MM] [--now UNIX_S]
                  [--renderer gles|software]
   glass-launcher [--window] [--time HH:MM] [--renderer gles|software]   (needs the `window` feature)
+  glass-launcher --glassd [SOCKET] [--out DIR | --window] [--time HH:MM] [--renderer R]
 
   --headless      run a mock input script and write the frames as PNG files
   --script FILE   commands in the glassd --mock syntax (tap, swipe forward, scroll 0.3, wait 200ms, ...)
@@ -28,6 +30,10 @@ usage:
   --now UNIX_S    fixed 'now' for relative times (default: the demo time with --time, else now)
   --window        open a 640x360 host window: Left/Right = swipe backward/forward,
                   Enter/Space = tap, Down = swipe down, Up = swipe up, Esc = quit
+  --glassd [SOCK] take input and the screen state from glassd (glass-services); SOCKET
+                  defaults to $GLASS_SERVICES_SOCKET, else the platform's glassd socket.
+                  Frames go to --out DIR as PNG files, to a --window, or nowhere (memory).
+                  Reconnects when glassd restarts
   --renderer R    gles (GPU, the default) or software (debugging aid). On the device a
                   failing EGL is an error; on a host without EGL the default is software";
 
@@ -41,12 +47,19 @@ struct Args {
     time: Option<(u8, u8)>,
     now: Option<i64>,
     renderer: Option<Renderer>,
+    /// `--glassd`, with the socket if one was given.
+    glassd: Option<Option<PathBuf>>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut a = Args::default();
-    let mut it = std::env::args().skip(1);
+    let mut it = std::env::args().skip(1).peekable();
     while let Some(arg) = it.next() {
+        if arg == "--glassd" {
+            let sock = it.next_if(|v| !v.starts_with("--")).map(PathBuf::from);
+            a.glassd = Some(sock);
+            continue;
+        }
         let mut value = |name: &str| it.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
             "--headless" => a.headless = true,
@@ -68,6 +81,12 @@ fn parse_args() -> Result<Args, String> {
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if a.glassd.is_some() && (a.headless || a.script.is_some()) {
+        return Err("--glassd excludes --headless and --script".into());
+    }
+    if a.glassd.is_some() && a.window && a.out.is_some() {
+        return Err("--glassd takes --out or --window, not both".into());
     }
     if a.headless && a.window {
         return Err("--headless and --window exclude each other".into());
@@ -183,6 +202,78 @@ fn run_window(_: &Args) -> Result<(), String> {
     )
 }
 
+fn run_glassd(args: &Args) -> Result<(), String> {
+    let path = glassd::socket(args.glassd.clone().flatten());
+    let clock = clock_for(args);
+    let ctx = clock(0.0);
+    let compositor = compositor_for(args.renderer)?;
+    let mut app = App::with_compositor(demo::timeline_at(ctx.now_s), ctx, compositor);
+    let log = |line: &str| eprintln!("glass-launcher: {line}");
+    let mut options = glassd::LoopOptions {
+        fps: args.fps.unwrap_or(60),
+        ..Default::default()
+    };
+    if args.window {
+        return glassd_window(&path, &mut app, clock, options);
+    }
+    let mut display = HeadlessDisplay::new(glass_gfx::GLASS_WIDTH, glass_gfx::GLASS_HEIGHT);
+    if let Some(out) = &args.out {
+        display = display.with_output_dir(out).map_err(|e| e.to_string())?;
+    }
+    options.max_wait = None;
+    glassd::run(
+        &path,
+        &mut app,
+        &mut display,
+        || clock(0.0),
+        options,
+        |_: &mut HeadlessDisplay| true,
+        log,
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(feature = "window")]
+fn glassd_window(
+    path: &std::path::Path,
+    app: &mut App,
+    clock: impl Fn(f32) -> RenderContext,
+    mut options: glassd::LoopOptions,
+) -> Result<(), String> {
+    use glass_gfx::window::WindowDisplay;
+    let mut display = WindowDisplay::new(
+        "glass-launcher (glassd)",
+        glass_gfx::GLASS_WIDTH,
+        glass_gfx::GLASS_HEIGHT,
+    )
+    .map_err(|e| e.to_string())?;
+    // The window's events must be polled: wait on the socket at most one frame.
+    options.max_wait = Some(std::time::Duration::from_millis(16));
+    glassd::run(
+        path,
+        app,
+        &mut display,
+        || clock(0.0),
+        options,
+        |d: &mut WindowDisplay| {
+            d.poll();
+            d.is_open()
+        },
+        |line| eprintln!("glass-launcher: {line}"),
+    )
+    .map_err(|e| e.to_string())
+}
+
+#[cfg(not(feature = "window"))]
+fn glassd_window(
+    _: &std::path::Path,
+    _: &mut App,
+    _: impl Fn(f32) -> RenderContext,
+    _: glassd::LoopOptions,
+) -> Result<(), String> {
+    Err("this build has no window support: rebuild with --features window".into())
+}
+
 fn main() -> ExitCode {
     let args = match parse_args() {
         Ok(a) => a,
@@ -195,7 +286,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.headless {
+    let result = if args.glassd.is_some() {
+        run_glassd(&args)
+    } else if args.headless {
         run_headless(&args)
     } else {
         run_window(&args)
