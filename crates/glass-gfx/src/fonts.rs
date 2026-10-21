@@ -1,30 +1,24 @@
-//! The bundled Inter fonts (SIL Open Font License 1.1, see `assets/fonts/`).
+//! The bundled Inter font (SIL Open Font License 1.1, see `assets/fonts/`).
 
 use fontdue::{Font, FontSettings};
 use std::sync::OnceLock;
 
-/// A bundled font weight.
+/// A bundled font weight. Only Light is bundled today; other weights of Inter can be added
+/// to `assets/fonts/` when the UI uses them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Weight {
-    Thin,
     Light,
-    Regular,
 }
 
-static THIN: &[u8] = include_bytes!("../../../assets/fonts/Inter-Thin.ttf");
 static LIGHT: &[u8] = include_bytes!("../../../assets/fonts/Inter-Light.ttf");
-static REGULAR: &[u8] = include_bytes!("../../../assets/fonts/Inter-Regular.ttf");
-
-fn load(bytes: &'static [u8]) -> Font {
-    Font::from_bytes(bytes, FontSettings::default()).expect("bundled font parses")
-}
 
 /// The bundled font of weight `w`, parsed once.
 pub fn font(w: Weight) -> &'static Font {
-    static CELLS: [OnceLock<Font>; 3] = [OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static LIGHT_FONT: OnceLock<Font> = OnceLock::new();
     match w {
-        Weight::Thin => CELLS[0].get_or_init(|| load(THIN)),
-        Weight::Light => CELLS[1].get_or_init(|| load(LIGHT)),
-        Weight::Regular => CELLS[2].get_or_init(|| load(REGULAR)),
+        Weight::Light => LIGHT_FONT.get_or_init(|| {
+            Font::from_bytes(LIGHT, FontSettings::default()).expect("bundled font parses")
+        }),
     }
 }

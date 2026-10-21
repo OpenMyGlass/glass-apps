@@ -15,7 +15,7 @@ fn lit_pixels(f: &Frame) -> usize {
 
 #[test]
 fn bundled_fonts_load() {
-    for w in [Weight::Thin, Weight::Light, Weight::Regular] {
+    for w in [Weight::Light] {
         let font = fonts::font(w);
         assert!(text::measure(font, 32.0, "Hello") > 0.0);
     }
@@ -53,7 +53,7 @@ fn draw_line_draws_inside_its_box_only() {
 
 #[test]
 fn draw_line_clips_at_frame_edges() {
-    let font = fonts::font(Weight::Regular);
+    let font = fonts::font(Weight::Light);
     let mut f = Frame::new(50, 30);
     f.fill(Color::BLACK);
     // Partly off every edge: must not panic.
@@ -179,4 +179,22 @@ fn text_rendering_is_deterministic() {
         f.data().to_vec()
     };
     assert_eq!(render(), render());
+}
+
+#[test]
+fn draw_box_with_zero_line_height_draws_one_line() {
+    let font = fonts::font(Weight::Light);
+    let mut f = Frame::new(200, 100);
+    let n = text::draw_box(
+        &mut f,
+        font,
+        32.0,
+        0.0,
+        Rect::new(0.0, 0.0, 200.0, 100.0),
+        "one two three four five six",
+        Color::WHITE,
+        Align::Left,
+        usize::MAX,
+    );
+    assert_eq!(n, 1);
 }

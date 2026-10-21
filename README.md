@@ -43,7 +43,7 @@ CI (`.github/workflows/ci.yml`): `host` (format, clippy with and without the win
 ## Design notes
 
 - **Timeline:** home in the middle, "now" cards and settings on the backward side, history on the forward side. A drag across the whole touchpad width moves 2 cards; a release settles on the nearest card after projecting the release velocity 0.15 s ahead, and a release faster than 0.5 pad widths/s moves at least one card. The swipe gesture that follows a drag (glass-services sends both) is not counted twice. Animations are ease-out cubic over 0.12 s + 0.12 s per card (at most 0.45 s), advanced only by `tick(dt)`, so they are deterministic. Details in [`timeline.rs`](crates/glass-ui/src/timeline.rs).
-- **Rendering:** each card renders once into its own 640×360 layer and is re-rendered only when what it shows changes (content, clock minute, relative time text). At rest, the neighbours of the visible card are rendered ahead and other layers are dropped (at most three, about 900 KiB each); a scrolling frame is two row copies, with no card rendering.
+- **Rendering:** each card renders once into its own 640×360 layer and is re-rendered only when what it shows changes (content, clock minute, relative time text). At rest, the neighbours of the visible card are rendered ahead and other layers are dropped (at rest at most three, about 900 KiB each; a fling across several cards renders the cards it passes and holds their layers until the next rest); a scrolling frame is two row copies, with no card rendering.
 - **Style:** after the public Glass design guidelines: black background, white Inter Light text, 40 px margins, body text sized 64/48/40/34 px to fit, footer in 26 px grey with the source on the left and the relative time on the right.
 
 ## Third-party code
@@ -66,7 +66,7 @@ The device builds (`armv7-linux-androideabi`, `armv7-unknown-linux-musleabihf`) 
 
 The host window back end (`window` feature, not part of device builds) adds minifb (MIT OR Apache-2.0) and, on Linux, X11 and Wayland client crates (MIT; ISC for libloading; Unlicense OR MIT for memchr; MIT OR Apache-2.0 with the Unicode-3.0 terms for unicode-ident). `tools/check_licenses.sh` checks the full dependency tree of each build in CI against this permissive set.
 
-Fonts: Inter 4.1, SIL Open Font License 1.1, in [`assets/fonts/`](assets/fonts/) with the licence and the checksums of the release files.
+Fonts: Inter 4.1 Light, SIL Open Font License 1.1, in [`assets/fonts/`](assets/fonts/) with the licence and the checksums of the release files.
 
 ## License
 
