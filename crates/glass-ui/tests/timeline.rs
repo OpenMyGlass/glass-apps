@@ -670,3 +670,41 @@ fn removed_cards_free_their_layers() {
     assert_eq!(c.layer_count(), t.cached_layers());
     assert_eq!(c.layer_count(), 3);
 }
+
+// ---- jumps (screen wake and sleep) ----
+
+#[test]
+fn show_home_jumps_without_animation() {
+    let mut t = timeline();
+    t.handle(&gesture(GestureKind::SwipeForward));
+    settle(&mut t);
+    t.handle(&gesture(GestureKind::SwipeForward));
+    assert!(!t.is_settled());
+    t.show_home();
+    assert!(t.is_settled());
+    assert_eq!(current_id(&t), 10);
+    assert_eq!(t.position(), t.home_index() as f32);
+}
+
+#[test]
+fn stop_motion_lands_on_the_card_being_approached() {
+    let mut t = timeline();
+    t.handle(&scroll(0.7 / CARDS_PER_PAD_WIDTH, 0.0, false));
+    t.stop_motion();
+    assert!(t.is_settled());
+    assert_eq!(
+        current_id(&t),
+        11,
+        "dragged 0.7 card: the next card is nearest"
+    );
+    t.handle(&scroll(-0.3 / CARDS_PER_PAD_WIDTH, 0.0, false));
+    t.stop_motion();
+    assert_eq!(
+        current_id(&t),
+        11,
+        "dragged back 0.3 card: still the same card"
+    );
+    t.handle(&gesture(GestureKind::SwipeForward));
+    t.stop_motion();
+    assert_eq!(current_id(&t), 12, "an animation ends on its target");
+}

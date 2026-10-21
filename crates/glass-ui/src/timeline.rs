@@ -331,6 +331,30 @@ impl Timeline {
         true
     }
 
+    /// Shows the home card at once, without animation (for a screen wake).
+    pub fn show_home(&mut self) {
+        let home = self.home_index();
+        self.jump_to(home);
+    }
+
+    /// Ends any drag or animation at once on the card it was heading to (for a screen
+    /// that turns off mid-motion).
+    pub fn stop_motion(&mut self) {
+        let to = self.current_index();
+        self.jump_to(to);
+    }
+
+    fn jump_to(&mut self, index: usize) {
+        self.drag = None;
+        self.release = None;
+        self.anim = None;
+        self.target = index;
+        if self.pos != index as f32 {
+            self.pos = index as f32;
+            self.dirty = true;
+        }
+    }
+
     /// Animates back to the home card.
     pub fn go_home(&mut self) {
         let home = self.home_index();
