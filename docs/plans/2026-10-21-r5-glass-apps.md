@@ -15,7 +15,9 @@ Roadmap phase R5 of OpenMyGlass ([glass-rom roadmap](https://github.com/OpenMyGl
 
 The same as glass-services ([its plan](https://github.com/OpenMyGlass/glass-services/blob/main/docs/plans/2026-10-21-r4-glass-services.md)), so the apps use the `glass-api` crate directly, and one toolchain cross-builds both repos.
 
-### UI: our own small card renderer on a software framebuffer
+### UI: our own small card renderer
+
+> **Changed on 2026-10-22:** the owner decided that the UI renders on the GPU on every system. The GLES2 back end is now the primary renderer and the software path below is for tests, host development and debugging. See [`2026-10-22-gpu-rendering.md`](2026-10-22-gpu-rendering.md).
 
 | Option | For | Against |
 |---|---|---|
@@ -35,10 +37,10 @@ The `glass-gfx` crate defines a `Frame` (an RGBA8888 pixel buffer of the display
 |---|---|---|
 | Headless (PNG files, in-memory) | tests, CI | M1 |
 | Host window (`minifb`, behind a Cargo feature) | development on a desktop, with the keyboard driving gestures through the mock | M1 |
-| Linux framebuffer (`/dev/fb0`, `mmap`, the pixel format reported by `FBIOGET_VSCREENINFO`; double buffering through `yres_virtual` and `FBIOPAN_DISPLAY`, `FBIO_WAITFORVSYNC` when the driver has it; one conversion pass from premultiplied RGBA to the panel's format per frame, measured) | route 2 | M2 |
+| Linux framebuffer, debug fallback only (`/dev/fb0`, `mmap`, the pixel format reported by `FBIOGET_VSCREENINFO`; double buffering through `yres_virtual` and `FBIOPAN_DISPLAY`, `FBIO_WAITFORVSYNC` when the driver has it; one conversion pass from premultiplied RGBA to the panel's format per frame, measured) | route 2 | M2 |
 | DRM dumb buffers (`omapdrm`) | route 2 on a mainline kernel (glass-mainline) | later |
-| Android `ANativeWindow` (software lock and post), in the Android glue | route 1 | M3 |
-| GLES2 (upload the frame or the card layers as textures) | route 1, if measurements show the software path is too slow or too costly in battery | later, optional |
+| Android `ANativeWindow` (EGL window surface for the GLES2 renderer; software lock and post only as a debug fallback), in the Android glue | route 1 | M3 |
+| GLES2 (card layers as textures, scrolling as textured quads) | **primary renderer** on routes 1 and 2 (libhybris on route 2); host tests on Mesa | GPU-1, see [`2026-10-22-gpu-rendering.md`](2026-10-22-gpu-rendering.md) |
 
 ### Fonts
 
