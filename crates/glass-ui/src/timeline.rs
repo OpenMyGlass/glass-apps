@@ -19,11 +19,16 @@
 //!   CARDS_PER_PAD_WIDTH × FLING_PROJECTION_S)`; a release faster than
 //!   [`FLING_MIN_VELOCITY`] moves at least one card in its direction. A cancelled touch
 //!   returns to the card where the drag started.
+//!   A fast release against the direction of the drag returns to the drag's start.
 //! - **Swipe after a drag:** glass-services sends a horizontal swipe as Scroll frames, the
-//!   final `Scroll{ended}`, then the `SWIPE_*` gesture. A swipe within
-//!   [`SWIPE_AFTER_SCROLL_S`] of a release is the same touch: it makes sure the settle target
-//!   is at least one card away from the drag's start in its direction, and is not counted a
-//!   second time. A swipe without a drag moves one card; swipes during an animation add up.
+//!   final `Scroll{ended}`, then the `SWIPE_*` gesture. The first gesture after a
+//!   non-cancelled `Scroll{ended}`, with no new `Scroll` between them, is the same touch
+//!   (unless their timestamps are more than [`SAME_TOUCH_US`] apart): it makes sure the
+//!   settle target is at least one card away from the drag's start in its direction, and is
+//!   not counted a second time. A swipe without a drag moves one card; swipes during an
+//!   animation add up.
+//! - **Fingers:** only one-finger gestures act (`glassd` handles the two-finger swipe down
+//!   itself); `Scroll` is followed with any number of fingers.
 //! - **Animation:** from the current position to the target with an ease-out cubic curve over
 //!   `min(0.12 s + 0.12 s × distance, 0.45 s)`. Time only advances through [`Timeline::tick`],
 //!   so animation is deterministic for any sequence of time steps and lands exactly on the
@@ -35,8 +40,9 @@
 //! one or two layer copies at the scroll offset. A layer is re-rendered only when its
 //! [`crate::card::render_key`] changes (content, clock minute, relative time text). When the
 //! timeline is at rest, the cards next to the visible one are rendered ahead and layers
-//! farther away are dropped, so a drag never renders a card and memory stays at about three
-//! layers (about 900 KiB each at 640×360).
+//! farther away are dropped, so a drag between neighbours never renders a card. At rest at
+//! most three layers are kept (about 900 KiB each at 640×360); a fling across several cards
+//! renders the cards it passes on demand and holds their layers until the next rest.
 
 use crate::card::{render_card, render_key, Card, CardContent, CardId, RenderContext};
 use crate::input::{GestureKind, InputEvent};
@@ -49,8 +55,10 @@ pub const CARDS_PER_PAD_WIDTH: f32 = 2.0;
 pub const FLING_PROJECTION_S: f32 = 0.15;
 /// Release velocity (pad widths per second) above which at least one card is moved.
 pub const FLING_MIN_VELOCITY: f32 = 0.5;
-/// Time after a release within which a swipe gesture belongs to the same touch.
-pub const SWIPE_AFTER_SCROLL_S: f32 = 0.1;
+/// Largest gap between a `Scroll{ended}` and a swipe gesture of the same touch, by their
+/// event timestamps (both are sent at the finger lift; this only guards against a lost
+/// gesture making a later swipe look like the same touch).
+pub const SAME_TOUCH_US: u64 = 200_000;
 /// Fraction of the drag applied past either end of the timeline.
 pub const EDGE_RESISTANCE: f32 = 0.3;
 /// Largest overscroll past either end, in cards.
@@ -84,7 +92,7 @@ struct Drag {
 #[derive(Clone, Copy, Debug)]
 struct Release {
     start_index: usize,
-    age: f32,
+    timestamp_us: u64,
 }
 
 struct Layer {
@@ -245,19 +253,28 @@ impl Timeline {
 
     fn insert_at(&mut self, at: usize, card: Card) {
         self.cards.insert(at, card);
+        // Card indices: every card at or after `at` moves up by one.
         let shift = |i: usize| if i >= at { i + 1 } else { i };
         self.target = shift(self.target);
-        let moves = self.pos >= at as f32 - 0.5;
-        if moves {
+        if let Some(d) = &mut self.drag {
+            d.start_index = shift(d.start_index);
+        }
+        if let Some(r) = &mut self.release {
+            r.start_index = shift(r.start_index);
+        }
+        // Positions: keep the card that covers most of the screen where it is. Between two
+        // cards the new one appears on the side that shows less.
+        if self.pos >= at as f32 - 0.5 {
             self.pos += 1.0;
             if let Some(a) = &mut self.anim {
                 a.from += 1.0;
-                a.to += 1.0;
             }
             if let Some(d) = &mut self.drag {
                 d.start_pos += 1.0;
-                d.start_index = shift(d.start_index);
             }
+        }
+        if let Some(a) = &mut self.anim {
+            a.to = self.target as f32;
         }
         self.dirty = true;
     }
@@ -315,16 +332,43 @@ impl Timeline {
                 velocity,
                 ended,
                 cancelled,
+                timestamp_us,
                 ..
             } => {
-                self.on_scroll(displacement, velocity, ended, cancelled);
+                self.on_scroll(displacement, velocity, ended, cancelled, timestamp_us);
                 None
             }
-            InputEvent::Gesture { kind, .. } => self.on_gesture(kind),
+            InputEvent::Gesture {
+                kind,
+                fingers,
+                timestamp_us,
+                ..
+            } => {
+                // The scroll touch, if any, is over with this gesture.
+                let release = self.release.take();
+                // One-finger gestures only: glassd keeps the two-finger swipe down for
+                // itself, and multi-finger taps and swipes have no timeline meaning yet.
+                if fingers != 1 {
+                    return None;
+                }
+                let release = release.filter(|r| {
+                    r.timestamp_us == 0
+                        || timestamp_us == 0
+                        || timestamp_us.saturating_sub(r.timestamp_us) <= SAME_TOUCH_US
+                });
+                self.on_gesture(kind, release)
+            }
         }
     }
 
-    fn on_scroll(&mut self, displacement: f32, velocity: f32, ended: bool, cancelled: bool) {
+    fn on_scroll(
+        &mut self,
+        displacement: f32,
+        velocity: f32,
+        ended: bool,
+        cancelled: bool,
+        timestamp_us: u64,
+    ) {
         let drag = *self.drag.get_or_insert(Drag {
             start_pos: self.pos,
             start_index: self.target,
@@ -344,18 +388,23 @@ impl Timeline {
         let v = velocity * CARDS_PER_PAD_WIDTH;
         let projected = self.pos + v * FLING_PROJECTION_S;
         let mut to = self.clamp_index(projected.round());
-        if velocity.abs() >= FLING_MIN_VELOCITY && to == drag.start_index {
-            to = self.step(drag.start_index, velocity > 0.0);
+        if velocity.abs() >= FLING_MIN_VELOCITY {
+            let dragged = self.pos - drag.start_index as f32;
+            if dragged != 0.0 && (dragged > 0.0) != (velocity > 0.0) {
+                // A flick back against the drag: return to where the drag started.
+                to = drag.start_index;
+            } else if to == drag.start_index {
+                to = self.step(drag.start_index, velocity > 0.0);
+            }
         }
         self.release = Some(Release {
             start_index: drag.start_index,
-            age: 0.0,
+            timestamp_us,
         });
         self.animate_to(to);
     }
 
-    fn on_gesture(&mut self, kind: GestureKind) -> Option<Action> {
-        let release = self.release.take();
+    fn on_gesture(&mut self, kind: GestureKind, release: Option<Release>) -> Option<Action> {
         match kind {
             GestureKind::SwipeForward | GestureKind::SwipeBackward => {
                 let forward = kind == GestureKind::SwipeForward;
@@ -439,12 +488,6 @@ impl Timeline {
     /// Advances time by `dt` seconds.
     pub fn tick(&mut self, dt: f32) {
         let dt = dt.max(0.0);
-        if let Some(r) = &mut self.release {
-            r.age += dt;
-            if r.age > SWIPE_AFTER_SCROLL_S {
-                self.release = None;
-            }
-        }
         if let Some(a) = &mut self.anim {
             a.elapsed += dt;
             let t = (a.elapsed / a.duration).min(1.0);
@@ -478,6 +521,14 @@ impl Timeline {
     /// the timeline's size). At rest, also renders the neighbouring cards ahead and drops
     /// layers that are no longer near.
     pub fn render(&mut self, frame: &mut Frame) {
+        assert!(
+            (frame.width(), frame.height()) == (self.width, self.height),
+            "frame size {}x{} differs from the timeline's {}x{}",
+            frame.width(),
+            frame.height(),
+            self.width,
+            self.height
+        );
         let w = self.width as i32;
         let base = self.pos.floor();
         let first = base as i64;

@@ -225,19 +225,6 @@ fn swipe_after_a_short_scroll_still_moves_one_card() {
 }
 
 #[test]
-fn a_later_swipe_after_the_window_is_counted() {
-    let mut t = timeline();
-    let d = 0.7 / CARDS_PER_PAD_WIDTH;
-    t.handle(&scroll(d, 0.0, false));
-    t.handle(&scroll(d, 0.0, true));
-    settle(&mut t);
-    assert_eq!(current_id(&t), 11);
-    t.handle(&gesture(GestureKind::SwipeForward));
-    settle(&mut t);
-    assert_eq!(current_id(&t), 12);
-}
-
-#[test]
 fn cancelled_scroll_returns_to_where_it_started() {
     let mut t = timeline();
     let d = 0.9 / CARDS_PER_PAD_WIDTH;
@@ -468,4 +455,133 @@ fn mid_scroll_frame_shows_both_cards_side_by_side() {
             assert_eq!(a.pixel(x, y), home.pixel(x + 320, y), "at {x},{y}");
         }
     }
+}
+
+// ---- review fixes ----
+
+#[test]
+fn insert_during_an_animation_keeps_target_and_position_together() {
+    let mut t = timeline();
+    t.handle(&gesture(GestureKind::SwipeForward));
+    settle(&mut t);
+    assert_eq!(current_id(&t), 11);
+    t.handle(&gesture(GestureKind::SwipeBackward));
+    t.tick(0.03); // position between home (2) and 11 (3)
+    t.insert_history(text(14, "brand new"));
+    assert_eq!(current_id(&t), 10, "still heading home");
+    settle(&mut t);
+    assert_eq!(current_id(&t), 10);
+    assert_eq!(t.position(), t.home_index() as f32);
+}
+
+#[test]
+fn insert_during_a_drag_keeps_the_dragged_cards() {
+    let mut t = timeline();
+    let d = 0.3 / CARDS_PER_PAD_WIDTH;
+    t.handle(&scroll(d, 0.0, false)); // home dragged 0.3 toward 11
+    t.insert_history(text(14, "brand new"));
+    // The cards under the finger stay home and the card next to it is now 14.
+    let home = t.home_index() as f32;
+    assert!(
+        (t.position() - (home + 0.3)).abs() < 1e-4,
+        "{}",
+        t.position()
+    );
+    t.handle(&scroll(d, 0.0, true));
+    settle(&mut t);
+    assert_eq!(current_id(&t), 10, "a short drag springs back to home");
+}
+
+#[test]
+fn insert_on_the_backward_side_during_a_drag_after_a_swipe() {
+    let mut t = timeline();
+    t.handle(&gesture(GestureKind::SwipeForward));
+    settle(&mut t);
+    let d = 0.7 / CARDS_PER_PAD_WIDTH;
+    t.handle(&scroll(d, 0.0, false));
+    t.insert_backward(text(3, "now 2"));
+    t.handle(&scroll(d, 0.0, true));
+    settle(&mut t);
+    assert_eq!(current_id(&t), 12);
+}
+
+#[test]
+fn swipe_after_a_scroll_is_one_touch_even_after_a_slow_frame() {
+    let mut t = timeline();
+    let d = 0.6 / CARDS_PER_PAD_WIDTH;
+    t.handle(&scroll(d, 0.0, false));
+    t.handle(&scroll(d, 0.8, true));
+    t.tick(0.12);
+    t.handle(&gesture(GestureKind::SwipeForward));
+    settle(&mut t);
+    assert_eq!(current_id(&t), 11, "one card, not two");
+}
+
+#[test]
+fn swipe_long_after_a_scroll_by_timestamp_is_a_new_touch() {
+    let mut t = timeline();
+    let d = 0.6 / CARDS_PER_PAD_WIDTH;
+    t.handle(&InputEvent::Scroll {
+        displacement: d,
+        delta: d,
+        velocity: 0.0,
+        fingers: 1,
+        ended: true,
+        cancelled: false,
+        timestamp_us: 1_000_000,
+    });
+    t.handle(&InputEvent::Gesture {
+        kind: GestureKind::SwipeForward,
+        fingers: 1,
+        velocity: 1.0,
+        timestamp_us: 3_000_000,
+    });
+    settle(&mut t);
+    assert_eq!(current_id(&t), 12, "the drag's card, then one more");
+}
+
+#[test]
+fn a_tap_ends_the_scroll_touch() {
+    let mut t = timeline();
+    let d = 0.7 / CARDS_PER_PAD_WIDTH;
+    t.handle(&scroll(d, 0.0, false));
+    t.handle(&scroll(d, 0.0, true));
+    settle(&mut t);
+    t.handle(&gesture(GestureKind::Tap));
+    t.handle(&gesture(GestureKind::SwipeForward));
+    settle(&mut t);
+    assert_eq!(current_id(&t), 12);
+}
+
+#[test]
+fn only_one_finger_gestures_act() {
+    let mut t = timeline();
+    let two = |kind| InputEvent::Gesture {
+        kind,
+        fingers: 2,
+        velocity: 0.0,
+        timestamp_us: 0,
+    };
+    assert_eq!(t.handle(&two(GestureKind::Tap)), None);
+    assert_eq!(t.handle(&two(GestureKind::SwipeDown)), None);
+    t.handle(&two(GestureKind::SwipeForward));
+    settle(&mut t);
+    assert_eq!(current_id(&t), 10);
+}
+
+#[test]
+fn flick_against_the_drag_returns_to_the_start() {
+    let mut t = timeline();
+    let d = 0.7 / CARDS_PER_PAD_WIDTH;
+    t.handle(&scroll(d, 0.0, false));
+    t.handle(&scroll(d, -1.0, true));
+    settle(&mut t);
+    assert_eq!(current_id(&t), 10);
+}
+
+#[test]
+#[should_panic(expected = "frame size")]
+fn render_rejects_a_frame_of_the_wrong_size() {
+    let mut t = timeline();
+    t.render(&mut Frame::new(10, 10));
 }
