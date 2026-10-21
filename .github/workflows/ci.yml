@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  host:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Window back-end build dependencies (minifb, X11 and Wayland)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libxkbcommon-dev libwayland-dev libxcursor-dev libx11-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo clippy --workspace --all-targets --locked --features glass-launcher/window -- -D warnings
+      - run: cargo test --workspace --locked
+      - name: Golden images that did not match
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-actual
+          path: target/golden-actual/
+          if-no-files-found: ignore
+      - name: Benchmarks (reported, not enforced)
+        run: cargo test --release --locked -p glass-ui --test bench -- --ignored --nocapture
+      - name: Headless demo
+        run: |
+          cargo run --release --locked -p glass-launcher -- --headless --script examples/demo.script --out frames --time 10:42
+          ls frames | head
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-frames
+          path: frames/
+      - name: Licences of the dependencies
+        run: |
+          tools/check_licenses.sh -p glass-launcher --target x86_64-unknown-linux-gnu --features window
+          tools/check_licenses.sh -p glass-launcher --target armv7-linux-androideabi
+          tools/check_licenses.sh -p glass-launcher --target armv7-unknown-linux-musleabihf
+
+  android-armv7:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with the runner's NDK (API 22)
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "NDK: $NDK"
+          export CARGO_TARGET_ARMV7_LINUX_ANDROIDEABI_LINKER="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi22-clang"
+          cargo build --release --locked --target armv7-linux-androideabi -p glass-launcher
+          file target/armv7-linux-androideabi/release/glass-launcher
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glass-launcher-armv7-linux-androideabi
+          path: target/armv7-linux-androideabi/release/glass-launcher
+
+  linux-armv7:
+    runs-on: ubuntu-latest
+    env:
+      # Static musl binary linked with the LLD that ships with Rust; no C toolchain needed.
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_LINKER: rust-lld
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_MUSLEABIHF_RUNNER: qemu-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
+      - run: cargo build --release --locked --target armv7-unknown-linux-musleabihf -p glass-launcher
+      - run: file target/armv7-unknown-linux-musleabihf/release/glass-launcher
+      - name: Tests on armv7 under QEMU (golden images included)
+        run: cargo test --locked --target armv7-unknown-linux-musleabihf --workspace
+      - name: Golden images that did not match
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-actual-armv7
+          path: target/golden-actual/
+          if-no-files-found: ignore
+      - name: Headless demo on armv7 under QEMU
+        run: qemu-arm target/armv7-unknown-linux-musleabihf/release/glass-launcher --headless --script examples/demo.script --out frames --time 10:42
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glass-launcher-armv7-unknown-linux-musleabihf
+          path: target/armv7-unknown-linux-musleabihf/release/glass-launcher

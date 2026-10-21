@@ -34,6 +34,7 @@ pub fn parse_hh_mm(s: &str) -> Option<(u8, u8)> {
 }
 
 #[cfg(unix)]
+#[allow(deprecated)] // libc::time_t on musl: 32-bit until the libc crate follows musl 1.2
 fn local_hour_minute(now_s: i64) -> (u8, u8) {
     let t = now_s as libc::time_t;
     // SAFETY: localtime_r writes only into `tm`, which outlives the call.
