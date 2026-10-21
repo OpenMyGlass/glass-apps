@@ -5,7 +5,7 @@
 # Usage: tools/check_licenses.sh [cargo tree arguments...]
 set -eu
 allowed=' MIT Apache-2.0 LLVM-exception BSD-2-Clause BSD-3-Clause Zlib ISC 0BSD Unlicense Unicode-3.0 '
-cargo tree -e normal,build --prefix none --format '{p}|{l}' "$@" | sed 's/ (\*)$//' | sort -u >"${TMPDIR:-/tmp}/glass-licences.txt"
+cargo tree --color never -e normal,build --prefix none --format '{p}|{l}' "$@" | sed 's/ (\*)$//' | sort -u >"${TMPDIR:-/tmp}/glass-licences.txt"
 status=0
 while IFS='|' read -r pkg lic; do
   case "$pkg" in glass-*) continue ;; esac
