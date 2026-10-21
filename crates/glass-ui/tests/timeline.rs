@@ -1,4 +1,6 @@
-use glass_gfx::Frame;
+use glass_gfx::Compositor;
+use glass_gfx::SoftwareCompositor;
+use glass_ui::timeline::MAX_RESIDENT_LAYERS;
 use glass_ui::{
     Action, Card, CardContent, GestureKind, InputEvent, RenderContext, Timeline,
     CARDS_PER_PAD_WIDTH,
@@ -350,13 +352,13 @@ fn removing_a_card_keeps_a_valid_position() {
 fn render_draws_and_counts_card_renders() {
     let mut t = timeline();
     t.set_context(ctx());
-    let mut f = Frame::glass();
+    let mut f = SoftwareCompositor::glass();
     assert!(t.needs_redraw());
-    t.render(&mut f);
+    t.render(&mut f).unwrap();
     assert!(!t.needs_redraw());
     // Visible card plus its two neighbours are rendered ahead.
     assert_eq!(t.render_count(), 3);
-    t.render(&mut f);
+    t.render(&mut f).unwrap();
     assert_eq!(t.render_count(), 3, "nothing changed, nothing re-rendered");
 }
 
@@ -364,14 +366,14 @@ fn render_draws_and_counts_card_renders() {
 fn scrolling_between_prepared_cards_does_not_rerender() {
     let mut t = timeline();
     t.set_context(ctx());
-    let mut f = Frame::glass();
-    t.render(&mut f);
+    let mut f = SoftwareCompositor::glass();
+    t.render(&mut f).unwrap();
     let before = t.render_count();
     for i in 1..=20 {
         let d = 0.04 * i as f32 / 20.0;
         t.handle(&scroll(d, 0.0, false));
         assert!(t.needs_redraw());
-        t.render(&mut f);
+        t.render(&mut f).unwrap();
     }
     assert_eq!(
         t.render_count(),
@@ -384,14 +386,14 @@ fn scrolling_between_prepared_cards_does_not_rerender() {
 fn layers_are_bounded_to_the_neighbourhood() {
     let mut t = timeline();
     t.set_context(ctx());
-    let mut f = Frame::glass();
+    let mut f = SoftwareCompositor::glass();
     for _ in 0..3 {
         t.handle(&gesture(GestureKind::SwipeForward));
         while !t.is_settled() {
             t.tick(1.0 / 60.0);
-            t.render(&mut f);
+            t.render(&mut f).unwrap();
         }
-        t.render(&mut f);
+        t.render(&mut f).unwrap();
         assert!(t.cached_layers() <= 3, "{} layers", t.cached_layers());
     }
 }
@@ -400,8 +402,8 @@ fn layers_are_bounded_to_the_neighbourhood() {
 fn changing_a_card_rerenders_only_that_card() {
     let mut t = timeline();
     t.set_context(ctx());
-    let mut f = Frame::glass();
-    t.render(&mut f);
+    let mut f = SoftwareCompositor::glass();
+    t.render(&mut f).unwrap();
     let before = t.render_count();
     assert!(t.update_card(
         11,
@@ -412,7 +414,7 @@ fn changing_a_card_rerenders_only_that_card() {
         }
     ));
     assert!(t.needs_redraw());
-    t.render(&mut f);
+    t.render(&mut f).unwrap();
     assert_eq!(t.render_count(), before + 1);
 }
 
@@ -420,15 +422,15 @@ fn changing_a_card_rerenders_only_that_card() {
 fn clock_change_rerenders_only_home() {
     let mut t = timeline();
     t.set_context(ctx());
-    let mut f = Frame::glass();
-    t.render(&mut f);
+    let mut f = SoftwareCompositor::glass();
+    t.render(&mut f).unwrap();
     let before = t.render_count();
     // Same minute, later second: relative times of the text cards still read the same.
     t.set_context(RenderContext {
         now_s: 1_061,
         ..ctx()
     });
-    t.render(&mut f);
+    t.render(&mut f).unwrap();
     assert_eq!(t.render_count(), before);
     t.set_context(RenderContext {
         minute: 43,
@@ -436,7 +438,7 @@ fn clock_change_rerenders_only_home() {
         ..ctx()
     });
     assert!(t.needs_redraw());
-    t.render(&mut f);
+    t.render(&mut f).unwrap();
     assert_eq!(t.render_count(), before + 1);
 }
 
@@ -444,15 +446,15 @@ fn clock_change_rerenders_only_home() {
 fn mid_scroll_frame_shows_both_cards_side_by_side() {
     let mut t = timeline();
     t.set_context(ctx());
-    let mut a = Frame::glass();
-    t.render(&mut a);
-    let home = a.clone();
+    let mut a = SoftwareCompositor::glass();
+    t.render(&mut a).unwrap();
+    let home = a.frame().clone();
     t.handle(&scroll(0.5 / CARDS_PER_PAD_WIDTH, 0.0, false));
-    t.render(&mut a);
+    t.render(&mut a).unwrap();
     // The right half of home is now on the left half of the screen.
     for y in (0..360).step_by(7) {
         for x in (0..320).step_by(7) {
-            assert_eq!(a.pixel(x, y), home.pixel(x + 320, y), "at {x},{y}");
+            assert_eq!(a.frame().pixel(x, y), home.pixel(x + 320, y), "at {x},{y}");
         }
     }
 }
@@ -583,5 +585,88 @@ fn flick_against_the_drag_returns_to_the_start() {
 #[should_panic(expected = "frame size")]
 fn render_rejects_a_frame_of_the_wrong_size() {
     let mut t = timeline();
-    t.render(&mut Frame::new(10, 10));
+    let _ = t.render(&mut SoftwareCompositor::new(10, 10));
+}
+
+// ---- resident layers (GPU memory bound) ----
+
+/// Home and twelve history cards.
+fn long_timeline() -> Timeline {
+    Timeline::new(
+        vec![],
+        Card::new(10, CardContent::Home),
+        (0..12).map(|i| text(100 + i, "history")).collect(),
+    )
+}
+
+#[test]
+fn a_long_fling_never_holds_more_than_the_resident_limit() {
+    let mut t = long_timeline();
+    t.set_context(ctx());
+    let mut c = SoftwareCompositor::glass();
+    t.render(&mut c).unwrap();
+    // A fast drag across many cards, rendered every frame.
+    for i in 1..=60 {
+        t.handle(&scroll(
+            4.0 * i as f32 / 60.0 / CARDS_PER_PAD_WIDTH,
+            0.0,
+            false,
+        ));
+        t.render(&mut c).unwrap();
+        assert!(
+            t.cached_layers() <= MAX_RESIDENT_LAYERS,
+            "{}",
+            t.cached_layers()
+        );
+        assert_eq!(c.layer_count(), t.cached_layers(), "no layer leaks");
+    }
+    t.handle(&scroll(4.0 / CARDS_PER_PAD_WIDTH, 3.0, true));
+    while !t.is_settled() {
+        t.tick(1.0 / 60.0);
+        t.render(&mut c).unwrap();
+        assert!(t.cached_layers() <= MAX_RESIDENT_LAYERS);
+    }
+    t.render(&mut c).unwrap();
+    assert_eq!(
+        t.cached_layers(),
+        3,
+        "at rest: the card and its two neighbours"
+    );
+    assert_eq!(c.layer_count(), 3);
+}
+
+#[test]
+fn eviction_drops_the_farthest_layer_and_returning_repaints_it() {
+    let mut t = long_timeline();
+    t.set_context(ctx());
+    let mut c = SoftwareCompositor::glass();
+    t.render(&mut c).unwrap(); // home (0) and 1 painted
+    let before = t.render_count();
+    // Drag forward 3.5 cards without releasing: cards 0..=4 are reached.
+    for i in 1..=35 {
+        t.handle(&scroll(0.1 * i as f32 / CARDS_PER_PAD_WIDTH, 0.0, false));
+        t.render(&mut c).unwrap();
+    }
+    assert!(t.render_count() > before);
+    assert!(t.cached_layers() <= MAX_RESIDENT_LAYERS);
+    // Back to home: its layer was the farthest and is painted again.
+    let painted = t.render_count();
+    for i in (0..35).rev() {
+        t.handle(&scroll(0.1 * i as f32 / CARDS_PER_PAD_WIDTH, 0.0, false));
+        t.render(&mut c).unwrap();
+    }
+    assert!(t.render_count() > painted, "home was evicted and repainted");
+}
+
+#[test]
+fn removed_cards_free_their_layers() {
+    let mut t = timeline();
+    t.set_context(ctx());
+    let mut c = SoftwareCompositor::glass();
+    t.render(&mut c).unwrap();
+    assert_eq!(c.layer_count(), 3);
+    assert!(t.remove_card(11));
+    t.render(&mut c).unwrap();
+    assert_eq!(c.layer_count(), t.cached_layers());
+    assert_eq!(c.layer_count(), 3);
 }
