@@ -2,10 +2,12 @@
 //!
 //! ```text
 //! glass-launcher --headless --script FILE --out DIR [--fps N] [--time HH:MM] [--now UNIX_S]
-//! glass-launcher [--window] [--time HH:MM]          (built with --features window)
+//!                [--renderer gles|software]
+//! glass-launcher [--window] [--time HH:MM] [--renderer gles|software]   (needs `window`)
 //! ```
 
 use glass_gfx::HeadlessDisplay;
+use glass_launcher::renderer::{compositor_for, Renderer};
 use glass_launcher::script::{parse, Runner};
 use glass_launcher::{clock, demo, App};
 use glass_ui::RenderContext;
@@ -15,7 +17,8 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 usage:
   glass-launcher --headless --script FILE --out DIR [--fps N] [--time HH:MM] [--now UNIX_S]
-  glass-launcher [--window] [--time HH:MM]   (needs the `window` feature)
+                 [--renderer gles|software]
+  glass-launcher [--window] [--time HH:MM] [--renderer gles|software]   (needs the `window` feature)
 
   --headless      run a mock input script and write the frames as PNG files
   --script FILE   commands in the glassd --mock syntax (tap, swipe forward, scroll 0.3, wait 200ms, ...)
@@ -24,7 +27,9 @@ usage:
   --time HH:MM    fixed clock for the home card (default: the local time)
   --now UNIX_S    fixed 'now' for relative times (default: the demo time with --time, else now)
   --window        open a 640x360 host window: Left/Right = swipe backward/forward,
-                  Enter/Space = tap, Down = swipe down, Up = swipe up, Esc = quit";
+                  Enter/Space = tap, Down = swipe down, Up = swipe up, Esc = quit
+  --renderer R    gles (GPU, the default) or software (debugging aid). On the device a
+                  failing EGL is an error; on a host without EGL the default is software";
 
 #[derive(Default)]
 struct Args {
@@ -35,6 +40,7 @@ struct Args {
     fps: Option<u32>,
     time: Option<(u8, u8)>,
     now: Option<i64>,
+    renderer: Option<Renderer>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -58,6 +64,7 @@ fn parse_args() -> Result<Args, String> {
             }
             "--time" => a.time = Some(clock::parse_hh_mm(&value("--time")?).ok_or("bad --time")?),
             "--now" => a.now = Some(value("--now")?.parse().map_err(|_| "bad --now")?),
+            "--renderer" => a.renderer = Some(value("--renderer")?.parse()?),
             "-h" | "--help" => return Err(String::new()),
             other => return Err(format!("unknown argument {other}")),
         }
@@ -86,7 +93,8 @@ fn run_headless(args: &Args) -> Result<(), String> {
     let commands = parse(&text)?;
     let clock = clock_for(args);
     let ctx = clock(0.0);
-    let mut app = App::new(demo::timeline_at(ctx.now_s), ctx);
+    let compositor = compositor_for(args.renderer)?;
+    let mut app = App::with_compositor(demo::timeline_at(ctx.now_s), ctx, compositor);
     let mut display = HeadlessDisplay::new(glass_gfx::GLASS_WIDTH, glass_gfx::GLASS_HEIGHT)
         .with_output_dir(out)
         .map_err(|e| e.to_string())?;
@@ -108,13 +116,13 @@ fn run_headless(args: &Args) -> Result<(), String> {
 #[cfg(feature = "window")]
 fn run_window(args: &Args) -> Result<(), String> {
     use glass_gfx::window::{Key, WindowDisplay};
-    use glass_gfx::Display;
     use glass_ui::{Action, GestureKind, InputEvent};
     use std::time::{Duration, Instant};
 
     let clock = clock_for(args);
     let ctx = clock(0.0);
-    let mut app = App::new(demo::timeline_at(ctx.now_s), ctx);
+    let compositor = compositor_for(args.renderer)?;
+    let mut app = App::with_compositor(demo::timeline_at(ctx.now_s), ctx, compositor);
     let mut display = WindowDisplay::new(
         "glass-launcher",
         glass_gfx::GLASS_WIDTH,
@@ -149,9 +157,12 @@ fn run_window(args: &Args) -> Result<(), String> {
             clock((now - start).as_secs_f32()),
         );
         last = now;
-        match app.frame_if_changed() {
-            Some(frame) => display.present(frame).map_err(|e| e.to_string())?,
-            None => display.poll(),
+        // With gles the frame is read back into the window (slow, fine for development).
+        if !app
+            .present_if_changed(&mut display)
+            .map_err(|e| e.to_string())?
+        {
+            display.poll();
         }
         std::thread::sleep(frame_time.saturating_sub(now.elapsed()));
     }

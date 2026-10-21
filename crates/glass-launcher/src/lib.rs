@@ -11,27 +11,44 @@ pub mod clock;
 pub mod demo;
 pub mod script;
 
-use glass_gfx::{Color, Frame};
+pub mod renderer;
+
+use glass_gfx::{Color, Compositor, Display, Frame, GfxError, SoftwareCompositor};
 use glass_ui::{Action, GestureKind, InputEvent, RenderContext, Timeline};
 
-/// The launcher state: the timeline, the frame it is drawn into, and a stand-in for the
-/// screen state that `glassd` owns.
+/// The launcher state: the timeline, the compositor it renders through, and a stand-in for
+/// the screen state that `glassd` owns.
 pub struct App {
     timeline: Timeline,
-    frame: Frame,
+    compositor: Box<dyn Compositor>,
     screen_on: bool,
     shown: bool,
 }
 
 impl App {
-    pub fn new(mut timeline: Timeline, ctx: RenderContext) -> App {
+    /// An app rendering in software (tests, debugging).
+    pub fn new(timeline: Timeline, ctx: RenderContext) -> App {
+        App::with_compositor(timeline, ctx, Box::new(SoftwareCompositor::glass()))
+    }
+
+    /// An app rendering through `compositor` (of the Glass display size).
+    pub fn with_compositor(
+        mut timeline: Timeline,
+        ctx: RenderContext,
+        compositor: Box<dyn Compositor>,
+    ) -> App {
         timeline.set_context(ctx);
         App {
             timeline,
-            frame: Frame::glass(),
+            compositor,
             screen_on: true,
             shown: false,
         }
+    }
+
+    /// The renderer's name ("software", "gles").
+    pub fn renderer(&self) -> &'static str {
+        self.compositor.name()
     }
 
     pub fn timeline(&self) -> &Timeline {
@@ -77,21 +94,35 @@ impl App {
         self.timeline.tick(dt);
     }
 
-    /// The new frame to present, or `None` when nothing changed since the last one.
-    pub fn frame_if_changed(&mut self) -> Option<&Frame> {
+    /// Composes a new frame if anything changed since the last one; true if it did.
+    pub fn render_if_changed(&mut self) -> Result<bool, GfxError> {
         if !self.screen_on {
             if self.shown {
-                return None;
+                return Ok(false);
             }
-            self.frame.fill(Color::BLACK);
+            self.compositor.compose(Color::BLACK, &[])?;
             self.shown = true;
-            return Some(&self.frame);
+            return Ok(true);
         }
         if self.shown && !self.timeline.needs_redraw() {
-            return None;
+            return Ok(false);
         }
-        self.timeline.render(&mut self.frame);
+        self.timeline.render(self.compositor.as_mut())?;
         self.shown = true;
-        Some(&self.frame)
+        Ok(true)
+    }
+
+    /// Composes and presents a new frame if anything changed; true if one was presented.
+    pub fn present_if_changed(&mut self, display: &mut dyn Display) -> Result<bool, GfxError> {
+        if !self.render_if_changed()? {
+            return Ok(false);
+        }
+        self.compositor.present(display)?;
+        Ok(true)
+    }
+
+    /// The last composed frame, read back (tests).
+    pub fn read_frame(&mut self) -> Result<Frame, GfxError> {
+        self.compositor.read_frame()
     }
 }
