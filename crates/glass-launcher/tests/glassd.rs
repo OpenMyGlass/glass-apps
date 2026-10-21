@@ -497,12 +497,21 @@ fn the_loop_reconnects_when_glassd_restarts() {
 /// the next attempt, and each real attempt is logged once with its true delay.
 #[test]
 fn waiting_to_reconnect_keeps_polling_and_logs_each_attempt_once() {
+    use std::cell::{Cell, RefCell};
     let missing = std::env::temp_dir().join(format!("glass-no-glassd-{}.sock", std::process::id()));
     let mut a = App::new(demo::timeline(), ctx());
     let mut display = HeadlessDisplay::new(640, 360);
     let start = Instant::now();
-    let mut polls = 0u32;
-    let mut lines = vec![];
+    let polls = Cell::new(0u32);
+    let polls_before_second = Cell::new(0u32);
+    let lines = RefCell::new(Vec::<String>::new());
+    let attempts = || {
+        lines
+            .borrow()
+            .iter()
+            .filter(|l| l.contains("unavailable"))
+            .count()
+    };
     run(
         &missing,
         &mut a,
@@ -514,15 +523,30 @@ fn waiting_to_reconnect_keeps_polling_and_logs_each_attempt_once() {
             backoff: Backoff::new(Duration::from_millis(200), Duration::from_millis(400)),
         },
         |_: &mut HeadlessDisplay| {
-            polls += 1;
-            start.elapsed() < Duration::from_millis(500)
+            polls.set(polls.get() + 1);
+            // Stop at the second attempt (timing-independent; slow under QEMU).
+            attempts() < 2 && start.elapsed() < Duration::from_secs(20)
         },
-        |l| lines.push(l.to_string()),
+        |l| {
+            if l.contains("unavailable") && attempts() == 1 {
+                polls_before_second.set(polls.get());
+            }
+            lines.borrow_mut().push(l.to_string());
+        },
     )
     .unwrap();
-    let attempts: Vec<&String> = lines.iter().filter(|l| l.contains("unavailable")).collect();
-    assert_eq!(attempts.len(), 2, "{lines:#?}");
-    assert!(attempts[0].contains("retrying in 200 ms"), "{lines:#?}");
-    assert!(attempts[1].contains("retrying in 400 ms"), "{lines:#?}");
-    assert!(polls >= 20, "polled {polls} times");
+    let lines = lines.into_inner();
+    let tried: Vec<&String> = lines.iter().filter(|l| l.contains("unavailable")).collect();
+    assert_eq!(tried.len(), 2, "{lines:#?}");
+    assert!(tried[0].contains("retrying in 200 ms"), "{lines:#?}");
+    assert!(tried[1].contains("retrying in 400 ms"), "{lines:#?}");
+    assert!(
+        start.elapsed() >= Duration::from_millis(200),
+        "the second attempt waited for the first delay"
+    );
+    assert!(
+        polls_before_second.get() >= 3,
+        "the window was polled while waiting ({} polls)",
+        polls_before_second.get()
+    );
 }
