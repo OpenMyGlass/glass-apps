@@ -1,0 +1,78 @@
+# R5: Glass apps (plan)
+
+Roadmap phase R5 of OpenMyGlass ([glass-rom roadmap](https://github.com/OpenMyGlass/glass-rom/blob/main/docs/plans/2026-10-21-open-source-roadmap.md)): the card timeline launcher at 640×360, settings, setup, camera, and voice with an open offline hotword; dictation goes through the OpenMyGlass companion to the phone.
+
+## Constraints
+
+- **No Android dependency in the apps.** The UI and app logic run on route 1 (open Android) and route 2 (plain Linux). They talk to Glass services only through the [glass-services interface](https://github.com/OpenMyGlass/glass-services/blob/main/docs/api.md), and draw only through a thin graphics layer.
+- **Android glue in its own module** (later milestone): the launcher wrapper (a `HOME` activity that hands its `Surface` to the native UI), intents to open Android apps, and the camera and audio paths that need Android services.
+- **Hardware:** two Cortex-A9 at up to 1 GHz, SGX540 (GLES2) on Android only; on plain Linux the PowerVR user-space libraries do not work (they are built for bionic), so rendering is in software there. The display is 640×360.
+- **Clean room:** Glass behaviour comes from public documentation (GDK reference, Glass design guidelines: cards, timeline, menus, typography); no stock APK is decompiled for this phase.
+
+## Decisions
+
+### Language: Rust
+
+The same as glass-services ([its plan](https://github.com/OpenMyGlass/glass-services/blob/main/docs/plans/2026-10-21-r4-glass-services.md)), so the apps use the `glass-api` crate directly, and one toolchain cross-builds both repos.
+
+### UI: our own small card renderer on a software framebuffer
+
+| Option | For | Against |
+|---|---|---|
+| **Own renderer** on `tiny-skia` (BSD-3-Clause) and `fontdue` (MIT/Apache-2.0) (chosen) | Pure Rust, no C dependencies, cross-builds trivially; the Glass UI is simple (full-screen cards, large text, images, a horizontal timeline); a retained layer per card makes scrolling a blit; deterministic output, so tests compare pixels | We write layout and animation ourselves |
+| Slint | Declarative, embedded-friendly, software renderer | GPLv3 or a non-OSI royalty-free licence: awkward for an Apache-2.0 project others may redistribute |
+| LVGL | MIT, made for software rendering on small CPUs | C: the UI would be written in C or through immature bindings |
+| Qt, GTK, Flutter | Complete toolkits | Large; need GLES for good performance, which plain Linux lacks; Flutter has no Android 5 software path |
+| egui, iced | Rust | Immediate mode (egui) redraws everything each frame; iced pulls in winit and a large dependency tree |
+
+The cost of software rendering at 640×360: one frame is 230,400 pixels (900 KiB in RGBA8888). A card is rendered once into its own layer; while the timeline scrolls, a frame is two layer blits, a few milliseconds on a Cortex-A9. Text and images are drawn only when a card changes.
+
+### Thin graphics layer
+
+The `glass-gfx` crate defines a `Frame` (an RGBA8888 pixel buffer of the display's size) and a `Display` trait with `present(&Frame)`. Back ends:
+
+| Back end | Where | Milestone |
+|---|---|---|
+| Headless (PNG files, in-memory) | tests, CI | M1 |
+| Host window (`minifb`, behind a Cargo feature) | development on a desktop, with the keyboard driving gestures through the mock | M1 |
+| Linux framebuffer (`/dev/fb0`, `mmap`, the pixel format reported by `FBIOGET_VSCREENINFO`) | route 2 | M2 |
+| Android `ANativeWindow` (software lock and post), in the Android glue | route 1 | M3 |
+| GLES2 (upload the frame or the card layers as textures) | route 1, if measurements show the software path is too slow or too costly in battery | later, optional |
+
+### Fonts
+
+Glass used Roboto Light and Thin. We bundle **Inter** (Rasmus Andersson, SIL Open Font License 1.1) instead, a similar open sans-serif with Light and Thin weights, in `assets/fonts/` with its licence. Roboto itself is Apache-2.0 and would also be allowed, but Inter keeps the repository free of any file published by Google, which keeps rule 1 simple to check. The owner can switch to Roboto later; only the font files change.
+
+### Voice
+
+- **Hotword ("ok glass"-like):** an open, offline engine with a licence-clean model. The choice and licence check are in [`2026-10-21-voice.md`](2026-10-21-voice.md).
+- **Commands:** a small fixed grammar on Glass ("take a picture", "record a video", ...).
+- **Dictation:** through glass-services' dictation request to the OpenMyGlass companion, which uses its existing bridge messages (`DictationStart`, `AudioChunk`, `DictationEnd`, `Transcript`). If the bridge protocol needs a change (free dictation that is not a notification reply), it is proposed as a small PR in OpenMyGlass, not forked here.
+
+## Crates
+
+| Crate | Content | Milestone |
+|---|---|---|
+| `glass-gfx` | `Frame`, drawing primitives, text, `Display` trait, headless and host-window back ends | M1 |
+| `glass-ui` | Cards (layout and rendering), the timeline (model, scrolling physics, rendering) | M1 |
+| `glass-launcher` | The launcher binary: connects to `glassd`, holds input focus, shows the timeline | M1 |
+| `glass-settings`, `glass-setup`, `glass-camera`, `glass-voice` | The other apps | M2 and later |
+
+## Milestone 1 (this plan)
+
+1. The timeline model: a home card (clock) in the middle, newer and settings cards on one side, older cards on the other, navigated with `SWIPE_FORWARD` and `SWIPE_BACKWARD` and followed live with `Scroll`; `TAP` opens a card's menu (placeholder in M1); `SWIPE_DOWN` on home sends `ScreenRequest{SLEEP}`.
+2. Card rendering at 640×360 in Glass style (black background, white Roboto Light text, footer with timestamp), with golden-image tests (rendered PNG compared with a committed reference, small tolerance).
+3. `glass-launcher --mock` runs against the `glass-api` in-process mock; with `--features window` it opens a host window and maps the arrow keys and Enter to gestures.
+4. Tests: timeline navigation from gesture sequences, scroll settling, rendering of each card type, frame time budget measured on the host (reported, not enforced).
+5. CI: host tests, cross-builds for `armv7-linux-androideabi` and `armv7-unknown-linux-musleabihf`.
+
+## Later milestones
+
+- **M2:** settings (head wake, wink, screen timeout through `SetSettings`; Wi-Fi and Bluetooth through a small platform trait), Linux framebuffer back end, menus.
+- **M3:** Android glue (launcher wrapper, `ANativeWindow`, intents), setup (pairing with the OpenMyGlass phone app), dictation.
+- **M4:** camera (through the platform: Android camera API or V4L2/Ducati on Linux), voice hotword and commands.
+
+## Device checklist (not run: no Glass available)
+
+- [ ] The launcher draws at 640×360 on the panel, text is sharp, the timeline scrolls without visible stutter.
+- [ ] Frame time while scrolling, CPU use while idle (should be zero: no redraw without a change).
