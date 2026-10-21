@@ -708,3 +708,17 @@ fn stop_motion_lands_on_the_card_being_approached() {
     t.stop_motion();
     assert_eq!(current_id(&t), 12, "an animation ends on its target");
 }
+
+#[test]
+fn cancel_touch_returns_a_drag_to_its_start() {
+    let mut t = timeline();
+    t.handle(&scroll(0.7 / CARDS_PER_PAD_WIDTH, 0.0, false));
+    t.cancel_touch();
+    settle(&mut t);
+    assert_eq!(current_id(&t), 10, "back where the drag started");
+    // Without a drag, nothing changes (an animation runs on).
+    t.handle(&gesture(GestureKind::SwipeForward));
+    t.cancel_touch();
+    settle(&mut t);
+    assert_eq!(current_id(&t), 11);
+}

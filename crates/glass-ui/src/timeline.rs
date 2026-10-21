@@ -337,6 +337,16 @@ impl Timeline {
         self.jump_to(home);
     }
 
+    /// Ends a touch whose end will not arrive (the input focus moved away, the connection
+    /// to glassd was lost): a drag animates back to where it started, as a cancelled
+    /// `Scroll` would. Without a drag, nothing changes.
+    pub fn cancel_touch(&mut self) {
+        self.release = None;
+        if let Some(d) = self.drag.take() {
+            self.animate_to(d.start_index);
+        }
+    }
+
     /// Ends any drag or animation at once on the card it was heading to (for a screen
     /// that turns off mid-motion).
     pub fn stop_motion(&mut self) {
