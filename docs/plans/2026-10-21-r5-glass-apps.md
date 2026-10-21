@@ -63,7 +63,7 @@ Glass used Roboto Light and Thin. We bundle **Inter** (Rasmus Andersson, SIL Ope
 
 1. The timeline model: a home card (clock) in the middle, newer and settings cards on one side, older cards on the other, navigated with `SWIPE_FORWARD` and `SWIPE_BACKWARD` and followed live with `Scroll`; `TAP` opens a card's menu (placeholder in M1); `SWIPE_DOWN` on home sends `ScreenRequest{SLEEP}`.
 2. Card rendering at 640×360 in Glass style (black background, white Inter Light text, footer with timestamp), with golden-image tests (rendered PNG compared with a committed reference, small tolerance).
-3. `glass-launcher --mock` runs against the `glass-api` in-process mock; with `--features window` it opens a host window and maps the arrow keys and Enter to gestures.
+3. `glass-launcher --headless --script FILE` runs a mock input script in the `glassd --mock` command syntax and writes the frames as PNG files; with `--features window` it opens a host window and maps the arrow keys and Enter to gestures. The launcher maps its input onto a local `InputEvent` that mirrors the glass-services messages 1:1. **M1b:** connect to `glassd` through the `glass-api` crate (and its in-process mock in tests) once that crate is merged in glass-services: take the input focus, convert `Gesture`/`Scroll`, send `ScreenRequest{ACTION_SLEEP}`, follow `ScreenState`.
 4. Tests: timeline navigation from gesture sequences, scroll settling, rendering of each card type. Benchmarks (reported, not enforced): composite time of a scrolling frame and render time of one card, on the host now and on armv7 when a device is available.
 5. CI: host tests, cross-builds for `armv7-linux-androideabi` and `armv7-unknown-linux-musleabihf`.
 

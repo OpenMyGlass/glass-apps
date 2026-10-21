@@ -20,7 +20,7 @@ Host window (needs a desktop; on Linux the X11/Wayland development packages, see
 cargo run -p glass-launcher --features window
 ```
 
-Keys: **Right** = swipe forward (older cards), **Left** = swipe backward (settings side), **Enter**/**Space** = tap, **Down** = swipe down (back to home; on home, the screen turns off and the next key wakes it), **Esc** = quit. `--time 10:42` fixes the clock.
+Keys: **Right** = swipe forward (older cards), **Left** = swipe backward (settings side), **Enter**/**Space** = tap, **Down** = swipe down (back to home; on home, the simulated screen turns off; Enter, Space, Left or Right wakes it and is consumed, as `glassd` does), **Up** = swipe up (no effect), **Esc** = quit. `--time 10:42` fixes the clock.
 
 Headless, with a mock script in the `glassd --mock` syntax (`tap`, `swipe forward|backward|down|up`, `scroll 0.3`, `wait 200ms`, ...), writing every changed frame as a PNG:
 

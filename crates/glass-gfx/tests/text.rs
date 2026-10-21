@@ -15,10 +15,8 @@ fn lit_pixels(f: &Frame) -> usize {
 
 #[test]
 fn bundled_fonts_load() {
-    for w in [Weight::Light] {
-        let font = fonts::font(w);
-        assert!(text::measure(font, 32.0, "Hello") > 0.0);
-    }
+    let font = fonts::font(Weight::Light);
+    assert!(text::measure(font, 32.0, "Hello") > 0.0);
 }
 
 #[test]

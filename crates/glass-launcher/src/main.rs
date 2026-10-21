@@ -24,7 +24,7 @@ usage:
   --time HH:MM    fixed clock for the home card (default: the local time)
   --now UNIX_S    fixed 'now' for relative times (default: the demo time with --time, else now)
   --window        open a 640x360 host window: Left/Right = swipe backward/forward,
-                  Enter/Space = tap, Down = swipe down, Esc = quit";
+                  Enter/Space = tap, Down = swipe down, Up = swipe up, Esc = quit";
 
 #[derive(Default)]
 struct Args {
@@ -136,7 +136,9 @@ fn run_window(args: &Args) -> Result<(), String> {
             };
             match app.input(&InputEvent::gesture(kind)) {
                 Some(Action::OpenMenu(id)) => eprintln!("menu: card {id} (placeholder)"),
-                Some(Action::RequestSleep) => eprintln!("sleep: screen off (any key wakes)"),
+                Some(Action::RequestSleep) => {
+                    eprintln!("sleep: screen off (Enter or an arrow left/right wakes)")
+                }
                 Some(Action::Back) => eprintln!("back: to the home card"),
                 None => {}
             }
