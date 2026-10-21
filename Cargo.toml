@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/glass-gfx"]
+members = ["crates/glass-gfx", "crates/glass-ui", "crates/glass-launcher"]
 
 [workspace.package]
 version = "0.1.0"
