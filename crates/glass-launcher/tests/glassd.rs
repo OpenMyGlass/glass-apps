@@ -520,7 +520,9 @@ fn waiting_to_reconnect_keeps_polling_and_logs_each_attempt_once() {
         LoopOptions {
             fps: 60,
             max_wait: Some(Duration::from_millis(10)),
-            backoff: Backoff::new(Duration::from_millis(200), Duration::from_millis(400)),
+            // Long enough for several polls even when the first frame is slow to render
+            // (a debug build under QEMU).
+            backoff: Backoff::new(Duration::from_millis(1000), Duration::from_millis(2000)),
         },
         |_: &mut HeadlessDisplay| {
             polls.set(polls.get() + 1);
@@ -538,14 +540,14 @@ fn waiting_to_reconnect_keeps_polling_and_logs_each_attempt_once() {
     let lines = lines.into_inner();
     let tried: Vec<&String> = lines.iter().filter(|l| l.contains("unavailable")).collect();
     assert_eq!(tried.len(), 2, "{lines:#?}");
-    assert!(tried[0].contains("retrying in 200 ms"), "{lines:#?}");
-    assert!(tried[1].contains("retrying in 400 ms"), "{lines:#?}");
+    assert!(tried[0].contains("retrying in 1000 ms"), "{lines:#?}");
+    assert!(tried[1].contains("retrying in 2000 ms"), "{lines:#?}");
     assert!(
-        start.elapsed() >= Duration::from_millis(200),
+        start.elapsed() >= Duration::from_millis(1000),
         "the second attempt waited for the first delay"
     );
     assert!(
-        polls_before_second.get() >= 3,
+        polls_before_second.get() >= 10,
         "the window was polled while waiting ({} polls)",
         polls_before_second.get()
     );
