@@ -30,7 +30,7 @@ impl Color {
     }
 
     /// Premultiplied channels.
-    pub(crate) fn premultiplied(self) -> [u8; 4] {
+    pub fn premultiplied(self) -> [u8; 4] {
         let a = self.a as u32;
         [
             mul255(self.r as u32, a) as u8,

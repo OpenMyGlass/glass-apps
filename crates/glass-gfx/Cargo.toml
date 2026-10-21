@@ -1,6 +1,6 @@
 [package]
 name = "glass-gfx"
-description = "Thin software graphics layer for the Glass apps: frames, drawing, text, displays"
+description = "Graphics layer for the Glass apps: painter and compositor traits, text layout, the software renderer, displays"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
