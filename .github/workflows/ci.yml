@@ -47,7 +47,79 @@ jobs:
         run: |
           tools/check_licenses.sh -p glass-launcher --target x86_64-unknown-linux-gnu --features window
           tools/check_licenses.sh -p glass-launcher --target armv7-linux-androideabi
-          tools/check_licenses.sh -p glass-launcher --target armv7-unknown-linux-musleabihf
+          tools/check_licenses.sh -p glass-launcher --target armv7-unknown-linux-gnueabihf
+          tools/check_licenses.sh -p glass-launcher --target armv7-unknown-linux-musleabihf --no-default-features
+          tools/check_licenses.sh -p glass-gfx-gles --target x86_64-unknown-linux-gnu
+      - name: Software-only launcher (no gles feature)
+        run: cargo clippy -p glass-launcher --no-default-features --all-targets --locked -- -D warnings
+
+  gles:
+    # Pinned so that the Mesa version changes only on purpose.
+    runs-on: ubuntu-24.04
+    env:
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      GALLIUM_DRIVER: llvmpipe
+      GLASS_GLES_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Mesa EGL and GLES (llvmpipe)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libegl1 libgles2 libegl-mesa0 libgl1-mesa-dri
+      - name: GL_RENDERER and GL_VERSION
+        run: cargo test --locked -p glass-gfx-gles --test gles gl_info -- --nocapture
+      - name: GLES tests against the goldens (SGX540 assertion layer on)
+        run: cargo test --locked -p glass-gfx-gles -- --nocapture --test-threads=1
+      - name: GLES images that did not match
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: golden-actual-gles
+          path: target/golden-actual-gles/
+          if-no-files-found: ignore
+      - name: Headless demo with the GLES renderer
+        run: |
+          cargo run --release --locked -p glass-launcher -- --headless --renderer gles --script examples/demo.script --out frames-gles --time 10:42
+          ls frames-gles | head
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-frames-gles
+          path: frames-gles/
+
+  linux-armv7-gnu:
+    # Dynamically linked glibc build: the GLES path needs dlopen (route 2, libhybris).
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: arm-linux-gnueabihf-gcc
+      QEMU_LD_PREFIX: /usr/arm-linux-gnueabihf
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-gnueabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Cross toolchain, sysroot and QEMU
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-arm-linux-gnueabihf libc6-dev-armhf-cross qemu-user
+      - run: cargo build --release --locked --target armv7-unknown-linux-gnueabihf -p glass-launcher
+      - name: Dynamically linked, no link-time EGL dependency
+        run: |
+          bin=target/armv7-unknown-linux-gnueabihf/release/glass-launcher
+          file "$bin"
+          arm-linux-gnueabihf-readelf -d "$bin" | grep NEEDED
+          ! arm-linux-gnueabihf-readelf -d "$bin" | grep -E 'NEEDED.*(EGL|GLES)'
+      - name: Device build without EGL is a hard error, software must be asked for
+        run: |
+          bin=target/armv7-unknown-linux-gnueabihf/release/glass-launcher
+          if qemu-arm "$bin" --headless --script examples/demo.script --out frames 2>err.txt; then
+            echo "expected a hard error without EGL"; exit 1
+          fi
+          cat err.txt
+          grep -q "GLES renderer failed" err.txt
+          qemu-arm "$bin" --headless --renderer software --script examples/demo.script --out frames --time 10:42
+      - uses: actions/upload-artifact@v4
+        with:
+          name: glass-launcher-armv7-unknown-linux-gnueabihf
+          path: target/armv7-unknown-linux-gnueabihf/release/glass-launcher
 
   android-armv7:
     runs-on: ubuntu-latest
@@ -70,6 +142,8 @@ jobs:
           path: target/armv7-linux-androideabi/release/glass-launcher
 
   linux-armv7:
+    # The software-only debug build: static musl, where dlopen cannot load EGL, so the
+    # launcher is built without the `gles` feature.
     runs-on: ubuntu-latest
     env:
       # Static musl binary linked with the LLD that ships with Rust; no C toolchain needed.
@@ -82,10 +156,11 @@ jobs:
           targets: armv7-unknown-linux-musleabihf
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends qemu-user
-      - run: cargo build --release --locked --target armv7-unknown-linux-musleabihf -p glass-launcher
+      - run: cargo build --release --locked --target armv7-unknown-linux-musleabihf -p glass-launcher --no-default-features
       - run: file target/armv7-unknown-linux-musleabihf/release/glass-launcher
       - name: Tests on armv7 under QEMU (golden images included)
-        run: cargo test --locked --target armv7-unknown-linux-musleabihf --workspace
+        # glass-gfx-gles needs libdl, which a static musl build does not have.
+        run: cargo test --locked --target armv7-unknown-linux-musleabihf --workspace --exclude glass-gfx-gles --no-default-features
       - name: Golden images that did not match
         if: failure()
         uses: actions/upload-artifact@v4

@@ -1,6 +1,6 @@
 # glass-apps
 
-Glass apps for Google Glass Explorer Edition: the card timeline launcher at 640×360, settings, setup, camera and voice. Written in Rust on a thin software graphics layer, with no Android dependency, so the same apps run on an open Android build and on plain Linux. They talk to the Glass system services of [glass-services](https://github.com/OpenMyGlass/glass-services) through its [interface](https://github.com/OpenMyGlass/glass-services/blob/main/docs/api.md). Part of [OpenMyGlass](https://github.com/OpenMyGlass).
+Glass apps for Google Glass Explorer Edition: the card timeline launcher at 640×360, settings, setup, camera and voice. Written in Rust, rendering on the GPU with GLES2 (the software renderer is a debugging aid and the test reference), with no Android dependency, so the same apps run on an open Android build and on plain Linux. They talk to the Glass system services of [glass-services](https://github.com/OpenMyGlass/glass-services) through its [interface](https://github.com/OpenMyGlass/glass-services/blob/main/docs/api.md). Part of [OpenMyGlass](https://github.com/OpenMyGlass).
 
 Plans and decisions are in [`docs/plans/`](docs/plans/).
 
@@ -8,9 +8,10 @@ Plans and decisions are in [`docs/plans/`](docs/plans/).
 
 | Crate | Content |
 |---|---|
-| [`glass-gfx`](crates/glass-gfx) | `Frame` (RGBA8888, premultiplied), shapes and images with tiny-skia, text with fontdue (single line, wrapping, ellipsis), the `Display` trait; headless back end (memory, PNG files) and host window back end (`window` feature, minifb) |
-| [`glass-ui`](crates/glass-ui) | Cards (home clock, text, settings entry, image) in Glass style; the timeline: gestures, live drag from `Scroll`, settle animation, cached per-card layers; `InputEvent` mirroring the glass-services messages |
-| [`glass-launcher`](crates/glass-launcher) | The launcher binary: mock scripts headless, or a host window driven by the keyboard. Connecting to `glassd` through `glass-api` comes in a later change |
+| [`glass-gfx`](crates/glass-gfx) | The `Painter` (draw commands) and `Compositor` (layers, frames) traits; text layout into whole-pixel glyph runs shared by both renderers (single line, wrapping, ellipsis); the software renderer: `Frame` (RGBA8888, premultiplied), `SkiaPainter` (tiny-skia, fontdue), `SoftwareCompositor`; the `Display` trait with a headless back end (memory, PNG files) and a host window back end (`window` feature, minifb) |
+| [`glass-gfx-gles`](crates/glass-gfx-gles) | The GLES2 renderer: EGL and GLES loaded at run time (khronos-egl, glow), off-screen contexts (Mesa surfaceless or pbuffer), `GlesPainter` (distance-function rounded rects, CPU-downscaled image textures, ALPHA glyph atlas), `GlesCompositor` (FBO texture layers), the SGX540 assertion layer |
+| [`glass-ui`](crates/glass-ui) | Cards (home clock, text, settings entry, image) in Glass style, drawn through `Painter`; the timeline: gestures, live drag from `Scroll`, settle animation, cached per-card layers through `Compositor` (at most 4); `InputEvent` mirroring the glass-services messages |
+| [`glass-launcher`](crates/glass-launcher) | The launcher binary: mock scripts headless, or a host window driven by the keyboard; `--renderer gles\|software`. Connecting to `glassd` through `glass-api` comes in a later change |
 
 ## Running on a desktop
 
@@ -19,6 +20,8 @@ Host window (needs a desktop; on Linux the X11/Wayland development packages, see
 ```sh
 cargo run -p glass-launcher --features window
 ```
+
+The renderer is chosen with `--renderer gles|software`. On a host, the default is `gles` when EGL initializes (Mesa: `libEGL.so.1`, `libGLESv2.so.2`; GLES frames are read back into the window or the PNG files) and `software` otherwise, with a log line. Device builds (Android, Linux on ARM) default to `gles` and stop with an error when EGL fails; `software` must be asked for. The static musl build is software only (built with `--no-default-features`, without the `gles` feature).
 
 Keys: **Right** = swipe forward (older cards), **Left** = swipe backward (settings side), **Enter**/**Space** = tap, **Down** = swipe down (back to home; on home, the simulated screen turns off; Enter, Space, Left or Right wakes it and is consumed, as `glassd` does), **Up** = swipe up (no effect), **Esc** = quit. `--time 10:42` fixes the clock.
 
@@ -33,22 +36,25 @@ cargo run -p glass-launcher -- --headless --script examples/demo.script --out /t
 ```sh
 cargo test --workspace                                       # unit, timeline, card and golden-image tests
 GLASS_UPDATE_GOLDEN=1 cargo test -p glass-ui --test golden   # regenerate tests/golden/*.png after a deliberate change
+GLASS_GLES_TESTS=1 cargo test -p glass-gfx-gles -- --nocapture --test-threads=1   # GLES2 renderer against the goldens (needs EGL)
 cargo test --release -p glass-ui --test bench -- --ignored --nocapture   # card render and scroll composite times
 ```
 
 Golden images are compared with a tolerance of 3 per channel; on a mismatch the actual image is written to `target/golden-actual/`. Rendering is pure Rust with the SIMD paths of tiny-skia and fontdue disabled, so the images are the same on every platform; CI checks them on Linux x86-64 and on armv7 under QEMU (they were generated on macOS AArch64).
 
-CI (`.github/workflows/ci.yml`): `host` (format, clippy with and without the window feature, tests, benchmarks, headless demo, dependency licences), `android-armv7` (`armv7-linux-androideabi`, API 22, the runner's NDK clang as linker), `linux-armv7` (static `armv7-unknown-linux-musleabihf` linked with `rust-lld`, tests and the demo under QEMU).
+The GLES tests render the same scenes and compare them with the same goldens: solid fills, layers and text within ±2 per channel on every pixel; anti-aliased rounded-rect edges within ±2 except on at most 1 % of the pixels, which stay within 64. Mismatching GLES images go to `target/golden-actual-gles/`. Without `GLASS_GLES_TESTS=1` (macOS, hosts without EGL) they are skipped. The SGX540 assertion layer is on in tests: NPOT textures without `CLAMP_TO_EDGE` or with mipmaps, `glGenerateMipmap`, textures above `GL_MAX_TEXTURE_SIZE` and shaders without `#version 100` panic. Precision (`mediump` on the SGX540) can only be checked on the device.
+
+CI (`.github/workflows/ci.yml`): `host` (format, clippy with and without the window feature and without `gles`, tests, benchmarks, headless demo, dependency licences), `gles` (ubuntu-24.04, Mesa llvmpipe: GL_RENDERER/GL_VERSION, the GLES tests, a headless demo with `--renderer gles`), `android-armv7` (`armv7-linux-androideabi`, API 22, the runner's NDK clang as linker), `linux-armv7-gnu` (dynamic `armv7-unknown-linux-gnueabihf` linked with `gcc-arm-linux-gnueabihf`, the GLES-capable plain-Linux build; checks the hard error without EGL and runs the software demo under QEMU), `linux-armv7` (static `armv7-unknown-linux-musleabihf` linked with `rust-lld`, the software-only debug build, tests and the demo under QEMU).
 
 ## Design notes
 
 - **Timeline:** home in the middle, "now" cards and settings on the backward side, history on the forward side. A drag across the whole touchpad width moves 2 cards; a release settles on the nearest card after projecting the release velocity 0.15 s ahead, and a release faster than 0.5 pad widths/s moves at least one card. The swipe gesture that follows a drag (glass-services sends both) is not counted twice. Animations are ease-out cubic over 0.12 s + 0.12 s per card (at most 0.45 s), advanced only by `tick(dt)`, so they are deterministic. Details in [`timeline.rs`](crates/glass-ui/src/timeline.rs).
-- **Rendering:** each card renders once into its own 640×360 layer and is re-rendered only when what it shows changes (content, clock minute, relative time text). At rest, the neighbours of the visible card are rendered ahead and other layers are dropped (at rest at most three, about 900 KiB each; a fling across several cards renders the cards it passes and holds their layers until the next rest); a scrolling frame is two row copies, with no card rendering.
+- **Rendering:** the GPU plan is [`docs/plans/2026-10-22-gpu-rendering.md`](docs/plans/2026-10-22-gpu-rendering.md). Card and timeline code draw only through `Painter` and `Compositor`, so both renderers draw the same cards. Each card renders once into its own 640×360 layer and is re-rendered only when what it shows changes (content, clock minute, relative time text). At rest, the neighbours of the visible card are rendered ahead and other layers are dropped (three at rest, about 900 KiB each); a fling renders the cards it reaches, and never more than four layers exist (the one farthest from the position is dropped first). A scrolling frame is two layer copies (row copies in software, two quads with blending off on the GPU), with no card rendering.
 - **Style:** after the public Glass design guidelines: black background, white Inter Light text, 40 px margins, body text sized 64/48/40/34 px to fit, footer in 26 px grey with the source on the left and the relative time on the right.
 
 ## Third-party code
 
-The device builds (`armv7-linux-androideabi`, `armv7-unknown-linux-musleabihf`) contain only these crates besides our own, all under permissive licences:
+The device builds (`armv7-linux-androideabi`, `armv7-unknown-linux-gnueabihf`, `armv7-unknown-linux-musleabihf`) contain only these crates besides our own, all under permissive licences:
 
 | Crate | Licence |
 |---|---|
@@ -63,6 +69,9 @@ The device builds (`armv7-linux-androideabi`, `armv7-unknown-linux-musleabihf`) 
 | arrayvec, bitflags, cfg-if, log, hashbrown, allocator-api2, equivalent, libc | MIT OR Apache-2.0 |
 | bytemuck | Zlib OR Apache-2.0 OR MIT |
 | foldhash | Zlib |
+| khronos-egl (GLES builds) | MIT OR Apache-2.0 |
+| glow (GLES builds) | MIT OR Apache-2.0 OR Zlib |
+| libloading (GLES builds) | ISC |
 
 The host window back end (`window` feature, not part of device builds) adds minifb (MIT OR Apache-2.0) and, on Linux, X11 and Wayland client crates (MIT; ISC for libloading; Unlicense OR MIT for memchr; MIT OR Apache-2.0 with the Unicode-3.0 terms for unicode-ident). `tools/check_licenses.sh` checks the full dependency tree of each build in CI against this permissive set.
 
