@@ -2,7 +2,7 @@
 
 use crate::style;
 use glass_gfx::text::{self, Align};
-use glass_gfx::{fonts, Frame, Rect, Weight};
+use glass_gfx::{fonts, Frame, Painter, Rect, SkiaPainter, Weight};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -144,15 +144,23 @@ pub fn render_key(card: &Card, ctx: &RenderContext) -> u64 {
     h.finish()
 }
 
-/// Renders `card` into a new opaque layer of `width`×`height` pixels.
+/// Renders `card` into a new opaque frame of `width`×`height` pixels (software painter).
 pub fn render_card(card: &Card, ctx: &RenderContext, width: u32, height: u32) -> Frame {
     let mut f = Frame::new(width, height);
-    f.fill(style::BACKGROUND);
+    paint_card(card, ctx, &mut SkiaPainter::new(&mut f));
+    f
+}
+
+/// Paints `card` over the whole of `f`, which ends up opaque. Written against [`Painter`]
+/// only, so every renderer draws the same card.
+pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
+    f.clear(style::BACKGROUND);
+    let (width, height) = f.size();
     let (w, h) = (width as f32, height as f32);
     match &card.content {
         CardContent::Home => {
             centered_line(
-                &mut f,
+                f,
                 Weight::Light,
                 style::CLOCK_SIZE,
                 &clock_text(ctx.hour, ctx.minute),
@@ -165,9 +173,9 @@ pub fn render_card(card: &Card, ctx: &RenderContext, width: u32, height: u32) ->
             source,
             timestamp_s,
         } => {
-            body_text(&mut f, body);
+            body_text(f, body);
             footer(
-                &mut f,
+                f,
                 source,
                 &relative_time(ctx.now_s, *timestamp_s),
                 style::SECONDARY,
@@ -180,7 +188,7 @@ pub fn render_card(card: &Card, ctx: &RenderContext, width: u32, height: u32) ->
                 h / 2.0
             };
             centered_line(
-                &mut f,
+                f,
                 Weight::Light,
                 style::TITLE_SIZE,
                 title,
@@ -189,7 +197,7 @@ pub fn render_card(card: &Card, ctx: &RenderContext, width: u32, height: u32) ->
             );
             if let Some(sub) = subtitle {
                 centered_line(
-                    &mut f,
+                    f,
                     Weight::Light,
                     style::SUBTITLE_SIZE,
                     sub,
@@ -211,7 +219,7 @@ pub fn render_card(card: &Card, ctx: &RenderContext, width: u32, height: u32) ->
                     f.draw_image(img, Rect::new((w - iw) / 2.0, (h - ih) / 2.0, iw, ih));
                 }
                 None => {
-                    f.fill(style::PLACEHOLDER);
+                    f.clear(style::PLACEHOLDER);
                     // A simple picture-frame mark in the middle.
                     let (bw, bh) = (150.0, 104.0);
                     let r = Rect::new((w - bw) / 2.0, (h - bh) / 2.0 - 20.0, bw, bh);
@@ -221,19 +229,18 @@ pub fn render_card(card: &Card, ctx: &RenderContext, width: u32, height: u32) ->
                 }
             }
             footer(
-                &mut f,
+                f,
                 caption,
                 &relative_time(ctx.now_s, *timestamp_s),
                 style::TEXT,
             );
         }
     }
-    f
 }
 
 /// Draws one line centred horizontally, its digits/capitals centred on `center_y`.
 fn centered_line(
-    f: &mut Frame,
+    f: &mut dyn Painter,
     weight: Weight,
     size: f32,
     line: &str,
@@ -241,24 +248,27 @@ fn centered_line(
     color: glass_gfx::Color,
 ) {
     let font = fonts::font(weight);
-    let max_w = f.width() as f32 - 2.0 * style::MARGIN;
+    let (fw, _) = f.size();
+    let max_w = fw as f32 - 2.0 * style::MARGIN;
     let line = text::ellipsize(font, size, line, max_w);
     let w = text::measure(font, size, &line);
     // Cap height from the glyph of '0' (same as capitals in Inter).
     let cap = font.metrics('0', size).height as f32;
-    let x = (f.width() as f32 - w) / 2.0;
-    text::draw_line(f, font, size, x, center_y + cap / 2.0, &line, color);
+    let x = (fw as f32 - w) / 2.0;
+    let (run, _) = text::layout_line(font, size, x, center_y + cap / 2.0, &line);
+    f.draw_glyph_run(&run, color);
 }
 
 /// Body text in the content area, at the largest size that fits; the smallest size
 /// ellipsizes what does not fit.
-fn body_text(f: &mut Frame, body: &str) {
+fn body_text(f: &mut dyn Painter, body: &str) {
     let font = fonts::font(Weight::Light);
+    let (fw, fh) = f.size();
     let area = Rect::new(
         style::MARGIN,
         style::MARGIN - 8.0,
-        f.width() as f32 - 2.0 * style::MARGIN,
-        f.height() as f32 - style::MARGIN - style::FOOTER_HEIGHT,
+        fw as f32 - 2.0 * style::MARGIN,
+        fh as f32 - style::MARGIN - style::FOOTER_HEIGHT,
     );
     let mut chosen = *style::BODY_SIZES.last().unwrap();
     for size in style::BODY_SIZES {
@@ -268,17 +278,17 @@ fn body_text(f: &mut Frame, body: &str) {
             break;
         }
     }
-    text::draw_box(
-        f,
+    for run in text::layout_box_runs(
         font,
         chosen,
         style::BODY_LINE_HEIGHT,
         area,
         body,
-        style::TEXT,
         Align::Left,
         usize::MAX,
-    );
+    ) {
+        f.draw_glyph_run(&run, style::TEXT);
+    }
 }
 
 fn lines_that_fit(font: &glass_gfx::Font, size: f32, height: f32) -> usize {
@@ -290,22 +300,17 @@ fn lines_that_fit(font: &glass_gfx::Font, size: f32, height: f32) -> usize {
 }
 
 /// The footer: `left` (source, caption) at the left margin, `right` (time) right-aligned.
-fn footer(f: &mut Frame, left: &str, right: &str, left_color: glass_gfx::Color) {
+fn footer(f: &mut dyn Painter, left: &str, right: &str, left_color: glass_gfx::Color) {
     let font = fonts::font(Weight::Light);
     let size = style::FOOTER_SIZE;
-    let baseline = f.height() as f32 - style::FOOTER_BASELINE_FROM_BOTTOM;
-    let right_edge = f.width() as f32 - style::MARGIN;
+    let (fw, fh) = f.size();
+    let baseline = fh as f32 - style::FOOTER_BASELINE_FROM_BOTTOM;
+    let right_edge = fw as f32 - style::MARGIN;
     let rw = text::measure(font, size, right);
-    text::draw_line(
-        f,
-        font,
-        size,
-        right_edge - rw,
-        baseline,
-        right,
-        style::SECONDARY,
-    );
+    let (run, _) = text::layout_line(font, size, right_edge - rw, baseline, right);
+    f.draw_glyph_run(&run, style::SECONDARY);
     let room = right_edge - rw - 24.0 - style::MARGIN;
     let left = text::ellipsize(font, size, left, room);
-    text::draw_line(f, font, size, style::MARGIN, baseline, &left, left_color);
+    let (run, _) = text::layout_line(font, size, style::MARGIN, baseline, &left);
+    f.draw_glyph_run(&run, left_color);
 }

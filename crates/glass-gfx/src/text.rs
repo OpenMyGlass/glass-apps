@@ -1,5 +1,8 @@
 //! Text measurement, layout and drawing with `fontdue`.
 //!
+//! Layout ([`layout_line`], [`layout_box_runs`]) is separate from drawing: it produces
+//! [`GlyphRun`]s at whole-pixel positions, which any [`crate::Painter`] draws.
+//!
 //! Sizes are in pixels (the font's em size). Glyphs are placed at whole pixels on the pen
 //! position (rounded), which keeps text crisp and the output identical on every platform.
 //! Kerning from the font's `kern` table is applied. There is no shaping beyond that, which
@@ -47,6 +50,61 @@ pub fn measure(font: &Font, size: f32, text: &str) -> f32 {
     pen_positions(font, size, text).1
 }
 
+/// A glyph placed on a whole pixel: `x` is the pen position (the glyph's origin) and
+/// `baseline` the baseline row. The rasterized bitmap's top-left corner is at
+/// `(x + metrics.xmin, baseline - (metrics.ymin + metrics.height))`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PositionedGlyph {
+    pub ch: char,
+    pub x: i32,
+    pub baseline: i32,
+}
+
+/// Glyphs of one font and size, laid out at whole-pixel positions. Both painters draw
+/// these, so the software and GLES paths place every glyph on the same pixel.
+#[derive(Clone, Debug)]
+pub struct GlyphRun<'a> {
+    pub font: &'a Font,
+    pub size: f32,
+    pub glyphs: Vec<PositionedGlyph>,
+}
+
+impl GlyphRun<'_> {
+    /// Where glyph `g`'s bitmap goes and its size: `(x, y, width, height)`.
+    pub fn bitmap_rect(&self, g: &PositionedGlyph) -> (i32, i32, usize, usize) {
+        let m = self.font.metrics(g.ch, self.size);
+        (
+            g.x + m.xmin,
+            g.baseline - (m.ymin + m.height as i32),
+            m.width,
+            m.height,
+        )
+    }
+}
+
+/// Lays out `text` on one line with its start at `x` and its baseline at `baseline`.
+/// Whitespace produces no glyph. Returns the run and the advance width.
+pub fn layout_line<'a>(
+    font: &'a Font,
+    size: f32,
+    x: f32,
+    baseline: f32,
+    text: &str,
+) -> (GlyphRun<'a>, f32) {
+    let (pens, width) = pen_positions(font, size, text);
+    let base = baseline.round() as i32;
+    let glyphs = pens
+        .into_iter()
+        .filter(|(ch, _)| !ch.is_whitespace())
+        .map(|(ch, pen)| PositionedGlyph {
+            ch,
+            x: (x + pen).round() as i32,
+            baseline: base,
+        })
+        .collect();
+    (GlyphRun { font, size, glyphs }, width)
+}
+
 /// Draws `text` on one line with its start at `x` and its baseline at `baseline`.
 /// Returns the advance width.
 pub fn draw_line(
@@ -58,20 +116,8 @@ pub fn draw_line(
     text: &str,
     color: Color,
 ) -> f32 {
-    let (glyphs, width) = pen_positions(font, size, text);
-    let base = baseline.round() as i32;
-    for (ch, pen) in glyphs {
-        if ch.is_whitespace() {
-            continue;
-        }
-        let (m, bitmap) = font.rasterize(ch, size);
-        if m.width == 0 || m.height == 0 {
-            continue;
-        }
-        let gx = (x + pen).round() as i32 + m.xmin;
-        let gy = base - (m.ymin + m.height as i32);
-        frame.blend_coverage(&bitmap, m.width, m.height, gx, gy, color);
-    }
+    let (run, width) = layout_line(font, size, x, baseline, text);
+    frame.draw_glyph_run(&run, color);
     width
 }
 
@@ -162,9 +208,44 @@ pub fn layout_box(
     lines
 }
 
-/// Lays out `text` in `rect` (at most `max_lines`, and no more than fit in its height) and
-/// draws it, the first baseline one ascent below the top, then every `size * line_height`.
-/// Returns the number of lines drawn.
+/// Lays out `text` in `rect` (at most `max_lines`, and no more than fit in its height), the
+/// first baseline one ascent below the top, then every `size * line_height`. One run per
+/// line.
+pub fn layout_box_runs<'a>(
+    font: &'a Font,
+    size: f32,
+    line_height: f32,
+    rect: Rect,
+    text: &str,
+    align: Align,
+    max_lines: usize,
+) -> Vec<GlyphRun<'a>> {
+    let (ascent, descent) = line_metrics(font, size);
+    let step = size * line_height;
+    let fit = if step <= 0.0 || !step.is_finite() {
+        max_lines.min(1)
+    } else if rect.h < ascent + descent {
+        0
+    } else {
+        1 + ((rect.h - ascent - descent) / step).floor() as usize
+    };
+    let lines = layout_box(font, size, text, rect.w, max_lines.min(fit));
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let w = measure(font, size, line);
+            let x = match align {
+                Align::Left => rect.x,
+                Align::Center => rect.x + (rect.w - w) / 2.0,
+                Align::Right => rect.right() - w,
+            };
+            layout_line(font, size, x, rect.y + ascent + step * i as f32, line).0
+        })
+        .collect()
+}
+
+/// [`layout_box_runs`] drawn into `frame`. Returns the number of lines drawn.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_box(
     frame: &mut Frame,
@@ -177,32 +258,9 @@ pub fn draw_box(
     align: Align,
     max_lines: usize,
 ) -> usize {
-    let (ascent, descent) = line_metrics(font, size);
-    let step = size * line_height;
-    let fit = if step <= 0.0 || !step.is_finite() {
-        max_lines.min(1)
-    } else if rect.h < ascent + descent {
-        0
-    } else {
-        1 + ((rect.h - ascent - descent) / step).floor() as usize
-    };
-    let lines = layout_box(font, size, text, rect.w, max_lines.min(fit));
-    for (i, line) in lines.iter().enumerate() {
-        let w = measure(font, size, line);
-        let x = match align {
-            Align::Left => rect.x,
-            Align::Center => rect.x + (rect.w - w) / 2.0,
-            Align::Right => rect.right() - w,
-        };
-        draw_line(
-            frame,
-            font,
-            size,
-            x,
-            rect.y + ascent + step * i as f32,
-            line,
-            color,
-        );
+    let runs = layout_box_runs(font, size, line_height, rect, text, align, max_lines);
+    for run in &runs {
+        frame.draw_glyph_run(run, color);
     }
-    lines.len()
+    runs.len()
 }

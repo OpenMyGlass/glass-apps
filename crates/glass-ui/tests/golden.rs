@@ -3,7 +3,7 @@
 //! `GLASS_UPDATE_GOLDEN=1 cargo test -p glass-ui --test golden` to regenerate them.
 //! On a mismatch, the actual image is written to `target/golden-actual/`.
 
-use glass_gfx::Frame;
+use glass_gfx::{Frame, SoftwareCompositor};
 use glass_ui::card::render_card;
 use glass_ui::{Card, CardContent, RenderContext, Timeline, CARDS_PER_PAD_WIDTH};
 use std::path::PathBuf;
@@ -145,8 +145,8 @@ fn golden_timeline_mid_scroll() {
         vec![message()],
     );
     t.set_context(ctx());
-    let mut f = Frame::glass();
-    t.render(&mut f);
+    let mut f = SoftwareCompositor::glass();
+    t.render(&mut f).unwrap();
     t.handle(&glass_ui::InputEvent::Scroll {
         displacement: 0.35 / CARDS_PER_PAD_WIDTH,
         delta: 0.0,
@@ -156,6 +156,6 @@ fn golden_timeline_mid_scroll() {
         cancelled: false,
         timestamp_us: 0,
     });
-    t.render(&mut f);
-    check("timeline-mid-scroll", &f);
+    t.render(&mut f).unwrap();
+    check("timeline-mid-scroll", f.frame());
 }

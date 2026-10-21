@@ -36,17 +36,24 @@
 //!
 //! # Rendering
 //!
-//! Each card is rendered once into its own layer ([`crate::card::render_card`]); a frame is
-//! one or two layer copies at the scroll offset. A layer is re-rendered only when its
-//! [`crate::card::render_key`] changes (content, clock minute, relative time text). When the
-//! timeline is at rest, the cards next to the visible one are rendered ahead and layers
-//! farther away are dropped, so a drag between neighbours never renders a card. At rest at
-//! most three layers are kept (about 900 KiB each at 640×360); a fling across several cards
-//! renders the cards it passes on demand and holds their layers until the next rest.
+//! Rendering goes through a [`Compositor`] (software or GLES2; the timeline does not know
+//! which). Each card is painted once into its own layer ([`crate::card::paint_card`]); a
+//! frame is one or two layer placements at the scroll offset. A layer is repainted only when
+//! its [`crate::card::render_key`] changes (content, clock minute, relative time text). When
+//! the timeline is at rest, the cards next to the visible one are painted ahead and layers
+//! farther away are dropped, so a drag between neighbours never paints a card. At rest three
+//! layers are kept (about 900 KiB each at 640×360); a fling across several cards paints the
+//! cards it reaches on demand, and never more than [`MAX_RESIDENT_LAYERS`] layers exist: the
+//! layer of the card farthest from the current position is dropped first.
+//!
+//! A timeline renders through one compositor for its whole life (its layer ids belong to
+//! that compositor).
 
-use crate::card::{render_card, render_key, Card, CardContent, CardId, RenderContext};
+use crate::card::{paint_card, render_key, Card, CardContent, CardId, RenderContext};
 use crate::input::{GestureKind, InputEvent};
-use glass_gfx::{Color, Frame, GLASS_HEIGHT, GLASS_WIDTH};
+use glass_gfx::{
+    Color, Compositor, GfxError, LayerId, Painter, Placement, GLASS_HEIGHT, GLASS_WIDTH,
+};
 use std::collections::HashMap;
 
 /// Cards moved by a drag across the full touchpad width.
@@ -63,6 +70,8 @@ pub const SAME_TOUCH_US: u64 = 200_000;
 pub const EDGE_RESISTANCE: f32 = 0.3;
 /// Largest overscroll past either end, in cards.
 pub const MAX_OVERSCROLL: f32 = 0.3;
+/// Most card layers that exist at any time (GPU memory on the SGX540: 4 × 900 KiB).
+pub const MAX_RESIDENT_LAYERS: usize = 4;
 
 /// What the launcher should do after an input event.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,8 +105,10 @@ struct Release {
 }
 
 struct Layer {
-    key: u64,
-    frame: Frame,
+    /// The render key the layer was painted for; `None` while it is being painted (a
+    /// failed paint leaves it to be painted again).
+    key: Option<u64>,
+    id: LayerId,
 }
 
 /// The card timeline: model, input handling, motion and rendering.
@@ -113,6 +124,8 @@ pub struct Timeline {
     release: Option<Release>,
     ctx: RenderContext,
     layers: HashMap<CardId, Layer>,
+    /// Layers to free in the compositor at the next render.
+    dropped: Vec<LayerId>,
     renders: u64,
     dirty: bool,
 }
@@ -144,6 +157,7 @@ impl Timeline {
                 minute: 0,
             },
             layers: HashMap::new(),
+            dropped: Vec::new(),
             renders: 0,
             dirty: true,
         }
@@ -153,7 +167,7 @@ impl Timeline {
     pub fn with_size(mut self, width: u32, height: u32) -> Timeline {
         self.width = width;
         self.height = height;
-        self.layers.clear();
+        self.dropped.extend(self.layers.drain().map(|(_, l)| l.id));
         self.dirty = true;
         self
     }
@@ -210,7 +224,7 @@ impl Timeline {
         self.dirty
     }
 
-    /// How many times a card was rendered into a layer.
+    /// How many times a card was painted into a layer.
     pub fn render_count(&self) -> u64 {
         self.renders
     }
@@ -229,7 +243,7 @@ impl Timeline {
         self.ctx = ctx;
         let stale = self.layers.iter().any(|(id, layer)| {
             self.index_of(*id)
-                .is_some_and(|i| render_key(&self.cards[i], &ctx) != layer.key)
+                .is_some_and(|i| Some(render_key(&self.cards[i], &ctx)) != layer.key)
         });
         if stale {
             self.dirty = true;
@@ -300,7 +314,9 @@ impl Timeline {
             return false;
         };
         self.cards.remove(at);
-        self.layers.remove(&id);
+        if let Some(l) = self.layers.remove(&id) {
+            self.dropped.push(l.id);
+        }
         // Stay on the same card; if it was the removed one, show its older neighbour (or
         // the newer one at the end). Motion stops: the layout under the finger changed.
         if self.target > at {
@@ -506,66 +522,121 @@ impl Timeline {
 
     // ---- rendering ----
 
-    fn ensure_layer(&mut self, index: usize) {
-        let card = &self.cards[index];
-        let key = render_key(card, &self.ctx);
-        if self.layers.get(&card.id).is_some_and(|l| l.key == key) {
-            return;
-        }
-        let frame = render_card(card, &self.ctx, self.width, self.height);
+    /// The layer of card `index`, painted for the current context. A new layer first makes
+    /// room by dropping the layer farthest from the current position, sparing `pinned`.
+    fn ensure_layer(
+        &mut self,
+        comp: &mut dyn Compositor,
+        index: usize,
+        pinned: &[CardId],
+    ) -> Result<LayerId, GfxError> {
+        let card_id = self.cards[index].id;
+        let key = render_key(&self.cards[index], &self.ctx);
+        let id = match self.layers.get(&card_id) {
+            Some(l) if l.key == Some(key) => return Ok(l.id),
+            Some(l) => l.id,
+            None => {
+                while self.layers.len() >= MAX_RESIDENT_LAYERS {
+                    if !self.evict_farthest(comp, pinned) {
+                        break;
+                    }
+                }
+                comp.create_layer(self.width, self.height, true)?
+            }
+        };
+        // Recorded before painting so that a failed paint does not leak the layer.
+        self.layers.insert(card_id, Layer { key: None, id });
+        let (card, ctx) = (&self.cards[index], self.ctx);
+        comp.paint_layer(id, &mut |p: &mut dyn Painter| paint_card(card, &ctx, p))?;
         self.renders += 1;
-        self.layers.insert(card.id, Layer { key, frame });
+        self.layers.insert(card_id, Layer { key: Some(key), id });
+        Ok(id)
     }
 
-    /// Composites the visible cards at the current position into `frame` (which must be
-    /// the timeline's size). At rest, also renders the neighbouring cards ahead and drops
-    /// layers that are no longer near.
-    pub fn render(&mut self, frame: &mut Frame) {
+    /// Drops the layer whose card is farthest from the position (not one of `pinned`).
+    fn evict_farthest(&mut self, comp: &mut dyn Compositor, pinned: &[CardId]) -> bool {
+        let far = self
+            .layers
+            .keys()
+            .filter(|id| !pinned.contains(id))
+            .map(|&id| {
+                let d = self
+                    .index_of(id)
+                    .map_or(f32::INFINITY, |i| (i as f32 - self.pos).abs());
+                (id, d)
+            })
+            .max_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        match far {
+            Some((id, _)) => {
+                if let Some(l) = self.layers.remove(&id) {
+                    comp.drop_layer(l.id);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Composes the visible cards at the current position and presents nothing: call
+    /// [`Compositor::present`] after it. The compositor must have the timeline's size. At
+    /// rest, also paints the neighbouring cards ahead and drops layers that are no longer
+    /// near.
+    pub fn render(&mut self, comp: &mut dyn Compositor) -> Result<(), GfxError> {
+        let size = comp.size();
         assert!(
-            (frame.width(), frame.height()) == (self.width, self.height),
+            size == (self.width, self.height),
             "frame size {}x{} differs from the timeline's {}x{}",
-            frame.width(),
-            frame.height(),
+            size.0,
+            size.1,
             self.width,
             self.height
         );
+        for id in self.dropped.drain(..) {
+            comp.drop_layer(id);
+        }
         let w = self.width as i32;
         let base = self.pos.floor();
         let first = base as i64;
         let offset = ((self.pos - base) * w as f32).round() as i32;
-        let mut visible: Vec<(i64, i32)> = vec![(first, -offset)];
-        if offset != 0 {
-            visible.push((first + 1, w - offset));
-        }
-        let covered = visible
-            .iter()
-            .all(|&(i, _)| i >= 0 && (i as usize) < self.cards.len());
-        if !covered {
-            frame.fill(Color::BLACK);
-        }
-        for &(i, x) in &visible {
-            if i < 0 || i as usize >= self.cards.len() {
-                continue;
+        let mut visible: Vec<(usize, i32)> = Vec::with_capacity(2);
+        for (i, x) in [(first, -offset), (first + 1, w - offset)] {
+            if (x < w && x > -w) && i >= 0 && (i as usize) < self.cards.len() {
+                visible.push((i as usize, x));
             }
-            let i = i as usize;
-            self.ensure_layer(i);
-            let layer = &self.layers[&self.cards[i].id].frame;
-            frame.copy_from(layer, x, 0);
         }
+        let pinned: Vec<CardId> = visible.iter().map(|&(i, _)| self.cards[i].id).collect();
+        let mut placements = Vec::with_capacity(visible.len());
+        for &(i, x) in &visible {
+            let id = self.ensure_layer(comp, i, &pinned)?;
+            placements.push(Placement::at(id, x, 0));
+        }
+        comp.compose(Color::BLACK, &placements)?;
         if self.is_settled() {
-            self.prepare_neighbours();
+            self.prepare_neighbours(comp)?;
         }
         self.dirty = false;
+        Ok(())
     }
 
-    fn prepare_neighbours(&mut self) {
+    fn prepare_neighbours(&mut self, comp: &mut dyn Compositor) -> Result<(), GfxError> {
         let c = self.target;
         let lo = c.saturating_sub(1);
         let hi = (c + 1).min(self.last());
-        for i in lo..=hi {
-            self.ensure_layer(i);
-        }
         let keep: Vec<CardId> = self.cards[lo..=hi].iter().map(|c| c.id).collect();
-        self.layers.retain(|id, _| keep.contains(id));
+        let far: Vec<CardId> = self
+            .layers
+            .keys()
+            .filter(|id| !keep.contains(id))
+            .copied()
+            .collect();
+        for id in far {
+            if let Some(l) = self.layers.remove(&id) {
+                comp.drop_layer(l.id);
+            }
+        }
+        for i in lo..=hi {
+            self.ensure_layer(comp, i, &keep)?;
+        }
+        Ok(())
     }
 }

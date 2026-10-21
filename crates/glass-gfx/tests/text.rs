@@ -196,3 +196,52 @@ fn draw_box_with_zero_line_height_draws_one_line() {
     );
     assert_eq!(n, 1);
 }
+
+#[test]
+fn layout_line_places_glyphs_on_whole_pixels_and_skips_spaces() {
+    let font = fonts::font(Weight::Light);
+    let (run, w) = text::layout_line(font, 32.0, 10.4, 50.6, "a b");
+    assert_eq!(w, text::measure(font, 32.0, "a b"));
+    assert_eq!(run.glyphs.len(), 2, "the space has no glyph");
+    assert_eq!(run.glyphs[0].x, 10);
+    assert!(run.glyphs.iter().all(|g| g.baseline == 51));
+    assert!(run.glyphs[1].x > run.glyphs[0].x);
+}
+
+#[test]
+fn drawing_a_laid_out_run_matches_draw_line() {
+    let font = fonts::font(Weight::Light);
+    let mut a = Frame::new(200, 60);
+    a.fill(Color::BLACK);
+    text::draw_line(&mut a, font, 36.0, 5.3, 45.0, "10:42 ok", Color::WHITE);
+    let mut b = Frame::new(200, 60);
+    b.fill(Color::BLACK);
+    let (run, _) = text::layout_line(font, 36.0, 5.3, 45.0, "10:42 ok");
+    b.draw_glyph_run(&run, Color::WHITE);
+    assert_eq!(a.data(), b.data());
+}
+
+#[test]
+fn layout_box_runs_has_one_run_per_line() {
+    let font = fonts::font(Weight::Light);
+    let rect = Rect::new(0.0, 0.0, 200.0, 200.0);
+    let body = "one two three four five six seven eight";
+    let runs = text::layout_box_runs(font, 32.0, 1.2, rect, body, Align::Left, usize::MAX);
+    let mut f = Frame::new(200, 200);
+    let n = text::draw_box(
+        &mut f,
+        font,
+        32.0,
+        1.2,
+        rect,
+        body,
+        Color::WHITE,
+        Align::Left,
+        usize::MAX,
+    );
+    assert_eq!(runs.len(), n);
+    assert!(n > 1);
+    assert!(runs
+        .windows(2)
+        .all(|r| r[1].glyphs[0].baseline > r[0].glyphs[0].baseline));
+}

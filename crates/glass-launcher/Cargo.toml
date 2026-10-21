@@ -8,12 +8,15 @@ repository.workspace = true
 rust-version.workspace = true
 
 [features]
-default = []
+default = ["gles"]
 # Open a host window (development on a desktop).
 window = ["glass-gfx/window"]
+# The GLES2 renderer (EGL and GLES loaded with dlopen; needs a dynamically linked build).
+gles = ["dep:glass-gfx-gles"]
 
 [dependencies]
 glass-gfx.workspace = true
+glass-gfx-gles = { workspace = true, optional = true }
 glass-ui.workspace = true
 
 [target.'cfg(unix)'.dependencies]

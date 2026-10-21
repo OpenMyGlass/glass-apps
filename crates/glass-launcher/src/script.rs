@@ -10,7 +10,7 @@
 //! | `camera`, `lookup`, `lookdown`, `wear`, `wink` | accepted and ignored (no effect on the timeline) |
 
 use crate::App;
-use glass_gfx::{Display, DisplayError};
+use glass_gfx::{Display, GfxError};
 use glass_ui::{Action, GestureKind, InputEvent, RenderContext};
 
 /// Frames a `scroll` command takes to reach its displacement.
@@ -144,7 +144,7 @@ impl Runner {
         app: &mut App,
         display: &mut dyn Display,
         clock: impl Fn(f32) -> RenderContext,
-    ) -> Result<(), DisplayError> {
+    ) -> Result<(), GfxError> {
         self.present(app, display)?;
         for cmd in commands {
             match cmd {
@@ -234,17 +234,15 @@ impl Runner {
         app: &mut App,
         display: &mut dyn Display,
         clock: &impl Fn(f32) -> RenderContext,
-    ) -> Result<(), DisplayError> {
+    ) -> Result<(), GfxError> {
         let dt = self.dt();
         self.elapsed_s += dt;
         app.step(dt, clock(self.elapsed_s));
         self.present(app, display)
     }
 
-    fn present(&mut self, app: &mut App, display: &mut dyn Display) -> Result<(), DisplayError> {
-        if let Some(frame) = app.frame_if_changed() {
-            display.present(frame)?;
-        }
+    fn present(&mut self, app: &mut App, display: &mut dyn Display) -> Result<(), GfxError> {
+        app.present_if_changed(display)?;
         Ok(())
     }
 }

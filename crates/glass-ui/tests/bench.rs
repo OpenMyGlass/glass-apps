@@ -1,7 +1,7 @@
 //! Host benchmarks, reported and not enforced. Run in release mode:
 //! `cargo test --release -p glass-ui --test bench -- --ignored --nocapture`
 
-use glass_gfx::Frame;
+use glass_gfx::SoftwareCompositor;
 use glass_ui::card::render_card;
 use glass_ui::{Card, CardContent, InputEvent, RenderContext, Timeline};
 use std::time::Instant;
@@ -49,8 +49,8 @@ fn bench_card_render_and_scroll_composite() {
         vec![text_card(2), text_card(3)],
     );
     t.set_context(ctx());
-    let mut f = Frame::glass();
-    t.render(&mut f);
+    let mut f = SoftwareCompositor::glass();
+    t.render(&mut f).unwrap();
     let renders = t.render_count();
     let start = Instant::now();
     for i in 0..N {
@@ -64,7 +64,7 @@ fn bench_card_render_and_scroll_composite() {
             cancelled: false,
             timestamp_us: 0,
         });
-        t.render(&mut f);
+        t.render(&mut f).unwrap();
     }
     let per = start.elapsed() / N;
     println!("composite one scrolling frame (two layers): {per:?}");
