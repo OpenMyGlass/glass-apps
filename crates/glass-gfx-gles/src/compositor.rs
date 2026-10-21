@@ -18,6 +18,9 @@ pub struct GlesOptions {
     pub sgx540_checks: bool,
     /// Store opaque layers as RGB565 as if RGBA FBOs were incomplete (tests the fallback).
     pub force_rgb565_layers: bool,
+    /// Use the default display and a pbuffer even when the surfaceless platform and
+    /// context are available (tests the EGL 1.4 set-up).
+    pub force_pbuffer: bool,
 }
 
 impl Default for GlesOptions {
@@ -25,6 +28,7 @@ impl Default for GlesOptions {
         GlesOptions {
             sgx540_checks: cfg!(debug_assertions),
             force_rgb565_layers: false,
+            force_pbuffer: false,
         }
     }
 }
@@ -103,7 +107,7 @@ impl GlesCompositor {
         height: u32,
         options: GlesOptions,
     ) -> Result<GlesCompositor, GfxError> {
-        let egl = EglContext::offscreen().map_err(gl_err)?;
+        let egl = EglContext::offscreen(options.force_pbuffer).map_err(gl_err)?;
         let raw = egl.load_gl();
         let (info, max) = unsafe {
             let max = raw.get_parameter_i32(glow::MAX_TEXTURE_SIZE).max(64) as u32;

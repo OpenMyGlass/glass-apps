@@ -63,8 +63,10 @@ fn egl_err(what: &str, e: egl::Error) -> String {
 }
 
 impl EglContext {
-    /// An off-screen GLES2 context, made current on this thread.
-    pub fn offscreen() -> Result<EglContext, String> {
+    /// An off-screen GLES2 context, made current on this thread. `force_pbuffer` skips the
+    /// surfaceless platform and context and uses the default display with a pbuffer, the
+    /// set-up of EGL 1.4 libraries (tests that path on Mesa).
+    pub fn offscreen(force_pbuffer: bool) -> Result<EglContext, String> {
         // SAFETY: the library is the system's EGL; its symbols follow the EGL API.
         let egl = unsafe {
             egl::DynamicInstance::<egl::EGL1_4>::load_required_from_filename(EGL_LIBRARY)
@@ -77,7 +79,7 @@ impl EglContext {
             .unwrap_or_default();
         let mut setup = String::new();
         let mut display = None;
-        if has_ext(&client_ext, "EGL_MESA_platform_surfaceless") {
+        if !force_pbuffer && has_ext(&client_ext, "EGL_MESA_platform_surfaceless") {
             display = Self::surfaceless_display(&egl, &client_ext);
             if display.is_some() {
                 setup.push_str("surfaceless");
@@ -103,7 +105,8 @@ impl EglContext {
             .query_string(Some(display), egl::VENDOR)
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let surfaceless_ctx = has_ext(&display_ext, "EGL_KHR_surfaceless_context");
+        let surfaceless_ctx =
+            !force_pbuffer && has_ext(&display_ext, "EGL_KHR_surfaceless_context");
         let surface_type = if surfaceless_ctx { 0 } else { egl::PBUFFER_BIT };
         let attribs = [
             egl::RED_SIZE,

@@ -39,7 +39,7 @@ fn compositor_with(options: GlesOptions) -> GlesCompositor {
 fn compositor() -> GlesCompositor {
     compositor_with(GlesOptions {
         sgx540_checks: true,
-        force_rgb565_layers: false,
+        ..GlesOptions::default()
     })
 }
 
@@ -440,6 +440,7 @@ fn rgb565_fallback_layers_render() {
     let mut c = compositor_with(GlesOptions {
         sgx540_checks: true,
         force_rgb565_layers: true,
+        ..GlesOptions::default()
     });
     let id = c.create_layer(640, 360, true).unwrap();
     assert_eq!(c.layer_format(id), Some(LayerFormat::Rgb565));
@@ -523,6 +524,35 @@ fn box_text_matches_software() {
         "box-text",
         &g.read_frame().unwrap(),
         s.frame(),
+        Tolerance::Strict,
+    );
+}
+
+/// The EGL 1.4 set-up (default display, pbuffer surface), as on Android and libhybris.
+/// Mesa needs `EGL_PLATFORM=surfaceless` for a default display without a window system.
+#[test]
+fn pbuffer_context_renders_the_goldens_too() {
+    if !enabled() {
+        return;
+    }
+    if std::env::var_os("EGL_PLATFORM").is_none() {
+        eprintln!("skipped: set EGL_PLATFORM (surfaceless on Mesa) for the pbuffer test");
+        return;
+    }
+    let mut c = compositor_with(GlesOptions {
+        sgx540_checks: true,
+        force_pbuffer: true,
+        ..GlesOptions::default()
+    });
+    println!("{}", c.info());
+    assert!(
+        c.info().egl.setup.contains("pbuffer"),
+        "{}",
+        c.info().egl.setup
+    );
+    check_golden(
+        "text",
+        &render_card_gles(&mut c, &scene("text")),
         Tolerance::Strict,
     );
 }

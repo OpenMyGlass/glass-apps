@@ -70,6 +70,10 @@ jobs:
         run: cargo test --locked -p glass-gfx-gles --test gles gl_info -- --nocapture
       - name: GLES tests against the goldens (SGX540 assertion layer on)
         run: cargo test --locked -p glass-gfx-gles -- --nocapture --test-threads=1
+      - name: GLES with the EGL 1.4 set-up (default display, pbuffer)
+        env:
+          EGL_PLATFORM: surfaceless
+        run: cargo test --locked -p glass-gfx-gles --test gles pbuffer -- --nocapture
       - name: GLES images that did not match
         if: failure()
         uses: actions/upload-artifact@v4
