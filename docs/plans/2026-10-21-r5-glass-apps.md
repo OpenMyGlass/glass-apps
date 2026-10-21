@@ -19,13 +19,13 @@ The same as glass-services ([its plan](https://github.com/OpenMyGlass/glass-serv
 
 | Option | For | Against |
 |---|---|---|
-| **Own renderer** on `tiny-skia` (BSD-3-Clause) and `fontdue` (MIT/Apache-2.0) (chosen) | Pure Rust, no C dependencies, cross-builds trivially; the Glass UI is simple (full-screen cards, large text, images, a horizontal timeline); a retained layer per card makes scrolling a blit; deterministic output, so tests compare pixels | We write layout and animation ourselves |
-| Slint | Declarative, embedded-friendly, software renderer | GPLv3 or a non-OSI royalty-free licence: awkward for an Apache-2.0 project others may redistribute |
+| **Own renderer** on `tiny-skia` (BSD-3-Clause) and `fontdue` (MIT, Apache-2.0 or Zlib) (chosen) | Pure Rust, no C dependencies, cross-builds trivially; the Glass UI is simple (full-screen cards, large text, images, a horizontal timeline); a retained layer per card makes scrolling a blit; deterministic output, so tests compare pixels | We write layout and animation ourselves |
+| Slint | Declarative, embedded-friendly, software renderer | On embedded devices the choice is GPLv3 or a paid licence (the royalty-free licence excludes embedded systems): awkward for an Apache-2.0 project others may redistribute |
 | LVGL | MIT, made for software rendering on small CPUs | C: the UI would be written in C or through immature bindings |
-| Qt, GTK, Flutter | Complete toolkits | Large; need GLES for good performance, which plain Linux lacks; Flutter has no Android 5 software path |
+| Qt, GTK, Flutter | Complete toolkits | Large; need GLES for good performance, which plain Linux lacks |
 | egui, iced | Rust | Immediate mode (egui) redraws everything each frame; iced pulls in winit and a large dependency tree |
 
-The cost of software rendering at 640×360: one frame is 230,400 pixels (900 KiB in RGBA8888). A card is rendered once into its own layer; while the timeline scrolls, a frame is two layer blits, a few milliseconds on a Cortex-A9. Text and images are drawn only when a card changes.
+The cost of software rendering at 640×360: one frame is 230,400 pixels (900 KiB in RGBA8888). A card is rendered once into its own layer; while the timeline scrolls, a frame is two layer blits, a few milliseconds on a Cortex-A9 (blits are plain memory copies). Text and images are drawn only when a card changes. tiny-skia has SIMD only for x86 and AArch64, so on armv7 card rendering runs its scalar path: it must stay off the scroll path (cards are rendered ahead, when they change or come next to the visible one), and only the visible card and its neighbours keep a layer (about 900 KiB each), so memory stays bounded.
 
 ### Thin graphics layer
 
@@ -35,7 +35,8 @@ The `glass-gfx` crate defines a `Frame` (an RGBA8888 pixel buffer of the display
 |---|---|---|
 | Headless (PNG files, in-memory) | tests, CI | M1 |
 | Host window (`minifb`, behind a Cargo feature) | development on a desktop, with the keyboard driving gestures through the mock | M1 |
-| Linux framebuffer (`/dev/fb0`, `mmap`, the pixel format reported by `FBIOGET_VSCREENINFO`) | route 2 | M2 |
+| Linux framebuffer (`/dev/fb0`, `mmap`, the pixel format reported by `FBIOGET_VSCREENINFO`; double buffering through `yres_virtual` and `FBIOPAN_DISPLAY`, `FBIO_WAITFORVSYNC` when the driver has it; one conversion pass from premultiplied RGBA to the panel's format per frame, measured) | route 2 | M2 |
+| DRM dumb buffers (`omapdrm`) | route 2 on a mainline kernel (glass-mainline) | later |
 | Android `ANativeWindow` (software lock and post), in the Android glue | route 1 | M3 |
 | GLES2 (upload the frame or the card layers as textures) | route 1, if measurements show the software path is too slow or too costly in battery | later, optional |
 
@@ -61,9 +62,9 @@ Glass used Roboto Light and Thin. We bundle **Inter** (Rasmus Andersson, SIL Ope
 ## Milestone 1 (this plan)
 
 1. The timeline model: a home card (clock) in the middle, newer and settings cards on one side, older cards on the other, navigated with `SWIPE_FORWARD` and `SWIPE_BACKWARD` and followed live with `Scroll`; `TAP` opens a card's menu (placeholder in M1); `SWIPE_DOWN` on home sends `ScreenRequest{SLEEP}`.
-2. Card rendering at 640×360 in Glass style (black background, white Roboto Light text, footer with timestamp), with golden-image tests (rendered PNG compared with a committed reference, small tolerance).
+2. Card rendering at 640×360 in Glass style (black background, white Inter Light text, footer with timestamp), with golden-image tests (rendered PNG compared with a committed reference, small tolerance).
 3. `glass-launcher --mock` runs against the `glass-api` in-process mock; with `--features window` it opens a host window and maps the arrow keys and Enter to gestures.
-4. Tests: timeline navigation from gesture sequences, scroll settling, rendering of each card type, frame time budget measured on the host (reported, not enforced).
+4. Tests: timeline navigation from gesture sequences, scroll settling, rendering of each card type. Benchmarks (reported, not enforced): composite time of a scrolling frame and render time of one card, on the host now and on armv7 when a device is available.
 5. CI: host tests, cross-builds for `armv7-linux-androideabi` and `armv7-unknown-linux-musleabihf`.
 
 ## Later milestones
@@ -75,4 +76,4 @@ Glass used Roboto Light and Thin. We bundle **Inter** (Rasmus Andersson, SIL Ope
 ## Device checklist (not run: no Glass available)
 
 - [ ] The launcher draws at 640×360 on the panel, text is sharp, the timeline scrolls without visible stutter.
-- [ ] Frame time while scrolling, CPU use while idle (should be zero: no redraw without a change).
+- [ ] Frame time while scrolling, render time of one card, CPU use while idle (only the home clock redraws, once a minute).
