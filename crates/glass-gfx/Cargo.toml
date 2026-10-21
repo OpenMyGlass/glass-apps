@@ -1,0 +1,19 @@
+[package]
+name = "glass-gfx"
+description = "Thin software graphics layer for the Glass apps: frames, drawing, text, displays"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[features]
+default = []
+# Host window back end (development on a desktop).
+window = ["dep:minifb"]
+
+[dependencies]
+tiny-skia.workspace = true
+fontdue.workspace = true
+png.workspace = true
+minifb = { workspace = true, optional = true }

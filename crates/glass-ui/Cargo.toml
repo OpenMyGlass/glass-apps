@@ -1,0 +1,11 @@
+[package]
+name = "glass-ui"
+description = "Glass cards and the card timeline: model, input handling, rendering"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glass-gfx.workspace = true

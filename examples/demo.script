@@ -1,0 +1,17 @@
+# Demo for: cargo run -p glass-launcher -- --headless --script examples/demo.script --out /tmp/frames --time 10:42
+wait 300ms
+swipe forward      # to the newest history card
+wait 400ms
+scroll 0.3         # a slow drag to the next card
+wait 400ms
+tap                # the card's menu (placeholder)
+swipe down         # back to home
+wait 400ms
+swipe backward     # the "now" card, then settings
+wait 400ms
+swipe backward
+wait 400ms
+swipe down
+wait 400ms
+swipe down         # on home: the screen turns off
+wait 200ms

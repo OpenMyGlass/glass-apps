@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = ["crates/glass-gfx", "crates/glass-ui", "crates/glass-launcher"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/OpenMyGlass/glass-apps"
+rust-version = "1.80"
+
+[workspace.dependencies]
+tiny-skia = { version = "0.12", default-features = false, features = ["std", "png-format"] }
+fontdue = { version = "0.9", default-features = false, features = ["std", "hashbrown"] }
+png = "0.18"
+minifb = "0.29"
+glass-gfx = { path = "crates/glass-gfx" }
+glass-ui = { path = "crates/glass-ui" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
