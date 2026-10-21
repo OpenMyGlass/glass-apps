@@ -1,0 +1,17 @@
+[package]
+name = "glass-gfx-gles"
+description = "GLES2 renderer for the Glass apps: EGL context, painter and compositor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+glass-gfx.workspace = true
+khronos-egl.workspace = true
+glow.workspace = true
+libloading.workspace = true
+
+[dev-dependencies]
+glass-ui.workspace = true

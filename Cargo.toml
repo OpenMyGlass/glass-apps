@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/glass-gfx", "crates/glass-ui", "crates/glass-launcher"]
+members = [
+    "crates/glass-gfx",
+    "crates/glass-gfx-gles",
+    "crates/glass-ui",
+    "crates/glass-launcher",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -14,7 +19,11 @@ tiny-skia = { version = "0.12", default-features = false, features = ["std", "pn
 fontdue = { version = "0.9", default-features = false, features = ["std", "hashbrown"] }
 png = "0.18"
 minifb = "0.29"
+khronos-egl = { version = "6", features = ["dynamic"] }
+glow = "0.17"
+libloading = "0.8"
 glass-gfx = { path = "crates/glass-gfx" }
+glass-gfx-gles = { path = "crates/glass-gfx-gles" }
 glass-ui = { path = "crates/glass-ui" }
 
 [profile.release]
