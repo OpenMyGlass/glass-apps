@@ -16,7 +16,7 @@ use glass_launcher::glassd::{wait_time, Backoff, Session};
 use glass_launcher::platform::{Platform, PlatformEvent};
 use glass_launcher::{clock, demo, App};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// The name of the marker file (in the app's files directory) that says setup was done.
 pub const SETUP_MARKER: &str = "setup-done";
@@ -206,17 +206,8 @@ pub fn run(
             }
         }
         if let Some(s) = session.as_mut() {
-            let mut lost = None;
-            loop {
-                match s.pump(&mut app, Some(Duration::from_micros(1))) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) => {
-                        lost = Some(e);
-                        break;
-                    }
-                }
-            }
+            // Non-blocking: everything already received (the loop waits in poll below).
+            let lost = s.drain(&mut app).err();
             for l in s.take_log() {
                 native.log(l.contains("ERROR_CODE_"), &l);
             }
@@ -270,6 +261,7 @@ mod tests {
     use glass_launcher::glassd::CLIENT_NAME;
     use glass_launcher::platform::MockPlatform;
     use std::sync::Mutex;
+    use std::time::Duration;
 
     #[derive(Default)]
     struct TestNative {

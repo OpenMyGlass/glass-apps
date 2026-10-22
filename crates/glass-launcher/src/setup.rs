@@ -161,6 +161,13 @@ impl Setup {
                     };
                 }
             }
+            // Paired without our confirmation (a consent answered elsewhere, or a phone that
+            // bonded on its own): go on to the phone step.
+            PlatformEvent::Paired { ok: true, .. } => {
+                if matches!(self.step, Step::Pair | Step::Pairing { .. }) {
+                    self.step = Step::Phone;
+                }
+            }
             PlatformEvent::Paired { ok: false, .. } => {
                 if matches!(self.step, Step::Pairing { .. } | Step::Phone) {
                     self.step = Step::Pair;
@@ -324,6 +331,16 @@ mod tests {
         let mut s = Setup::new();
         s.input(&g(GestureKind::Tap));
         s.input(&g(GestureKind::SwipeForward));
+        assert_eq!(s.step(), &Step::Phone);
+        s.platform_event(&PlatformEvent::Paired {
+            device: "X".into(),
+            ok: false,
+        });
+        assert_eq!(s.step(), &Step::Pair);
+        s.platform_event(&PlatformEvent::Paired {
+            device: "X".into(),
+            ok: true,
+        });
         assert_eq!(s.step(), &Step::Phone);
         s.platform_event(&PlatformEvent::Paired {
             device: "X".into(),

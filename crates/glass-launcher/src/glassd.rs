@@ -365,6 +365,18 @@ impl Session {
                         }))?;
                     self.log.push(format!("DictationCancel {request_id}"));
                 }
+                Request::KeepScreenOn(on) => {
+                    let action = if on {
+                        screen_request::Action::KeepOn
+                    } else {
+                        screen_request::Action::ReleaseKeepOn
+                    };
+                    // One minute: glassd ends a dictation after 55 s anyway.
+                    self.client.send(client_frame::Body::Screen(ScreenRequest {
+                        action: action as i32,
+                        duration_ms: if on { 60_000 } else { 0 },
+                    }))?;
+                }
             }
         }
         Ok(())
@@ -380,9 +392,22 @@ impl Session {
         };
         self.handle(first, app)?;
         n += 1;
-        // Frames already decoded or already in the socket: a 1 µs deadline reads what is
-        // there and does not wait for more.
-        while let Some(f) = self.client.recv(Some(Duration::from_micros(1)))? {
+        // Frames already decoded or already in the socket, without waiting for more.
+        n += self.drain_received(app)?;
+        Ok(n)
+    }
+
+    /// Sends pending requests, then applies every frame already received, without blocking
+    /// (for a loop that polls the socket itself); returns how many were applied.
+    pub fn drain(&mut self, app: &mut App) -> Result<usize, ClientError> {
+        self.send_requests(app)?;
+        self.drain_received(app)
+    }
+
+    fn drain_received(&mut self, app: &mut App) -> Result<usize, ClientError> {
+        let mut n = 0;
+        // try_recv never blocks; recv with a tiny timeout would wait a scheduler tick.
+        while let Some(f) = self.client.try_recv()? {
             self.handle(f, app)?;
             n += 1;
         }

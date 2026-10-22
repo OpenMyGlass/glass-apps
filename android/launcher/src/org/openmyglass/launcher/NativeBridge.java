@@ -59,6 +59,7 @@ final class NativeBridge {
     }
 
     void destroy() {
+        destroyed = true;
         if (handle != 0) {
             long h = handle;
             handle = 0;
@@ -72,10 +73,16 @@ final class NativeBridge {
         main.post(new Runnable() {
             @Override
             public void run() {
-                requests.onRequest(line);
+                // A request posted just before onDestroy is dropped.
+                if (!destroyed) {
+                    requests.onRequest(line);
+                }
             }
         });
     }
+
+    /** Set on the main thread by destroy(). */
+    private boolean destroyed;
 
     private native long nativeCreate(String filesDir);
 

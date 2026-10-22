@@ -9,11 +9,14 @@ import android.content.Intent;
 import android.content.IntentFilter;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.Log;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Carries out the native launcher's platform requests (Wi-Fi, Bluetooth, pairing, the
@@ -34,6 +37,15 @@ final class AndroidPlatform extends BroadcastReceiver implements NativeBridge.Re
     private final BluetoothAdapter bt;
     /** The device of the pairing request shown, until it is answered. */
     private BluetoothDevice pending;
+    /**
+     * Until when (uptime ms) pairing requests are answered here: only while the set-up flow
+     * made Glass discoverable. At any other time the system handles them.
+     */
+    private long pairingUntil;
+    /** A discoverable request made while Bluetooth was still turning on, in seconds. */
+    private int discoverableWhenOn;
+    /** Connected devices (ACL), address to name. */
+    private final Map<String, String> connected = new LinkedHashMap<String, String>();
 
     AndroidPlatform(Context context, Events events) {
         this.context = context;
@@ -49,6 +61,8 @@ final class AndroidPlatform extends BroadcastReceiver implements NativeBridge.Re
         f.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
         f.addAction(BluetoothAdapter.ACTION_LOCAL_NAME_CHANGED);
         f.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+        f.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
+        f.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
         context.registerReceiver(this, f);
         // Ordered: taken before the system's pairing dialog, which the touchpad cannot use.
         IntentFilter p = new IntentFilter(BluetoothDevice.ACTION_PAIRING_REQUEST);
@@ -86,10 +100,11 @@ final class AndroidPlatform extends BroadcastReceiver implements NativeBridge.Re
         boolean on = bt.isEnabled();
         List<String> names = new ArrayList<String>();
         if (on) {
-            for (BluetoothDevice d : bt.getBondedDevices()) {
-                names.add(d.getName() == null ? d.getAddress() : d.getName());
-            }
+            // The connected devices (not every paired one).
+            names.addAll(connected.values());
             events.event(PlatformLines.btName(bt.getName()));
+        } else {
+            connected.clear();
         }
         events.event(PlatformLines.bluetooth(on, names));
     }
@@ -105,6 +120,10 @@ final class AndroidPlatform extends BroadcastReceiver implements NativeBridge.Re
             // (a PIN to type) are left to the system.
             if (d == null || (variant != BluetoothDevice.PAIRING_VARIANT_PASSKEY_CONFIRMATION
                     && variant != 3)) {
+                return;
+            }
+            // Outside the set-up flow's pairing step, the system's dialog handles it.
+            if (SystemClock.uptimeMillis() > pairingUntil) {
                 return;
             }
             pending = d;
@@ -124,9 +143,27 @@ final class AndroidPlatform extends BroadcastReceiver implements NativeBridge.Re
             } else if (state == BluetoothDevice.BOND_NONE && prev == BluetoothDevice.BOND_BONDING) {
                 events.event(PlatformLines.paired(name, false));
             }
+        } else if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(a)
+                || BluetoothDevice.ACTION_ACL_DISCONNECTED.equals(a)) {
+            BluetoothDevice d = intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+            if (d != null) {
+                if (BluetoothDevice.ACTION_ACL_CONNECTED.equals(a)) {
+                    connected.put(d.getAddress(), d.getName() == null ? d.getAddress() : d.getName());
+                } else {
+                    connected.remove(d.getAddress());
+                }
+            }
+            sendBluetooth();
         } else if (a != null && a.startsWith("android.net.wifi")) {
             sendWifi();
         } else {
+            if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(a)
+                    && intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1) == BluetoothAdapter.STATE_ON
+                    && discoverableWhenOn > 0) {
+                int s = discoverableWhenOn;
+                discoverableWhenOn = 0;
+                discoverable(s);
+            }
             sendBluetooth();
         }
     }
@@ -180,9 +217,18 @@ final class AndroidPlatform extends BroadcastReceiver implements NativeBridge.Re
      * screen): the hidden BluetoothAdapter.setScanMode(int, int), present on 4.4 and 6.0.
      */
     private void discoverable(int seconds) {
+        pairingUntil = SystemClock.uptimeMillis() + seconds * 1000L;
+        if (!bt.isEnabled()) {
+            // Bluetooth is still turning on (enable() is asynchronous): on STATE_ON.
+            discoverableWhenOn = seconds;
+            return;
+        }
         try {
             Method m = BluetoothAdapter.class.getMethod("setScanMode", int.class, int.class);
-            m.invoke(bt, SCAN_MODE_DISCOVERABLE, seconds);
+            Object ok = m.invoke(bt, SCAN_MODE_DISCOVERABLE, seconds);
+            if (!Boolean.TRUE.equals(ok)) {
+                Log.e(TAG, "setScanMode(discoverable, " + seconds + ") returned " + ok);
+            }
         } catch (Exception e) {
             Log.e(TAG, "setScanMode failed", e);
         }

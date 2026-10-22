@@ -7,7 +7,7 @@ use std::ffi::{c_int, c_void};
 
 /// Reports no loaded objects, so a panic backtrace shows addresses without names.
 #[no_mangle]
-pub unsafe extern "C" fn dl_iterate_phdr(
+pub extern "C" fn dl_iterate_phdr(
     _callback: Option<unsafe extern "C" fn(*mut c_void, usize, *mut c_void) -> c_int>,
     _data: *mut c_void,
 ) -> c_int {

@@ -28,6 +28,6 @@ LOCAL_SRC_FILES := GlassLauncher.apk
 LOCAL_CERTIFICATE := platform
 LOCAL_PRIVILEGED_MODULE := true
 LOCAL_MODULE_TAGS := optional
-LOCAL_OVERRIDES_PACKAGES := Launcher2 Launcher3 Home
+LOCAL_OVERRIDES_PACKAGES := Launcher2 Launcher3 Home Provision
 LOCAL_REQUIRED_MODULES := libglass_launcher_jni
 include $(BUILD_PREBUILT)

@@ -61,6 +61,9 @@ pub enum Request {
     /// `DictationStart{request_id, purpose: "free"}`.
     DictationStart(u32),
     DictationCancel(u32),
+    /// Keep the screen on while dictating (`ScreenRequest{ACTION_KEEP_ON}`, true) or let it
+    /// time out again (`ACTION_RELEASE_KEEP_ON`, false): glassd's timeout counts touches only.
+    KeepScreenOn(bool),
 }
 
 /// The first note card's id; later notes count up.
@@ -265,6 +268,7 @@ impl App {
         let id = self.next_request;
         self.next_request = self.next_request.wrapping_add(1).max(1);
         self.requests.push(Request::DictationStart(id));
+        self.requests.push(Request::KeepScreenOn(true));
         let d = Dictation::new(id);
         let panel = Panel::new(d.card(self.ctx.now_s), self.ctx);
         self.show_overlay(Overlay::Dictation(d, panel));
@@ -484,6 +488,7 @@ impl App {
                 if d.is_open() {
                     self.requests.push(Request::DictationCancel(d.request_id()));
                 }
+                self.requests.push(Request::KeepScreenOn(false));
                 panel.release(self.compositor.as_mut());
             }
             None => return,
@@ -624,12 +629,30 @@ impl App {
     /// The connection to glassd is gone: its settings are unknown again and requests made
     /// for it are dropped (a new session sends a fresh snapshot).
     pub fn glassd_disconnected(&mut self) {
+        // An open dictation ended with the connection (glassd forgets it, no state will come).
+        let open = match &self.overlay {
+            Some(Overlay::Dictation(d, _)) if d.is_open() => Some(d.request_id()),
+            _ => None,
+        };
+        if let Some(request_id) = open {
+            self.dictation_state(&DictationState {
+                request_id,
+                state: glass_api::proto::dictation_state::State::Failed as i32,
+                error: "link-lost".into(),
+            });
+        }
+        self.companion = Companion::default();
+        if let Some((s, _)) = self.setup.as_mut() {
+            s.set_companion(Companion::default());
+        }
         self.requests.clear();
         self.service = None;
         if self.owner == ScreenOwner::Glassd {
             self.settings = None;
         }
         self.refresh_settings_cards();
+        self.refresh_setup_card();
+        self.refresh_note_card();
     }
 
     /// Whether the timeline is moving (frames are due at the frame rate).

@@ -55,17 +55,9 @@ The device tree needs (both branches, `android-4.4.4` and `android-6.0.1_r31`), 
 $(call inherit-product, vendor/openmyglass/glass-apps/glass-apps.mk)
 ```
 
-`LOCAL_OVERRIDES_PACKAGES` already keeps `Launcher2`, `Launcher3` and `Home` out of the
-image. Optionally, on the branch that has the lean list (`android-4.4.4`), in
-`BoardConfig.mk`:
-
-```make
-GLASS_REMOVED_PACKAGES += Provision
-```
-
-(`Provision` is not needed: the launcher's HOME filter has a higher priority, 2, so
-`Provision` would never run, and the launcher's setup flow sets `device_provisioned` and
-`user_setup_complete` itself.) The launcher also needs glass-services' packaging (`glassd` with
+`LOCAL_OVERRIDES_PACKAGES` keeps `Launcher2`, `Launcher3`, `Home` and `Provision` out of the
+image: the launcher's setup flow sets `device_provisioned` and `user_setup_complete` itself, so
+no other HOME candidate is needed. Nothing else is needed in the device tree. The launcher also needs glass-services' packaging (`glassd` with
 `--allow-package org.openmyglass.launcher`, the socket, and on 6.0 the SELinux rules for
 `platform_app` to connect to it): see glass-services' `android/`.
 

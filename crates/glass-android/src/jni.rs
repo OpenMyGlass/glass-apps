@@ -17,7 +17,9 @@ use crate::control::{channel, Command, Control, WindowPtr};
 use crate::runtime::{self, Config, Native};
 use glass_gfx::{Compositor, GLASS_HEIGHT, GLASS_WIDTH};
 use glass_launcher::platform::LinePlatform;
-use jni_sys::{jlong, jobject, jstring, jvalue, JNIEnv, JavaVM, JNI_OK};
+use jni_sys::{
+    jchar, jlong, jobject, jsize, jstring, jvalue, JNIEnv, JavaVM, JNI_OK, JNI_VERSION_1_6,
+};
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::thread::JoinHandle;
@@ -81,6 +83,8 @@ struct JavaBridge {
     vm: *mut JavaVM,
     bridge: jobject,
     env: *mut JNIEnv,
+    /// Whether this object attached the thread it runs on (and must detach it).
+    attached: bool,
 }
 
 // SAFETY: a JavaVM and a global reference may be used from any attached thread; the
@@ -88,15 +92,22 @@ struct JavaBridge {
 unsafe impl Send for JavaBridge {}
 
 impl JavaBridge {
-    /// Attaches this thread on first use.
+    /// The thread's JNIEnv: the existing one if the thread is attached already (a Java
+    /// thread), else attaches it on first use.
     unsafe fn env(&mut self) -> Option<*mut JNIEnv> {
         if self.env.is_null() {
             let mut env: *mut c_void = std::ptr::null_mut();
+            let get_env = (**self.vm).GetEnv?;
+            if get_env(self.vm, &mut env, JNI_VERSION_1_6) == JNI_OK && !env.is_null() {
+                self.env = env.cast();
+                return Some(self.env);
+            }
             let attach = (**self.vm).AttachCurrentThread?;
             if attach(self.vm, &mut env, std::ptr::null_mut()) != JNI_OK {
                 return None;
             }
             self.env = env.cast();
+            self.attached = true;
         }
         Some(self.env)
     }
@@ -121,8 +132,13 @@ impl JavaBridge {
                 (f.ExceptionClear.unwrap())(env);
                 return Err("NativeBridge.onNativeRequest is missing".into());
             }
-            let c = CString::new(line.replace('\0', " ")).unwrap_or_default();
-            let s = (f.NewStringUTF.unwrap())(env, c.as_ptr());
+            // UTF-16, not modified UTF-8 (NewStringUTF rejects supplementary characters).
+            let units: Vec<jchar> = line.encode_utf16().collect();
+            let s = (f.NewString.unwrap())(env, units.as_ptr(), units.len() as jsize);
+            if s.is_null() {
+                (f.ExceptionClear.unwrap())(env);
+                return Err("NewString failed".into());
+            }
             let args = [jvalue { l: s }];
             (f.CallVoidMethodA.unwrap())(env, self.bridge, mid, args.as_ptr());
             (f.DeleteLocalRef.unwrap())(env, s);
@@ -138,12 +154,13 @@ impl JavaBridge {
 
 impl Drop for JavaBridge {
     fn drop(&mut self) {
-        // SAFETY: drop the global reference and detach the render thread.
+        // SAFETY: drop the global reference; detach only a thread this object attached (a
+        // Java thread, such as the main one if the render thread never started, stays).
         unsafe {
             if let Some(env) = self.env() {
                 ((**env).DeleteGlobalRef.unwrap())(env, self.bridge);
             }
-            if !self.env.is_null() {
+            if self.attached {
                 if let Some(detach) = (**self.vm).DetachCurrentThread {
                     detach(self.vm);
                 }
@@ -161,13 +178,15 @@ unsafe fn string(env: *mut JNIEnv, s: jstring) -> String {
     if s.is_null() {
         return String::new();
     }
+    // UTF-16 (GetStringUTFChars gives modified UTF-8: emoji would turn into U+FFFD pairs).
     let f = &**env;
-    let p = (f.GetStringUTFChars.unwrap())(env, s, std::ptr::null_mut());
+    let len = (f.GetStringLength.unwrap())(env, s);
+    let p = (f.GetStringChars.unwrap())(env, s, std::ptr::null_mut());
     if p.is_null() {
         return String::new();
     }
-    let out = CStr::from_ptr(p).to_string_lossy().into_owned();
-    (f.ReleaseStringUTFChars.unwrap())(env, s, p);
+    let out = String::from_utf16_lossy(std::slice::from_raw_parts(p, len.max(0) as usize));
+    (f.ReleaseStringChars.unwrap())(env, s, p);
     out
 }
 
@@ -206,6 +225,7 @@ pub unsafe extern "system" fn Java_org_openmyglass_launcher_NativeBridge_nativeC
         vm,
         bridge,
         env: std::ptr::null_mut(),
+        attached: false,
     };
     let (control, inbox) = match channel() {
         Ok(c) => c,
