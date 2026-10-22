@@ -501,6 +501,9 @@ fn waiting_to_reconnect_keeps_polling_and_logs_each_attempt_once() {
     let missing = std::env::temp_dir().join(format!("glass-no-glassd-{}.sock", std::process::id()));
     let mut a = App::new(demo::timeline(), ctx());
     let mut display = HeadlessDisplay::new(640, 360);
+    // The first frame paints three cards: seconds in a debug build under QEMU. Paint it
+    // before, so the wait below measures polling only.
+    a.present_if_changed(&mut display).unwrap();
     let start = Instant::now();
     let polls = Cell::new(0u32);
     let polls_before_second = Cell::new(0u32);
