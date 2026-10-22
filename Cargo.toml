@@ -22,8 +22,8 @@ minifb = "0.29"
 khronos-egl = { version = "6", features = ["dynamic"] }
 glow = "0.17"
 libloading = "0.8"
-# glassd client, types and in-process mock (glass-services main, pinned).
-glass-api = { git = "https://github.com/OpenMyGlass/glass-services", rev = "b3a14a3dc6b414946f2d62384298e5f2864d461f" }
+# glassd client, types and in-process mock (glass-services, pinned: M3 interface on its m3-android-glue branch until merged).
+glass-api = { git = "https://github.com/OpenMyGlass/glass-services", rev = "6d09bb74d25162b38a287d5c4e665f04005f4b42" }
 glass-gfx = { path = "crates/glass-gfx" }
 glass-gfx-gles = { path = "crates/glass-gfx-gles" }
 glass-ui = { path = "crates/glass-ui" }

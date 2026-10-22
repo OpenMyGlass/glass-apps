@@ -1,8 +1,8 @@
 //! The GLES2 compositor: card layers are textures attached to FBOs; a frame is a full clear
-//! then one textured quad per visible layer, drawn into an off-screen target (host tests
-//! and development) and read back for the [`glass_gfx::Display`]. The window-surface
-//! target (an `ANativeWindow`, `eglSwapBuffers`, no read-back) comes with the Android
-//! wrapper (M3).
+//! then one textured quad per visible layer, drawn either into an off-screen target (host
+//! tests and development, read back for the [`glass_gfx::Display`]) or straight into a
+//! native window's surface (Android's `ANativeWindow`: the default framebuffer, y flipped,
+//! `eglSwapBuffers`, no read-back).
 
 use crate::egl::{EglContext, EglInfo};
 use crate::painter::{texture_params, GlesPainter, Resources, Which};
@@ -24,6 +24,9 @@ pub struct GlesOptions {
     /// Use the default display and a pbuffer even when the surfaceless platform and
     /// context are available (tests the EGL 1.4 set-up).
     pub force_pbuffer: bool,
+    /// Off screen only: compose with the window orientation (y up, as into a window
+    /// surface) and un-flip on read-back, so host tests check the window path's flip.
+    pub window_orientation: bool,
 }
 
 impl Default for GlesOptions {
@@ -32,6 +35,7 @@ impl Default for GlesOptions {
             sgx540_checks: cfg!(debug_assertions),
             force_rgb565_layers: false,
             force_pbuffer: false,
+            window_orientation: false,
         }
     }
 }
@@ -87,10 +91,20 @@ struct Target {
     format: LayerFormat,
 }
 
+/// Where frames are composed.
+enum Screen {
+    /// An FBO (off screen; read back on present).
+    Offscreen(Target),
+    /// The default framebuffer of the attached window surface.
+    Window { width: u32, height: u32 },
+}
+
 /// The GLES2 compositor. Not `Send`: one context, one thread.
 pub struct GlesCompositor {
     res: Resources,
-    screen: Target,
+    screen: Screen,
+    /// Compose with y flipped: always for a window, with `window_orientation` off screen.
+    flip_y: bool,
     layers: HashMap<LayerId, Target>,
     /// Layers dropped while the context could not be made current; freed later.
     orphans: Vec<Target>,
@@ -114,6 +128,35 @@ impl GlesCompositor {
         options: GlesOptions,
     ) -> Result<GlesCompositor, GfxError> {
         let egl = EglContext::offscreen(options.force_pbuffer).map_err(gl_err)?;
+        Self::with_context(egl, width, height, options, false)
+    }
+
+    /// A compositor that composes `width`×`height` frames into a native window (attach it
+    /// with [`GlesCompositor::attach_window`]; on Android set the window's buffers to this
+    /// size and to [`GlesCompositor::native_visual_id`] first). Needs a config with
+    /// pbuffers, so the context and the layers live while no window is attached.
+    pub fn for_window(
+        width: u32,
+        height: u32,
+        options: GlesOptions,
+    ) -> Result<GlesCompositor, GfxError> {
+        let egl = EglContext::for_window().map_err(gl_err)?;
+        if !egl.is_current() {
+            return Err(GfxError::Renderer(
+                "the EGL window config has no pbuffers: cannot keep the context without a window"
+                    .into(),
+            ));
+        }
+        Self::with_context(egl, width, height, options, true)
+    }
+
+    fn with_context(
+        egl: EglContext,
+        width: u32,
+        height: u32,
+        options: GlesOptions,
+        window: bool,
+    ) -> Result<GlesCompositor, GfxError> {
         let raw = egl.load_gl();
         let (info, max) = unsafe {
             let max = raw.get_parameter_i32(glow::MAX_TEXTURE_SIZE).max(64) as u32;
@@ -148,10 +191,15 @@ impl GlesCompositor {
         };
         let gl = Gl::new(raw, options.sgx540_checks, max);
         let res = Resources::new(gl, max).map_err(gl_err)?;
-        let screen = create_target(&res.gl, width, height, true, false).map_err(gl_err)?;
+        let screen = if window {
+            Screen::Window { width, height }
+        } else {
+            Screen::Offscreen(create_target(&res.gl, width, height, true, false).map_err(gl_err)?)
+        };
         let c = GlesCompositor {
             res,
             screen,
+            flip_y: window || options.window_orientation,
             layers: HashMap::new(),
             orphans: Vec::new(),
             next_id: 1,
@@ -173,6 +221,41 @@ impl GlesCompositor {
 
     pub fn info(&self) -> &GlInfo {
         &self.info
+    }
+
+    /// The EGL config's native visual id (the buffer format a window must have).
+    pub fn native_visual_id(&self) -> Result<i32, GfxError> {
+        self.egl.native_visual_id().map_err(gl_err)
+    }
+
+    /// Whether frames go to a window surface (rather than an off-screen target).
+    pub fn is_window(&self) -> bool {
+        matches!(self.screen, Screen::Window { .. })
+    }
+
+    /// Whether a window is attached (frames can be presented).
+    pub fn has_window(&self) -> bool {
+        self.egl.has_window()
+    }
+
+    /// Attaches a native window: frames are composed into it from now on. Layers are kept.
+    ///
+    /// # Safety
+    /// `window` must be a valid native window (`ANativeWindow*` on Android) that stays
+    /// valid until [`GlesCompositor::detach_window`] returns or the compositor is dropped.
+    pub unsafe fn attach_window(&mut self, window: *mut std::ffi::c_void) -> Result<(), GfxError> {
+        if !self.is_window() {
+            return Err(GfxError::Renderer("an off-screen compositor has no window".into()));
+        }
+        // SAFETY: forwarded from the caller.
+        unsafe { self.egl.attach_window(window) }.map_err(gl_err)
+    }
+
+    /// Releases the window surface (the window is about to be destroyed). The context and
+    /// the layers stay, current on a 1×1 pbuffer; nothing can be presented until the next
+    /// [`GlesCompositor::attach_window`].
+    pub fn detach_window(&mut self) {
+        self.egl.detach_window();
     }
 
     /// The texture size limit in use: the queried one, capped at
@@ -227,6 +310,30 @@ impl GlesCompositor {
             raw.bind_framebuffer(glow::FRAMEBUFFER, Some(t.fbo));
             raw.viewport(0, 0, t.width as i32, t.height as i32);
         }
+    }
+
+    fn screen_size(&self) -> (u32, u32) {
+        match &self.screen {
+            Screen::Offscreen(t) => (t.width, t.height),
+            Screen::Window { width, height } => (*width, *height),
+        }
+    }
+
+    fn bind_screen(&self) -> Result<(), GfxError> {
+        match &self.screen {
+            Screen::Offscreen(t) => self.bind_target(t),
+            Screen::Window { width, height } => {
+                if !self.egl.has_window() {
+                    return Err(GfxError::Renderer("no window attached".into()));
+                }
+                unsafe {
+                    let raw = self.res.gl.raw();
+                    raw.bind_framebuffer(glow::FRAMEBUFFER, None);
+                    raw.viewport(0, 0, *width as i32, *height as i32);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -301,7 +408,7 @@ impl Compositor for GlesCompositor {
     }
 
     fn size(&self) -> (u32, u32) {
-        (self.screen.width, self.screen.height)
+        self.screen_size()
     }
 
     fn create_layer(&mut self, width: u32, height: u32, opaque: bool) -> Result<LayerId, GfxError> {
@@ -374,17 +481,19 @@ impl Compositor for GlesCompositor {
                 return Err(GfxError::UnknownLayer(p.layer));
             }
         }
-        self.bind_target(&self.screen);
+        self.bind_screen()?;
         let bg = background.premultiplied().map(|v| v as f32 / 255.0);
-        let (sw, sh) = (self.screen.width, self.screen.height);
+        let (sw, sh) = self.screen_size();
         unsafe {
             let raw = self.res.gl.raw();
             raw.clear_color(bg[0], bg[1], bg[2], bg[3]);
             raw.clear(glow::COLOR_BUFFER_BIT);
         }
-        // The target is an FBO, so pixel row 0 is memory row 0 and no flip is needed. The
-        // window-surface target of M3 needs a y-flip here (GL window row 0 is the bottom).
-        self.res.use_program(Which::Texture, sw, sh);
+        // In an FBO pixel row 0 is memory row 0 and no flip is needed; in a window surface
+        // GL row 0 is the bottom of the screen, so the projection flips y (texture
+        // coordinates stay: a layer's texel row 0 is still the top of its card).
+        self.res
+            .use_program_oriented(Which::Texture, sw, sh, self.flip_y);
         for p in layers {
             let t = &self.layers[&p.layer];
             let opacity = p.opacity.clamp(0.0, 1.0);
@@ -413,6 +522,11 @@ impl Compositor for GlesCompositor {
     }
 
     fn present(&mut self, display: &mut dyn Display) -> Result<(), GfxError> {
+        if self.is_window() {
+            // The frame is in the window's back buffer: show it, no read-back.
+            self.current()?;
+            return self.egl.swap_buffers().map_err(gl_err);
+        }
         let frame = self.read_frame()?;
         display.present(&frame)?;
         Ok(())
@@ -420,9 +534,9 @@ impl Compositor for GlesCompositor {
 
     fn read_frame(&mut self) -> Result<Frame, GfxError> {
         self.current()?;
-        let (w, h) = (self.screen.width, self.screen.height);
+        let (w, h) = self.screen_size();
         let mut frame = Frame::new(w, h);
-        self.bind_target(&self.screen);
+        self.bind_screen()?;
         unsafe {
             let raw = self.res.gl.raw();
             raw.pixel_store_i32(glow::PACK_ALIGNMENT, 4);
@@ -437,6 +551,15 @@ impl Compositor for GlesCompositor {
             );
         }
         self.check_error("read_frame")?;
+        if self.flip_y {
+            // GL row 0 is the bottom: put the top row first again.
+            let stride = w as usize * 4;
+            let data = frame.data_mut();
+            for y in 0..h as usize / 2 {
+                let (a, b) = data.split_at_mut((h as usize - 1 - y) * stride);
+                a[y * stride..(y + 1) * stride].swap_with_slice(&mut b[..stride]);
+            }
+        }
         Ok(frame)
     }
 }
@@ -452,7 +575,9 @@ impl Drop for GlesCompositor {
         for (_, t) in self.layers.drain() {
             delete_target(&self.res.gl, &t);
         }
-        delete_target(&self.res.gl, &self.screen);
+        if let Screen::Offscreen(t) = &self.screen {
+            delete_target(&self.res.gl, t);
+        }
         self.res.delete();
     }
 }
