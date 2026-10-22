@@ -245,7 +245,9 @@ impl GlesCompositor {
     /// valid until [`GlesCompositor::detach_window`] returns or the compositor is dropped.
     pub unsafe fn attach_window(&mut self, window: *mut std::ffi::c_void) -> Result<(), GfxError> {
         if !self.is_window() {
-            return Err(GfxError::Renderer("an off-screen compositor has no window".into()));
+            return Err(GfxError::Renderer(
+                "an off-screen compositor has no window".into(),
+            ));
         }
         // SAFETY: forwarded from the caller.
         unsafe { self.egl.attach_window(window) }.map_err(gl_err)
