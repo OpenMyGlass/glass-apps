@@ -22,6 +22,8 @@ minifb = "0.29"
 khronos-egl = { version = "6", features = ["dynamic"] }
 glow = "0.17"
 libloading = "0.8"
+# glassd client, types and in-process mock (glass-services main, pinned).
+glass-api = { git = "https://github.com/OpenMyGlass/glass-services", rev = "fa7ae01a8102005f1684026a6c85ead2475c6793" }
 glass-gfx = { path = "crates/glass-gfx" }
 glass-gfx-gles = { path = "crates/glass-gfx-gles" }
 glass-ui = { path = "crates/glass-ui" }

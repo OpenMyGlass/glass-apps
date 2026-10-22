@@ -1,14 +1,15 @@
 //! The Glass launcher: shows the card timeline and turns input into timeline motion and
 //! actions.
 //!
-//! [`App`] is independent of where input comes from and where frames go. Today the input is
-//! a mock script ([`script`]) or the host keyboard; a later change connects it to `glassd`
-//! through `glass-api`, converting each `Gesture`/`Scroll` message into a
-//! [`glass_ui::InputEvent`] field by field and sending `ScreenRequest{ACTION_SLEEP}` for
-//! [`glass_ui::Action::RequestSleep`].
+//! [`App`] is independent of where input comes from and where frames go. The input is
+//! `glassd` ([`glassd`]: `Gesture`/`Scroll` converted field by field into
+//! [`glass_ui::InputEvent`], `ScreenRequest{ACTION_SLEEP}` for
+//! [`glass_ui::Action::RequestSleep`], the screen following `ScreenState`), a mock script
+//! ([`script`]) or the host keyboard.
 
 pub mod clock;
 pub mod demo;
+pub mod glassd;
 pub mod script;
 
 pub mod renderer;
@@ -16,11 +17,21 @@ pub mod renderer;
 use glass_gfx::{Color, Compositor, Display, Frame, GfxError, SoftwareCompositor};
 use glass_ui::{Action, GestureKind, InputEvent, RenderContext, Timeline};
 
-/// The launcher state: the timeline, the compositor it renders through, and a stand-in for
-/// the screen state that `glassd` owns.
+/// Who decides whether the screen is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenOwner {
+    /// A local stand-in for `glassd`'s screen policy (mock scripts, the host window).
+    Local,
+    /// `glassd`: the app follows `ScreenState` and only asks for sleep.
+    Glassd,
+}
+
+/// The launcher state: the timeline, the compositor it renders through, and the screen
+/// state (owned by `glassd`, or simulated locally without it).
 pub struct App {
     timeline: Timeline,
     compositor: Box<dyn Compositor>,
+    owner: ScreenOwner,
     screen_on: bool,
     shown: bool,
 }
@@ -41,6 +52,7 @@ impl App {
         App {
             timeline,
             compositor,
+            owner: ScreenOwner::Local,
             screen_on: true,
             shown: false,
         }
@@ -55,9 +67,46 @@ impl App {
         &self.timeline
     }
 
-    /// Whether the (simulated) screen is on.
+    /// Whether the screen is on (or dimmed).
     pub fn screen_on(&self) -> bool {
         self.screen_on
+    }
+
+    /// Lets `glassd` own the screen: the local wake stand-in is off, and the screen changes
+    /// only through [`App::screen_off`] and [`App::screen_wake`].
+    pub fn follow_glassd(&mut self) {
+        self.owner = ScreenOwner::Glassd;
+    }
+
+    pub fn screen_owner(&self) -> ScreenOwner {
+        self.owner
+    }
+
+    /// The screen went off: motion stops where it was heading, and nothing is drawn.
+    pub fn screen_off(&mut self) {
+        self.timeline.stop_motion();
+        self.screen_on = false;
+        self.shown = false;
+    }
+
+    /// The screen is on again; `return_home` shows the home card at once.
+    pub fn screen_wake(&mut self, return_home: bool) {
+        if return_home {
+            self.timeline.show_home();
+        }
+        self.screen_on = true;
+        self.shown = false;
+    }
+
+    /// Ends a touch whose end will not arrive (focus lost, glassd gone); see
+    /// [`glass_ui::Timeline::cancel_touch`].
+    pub fn cancel_touch(&mut self) {
+        self.timeline.cancel_touch();
+    }
+
+    /// Whether the timeline is moving (frames are due at the frame rate).
+    pub fn is_animating(&self) -> bool {
+        !self.timeline.is_settled()
     }
 
     /// Handles one input event.
@@ -68,6 +117,14 @@ impl App {
     /// launcher while the screen is off, and the dim step (where the restoring touch is
     /// consumed too) is handled there; the launcher only follows `ScreenState`.
     pub fn input(&mut self, event: &InputEvent) -> Option<Action> {
+        if self.owner == ScreenOwner::Glassd {
+            // glassd delivers no touchpad events while the screen is off, and changes the
+            // screen itself (the caller sends ScreenRequest for RequestSleep).
+            if !self.screen_on {
+                return None;
+            }
+            return self.timeline.handle(event);
+        }
         if !self.screen_on {
             if let InputEvent::Gesture {
                 kind: GestureKind::Tap | GestureKind::SwipeForward | GestureKind::SwipeBackward,
@@ -97,7 +154,8 @@ impl App {
     /// Composes a new frame if anything changed since the last one; true if it did.
     pub fn render_if_changed(&mut self) -> Result<bool, GfxError> {
         if !self.screen_on {
-            if self.shown {
+            // With glassd the panel is off: nothing to draw until the wake.
+            if self.shown || self.owner == ScreenOwner::Glassd {
                 return Ok(false);
             }
             self.compositor.compose(Color::BLACK, &[])?;

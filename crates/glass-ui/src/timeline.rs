@@ -331,6 +331,40 @@ impl Timeline {
         true
     }
 
+    /// Shows the home card at once, without animation (for a screen wake).
+    pub fn show_home(&mut self) {
+        let home = self.home_index();
+        self.jump_to(home);
+    }
+
+    /// Ends a touch whose end will not arrive (the input focus moved away, the connection
+    /// to glassd was lost): a drag animates back to where it started, as a cancelled
+    /// `Scroll` would. Without a drag, nothing changes.
+    pub fn cancel_touch(&mut self) {
+        self.release = None;
+        if let Some(d) = self.drag.take() {
+            self.animate_to(d.start_index);
+        }
+    }
+
+    /// Ends any drag or animation at once on the card it was heading to (for a screen
+    /// that turns off mid-motion).
+    pub fn stop_motion(&mut self) {
+        let to = self.current_index();
+        self.jump_to(to);
+    }
+
+    fn jump_to(&mut self, index: usize) {
+        self.drag = None;
+        self.release = None;
+        self.anim = None;
+        self.target = index;
+        if self.pos != index as f32 {
+            self.pos = index as f32;
+            self.dirty = true;
+        }
+    }
+
     /// Animates back to the home card.
     pub fn go_home(&mut self) {
         let home = self.home_index();
