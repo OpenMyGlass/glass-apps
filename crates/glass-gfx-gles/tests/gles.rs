@@ -9,6 +9,7 @@
 //! On a mismatch the GLES image goes to `target/golden-actual-gles/`. The SGX540 assertion
 //! layer is on.
 
+use glass_gfx::golden::{self, diff, Tolerance};
 use glass_gfx::text::{self, Align};
 use glass_gfx::{
     fonts, Color, Compositor, Frame, HeadlessDisplay, Painter, Placement, Rect, SoftwareCompositor,
@@ -47,67 +48,31 @@ fn root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
-#[derive(Clone, Copy, Debug)]
-enum Tolerance {
-    /// Every channel of every pixel within ±2.
-    Strict,
-    /// ±2 except on at most 1 % of the pixels, which are within 64.
-    Edges,
-}
-
-#[derive(Debug)]
-struct Diff {
-    worst: u8,
-    pixels_over_2: usize,
-    pixels: usize,
-}
-
-fn diff(a: &Frame, b: &Frame) -> Diff {
-    assert_eq!((a.width(), a.height()), (b.width(), b.height()), "sizes");
-    let mut worst = 0;
-    let mut over = 0;
-    for (pa, pb) in a.data().chunks_exact(4).zip(b.data().chunks_exact(4)) {
-        let d = pa
-            .iter()
-            .zip(pb)
-            .map(|(x, y)| x.abs_diff(*y))
-            .max()
-            .unwrap();
-        worst = worst.max(d);
-        if d > 2 {
-            over += 1;
-        }
-    }
-    Diff {
-        worst,
-        pixels_over_2: over,
-        pixels: (a.width() * a.height()) as usize,
-    }
-}
-
-fn within(d: &Diff, tol: Tolerance) -> bool {
-    match tol {
-        Tolerance::Strict => d.worst <= 2,
-        Tolerance::Edges => d.pixels_over_2 * 100 <= d.pixels && d.worst <= 64,
-    }
-}
-
 fn compare(name: &str, actual: &Frame, expected: &Frame, tol: Tolerance) {
-    let d = diff(actual, expected);
+    let d = golden::compare(
+        &root().join("target/golden-actual-gles"),
+        name,
+        actual,
+        expected,
+        &tol,
+    );
     println!(
-        "scene {name}: worst {} per channel, {} pixels over ±2 ({:.3} %), tolerance {tol:?}",
+        "scene {name}: worst {} per channel ({} outside rounded shapes), {} pixels over ±2 \
+         ({:.3} %), tolerance {tol:?}",
         d.worst,
+        d.worst_outside,
         d.pixels_over_2,
         100.0 * d.pixels_over_2 as f64 / d.pixels as f64
     );
-    if !within(&d, tol) {
-        let out = root().join("target/golden-actual-gles");
-        std::fs::create_dir_all(&out).unwrap();
-        actual.write_png(out.join(format!("{name}.png"))).unwrap();
-        panic!(
-            "{name}: {d:?} exceeds {tol:?}; GLES image in {}",
-            out.display()
-        );
+}
+
+/// Strict, with the edge rule only on the card's rounded shapes.
+fn shapes_of(card: &Card) -> Tolerance {
+    let r = glass_ui::card::shape_rects(card, 640, 360);
+    if r.is_empty() {
+        Tolerance::Max(2)
+    } else {
+        Tolerance::Shapes(r)
     }
 }
 
@@ -227,19 +192,21 @@ fn golden_cards() {
         return;
     }
     let mut c = compositor();
-    for (name, tol) in [
-        ("home", Tolerance::Strict),
-        ("text", Tolerance::Strict),
-        ("text-long", Tolerance::Strict),
-        ("settings", Tolerance::Strict),
-        ("image-placeholder", Tolerance::Edges),
-        // Menu position dots and the adjustment bar are rounded rects.
-        ("menu-item", Tolerance::Edges),
-        ("adjust", Tolerance::Edges),
-        ("info", Tolerance::Strict),
+    // Strict, with the edge rule only on rounded shapes (the image placeholder's frame,
+    // menu dots, the adjustment bar): shape_rects of each card.
+    for name in [
+        "home",
+        "text",
+        "text-long",
+        "settings",
+        "image-placeholder",
+        "menu-item",
+        "adjust",
+        "info",
     ] {
-        let f = render_card_gles(&mut c, &scene(name));
-        check_golden(name, &f, tol);
+        let card = scene(name);
+        let f = render_card_gles(&mut c, &card);
+        check_golden(name, &f, shapes_of(&card));
     }
 }
 
@@ -269,7 +236,7 @@ fn golden_timeline_mid_scroll() {
     check_golden(
         "timeline-mid-scroll",
         &c.read_frame().unwrap(),
-        Tolerance::Strict,
+        Tolerance::Max(2),
     );
     // Present hands the read-back frame to the display.
     let mut d = HeadlessDisplay::new(640, 360);
@@ -357,7 +324,7 @@ fn translucent_composition_matches_software() {
         "translucent-composition",
         &g.read_frame().unwrap(),
         s.frame(),
-        Tolerance::Strict,
+        Tolerance::Max(2),
     );
 }
 
@@ -399,18 +366,18 @@ fn text_after_the_atlas_was_refilled() {
         &format!("atlas-refill-run-{size}px"),
         &c.read_frame().unwrap(),
         s.frame(),
-        Tolerance::Strict,
+        Tolerance::Max(2),
     );
     c.drop_layer(id);
     check_golden(
         "text",
         &render_card_gles(&mut c, &scene("text")),
-        Tolerance::Strict,
+        Tolerance::Max(2),
     );
     check_golden(
         "home",
         &render_card_gles(&mut c, &scene("home")),
-        Tolerance::Strict,
+        Tolerance::Max(2),
     );
 }
 
@@ -455,7 +422,7 @@ fn image_at_its_own_size_matches_software() {
         "image-1to1",
         &render_card_gles(&mut c, &card),
         &render_card(&card, &ctx(), 640, 360),
-        Tolerance::Strict,
+        Tolerance::Max(2),
     );
 }
 
@@ -577,7 +544,7 @@ fn box_text_matches_software() {
         "box-text",
         &g.read_frame().unwrap(),
         s.frame(),
-        Tolerance::Strict,
+        Tolerance::Max(2),
     );
 }
 
@@ -606,6 +573,6 @@ fn pbuffer_context_renders_the_goldens_too() {
     check_golden(
         "text",
         &render_card_gles(&mut c, &scene("text")),
-        Tolerance::Strict,
+        Tolerance::Max(2),
     );
 }

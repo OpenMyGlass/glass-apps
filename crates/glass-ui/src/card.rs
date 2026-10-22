@@ -265,8 +265,7 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
                 None => {
                     f.clear(style::PLACEHOLDER);
                     // A simple picture-frame mark in the middle.
-                    let (bw, bh) = (150.0, 104.0);
-                    let r = Rect::new((w - bw) / 2.0, (h - bh) / 2.0 - 20.0, bw, bh);
+                    let r = placeholder_rect(w, h);
                     f.fill_rounded_rect(r, 10.0, glass_gfx::Color::grey(0x55));
                     let inner = Rect::new(r.x + 8.0, r.y + 8.0, r.w - 16.0, r.h - 16.0);
                     f.fill_rounded_rect(inner, 4.0, style::PLACEHOLDER);
@@ -327,12 +326,7 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
                 h * 0.48,
                 style::TEXT,
             );
-            let track = Rect::new(
-                style::MARGIN,
-                h - style::FOOTER_BASELINE_FROM_BOTTOM - 20.0,
-                w - 2.0 * style::MARGIN,
-                style::BAR_HEIGHT,
-            );
+            let track = bar_rect(w, h);
             let r = style::BAR_HEIGHT / 2.0;
             f.fill_rounded_rect(track, r, style::TRACK);
             let fill = track.w * fraction.clamp(0.0, 1.0);
@@ -382,19 +376,54 @@ fn position_dots(f: &mut dyn Painter, index: usize, count: usize) {
         return;
     }
     let (w, h) = f.size();
-    let d = style::DOT_SIZE;
-    let gap = style::DOT_GAP;
-    let total = count as f32 * d + (count - 1) as f32 * gap;
-    let x0 = ((w as f32 - total) / 2.0).round();
-    let y = h as f32 - style::FOOTER_BASELINE_FROM_BOTTOM - d;
-    for i in 0..count {
+    for (i, r) in dot_rects(count, w, h).into_iter().enumerate() {
         let c = if i == index {
             style::TEXT
         } else {
             style::TRACK
         };
-        let x = x0 + i as f32 * (d + gap);
-        f.fill_rounded_rect(Rect::new(x, y, d, d), d / 2.0, c);
+        f.fill_rounded_rect(r, r.w / 2.0, c);
+    }
+}
+
+fn dot_rects(count: usize, w: u32, h: u32) -> Vec<Rect> {
+    if count < 2 {
+        return Vec::new();
+    }
+    let d = style::DOT_SIZE;
+    let gap = style::DOT_GAP;
+    let total = count as f32 * d + (count - 1) as f32 * gap;
+    let x0 = ((w as f32 - total) / 2.0).round();
+    let y = h as f32 - style::FOOTER_BASELINE_FROM_BOTTOM - d;
+    (0..count)
+        .map(|i| Rect::new(x0 + i as f32 * (d + gap), y, d, d))
+        .collect()
+}
+
+fn bar_rect(w: f32, h: f32) -> Rect {
+    Rect::new(
+        style::MARGIN,
+        h - style::FOOTER_BASELINE_FROM_BOTTOM - 20.0,
+        w - 2.0 * style::MARGIN,
+        style::BAR_HEIGHT,
+    )
+}
+
+fn placeholder_rect(w: f32, h: f32) -> Rect {
+    let (bw, bh) = (150.0, 104.0);
+    Rect::new((w - bw) / 2.0, (h - bh) / 2.0 - 20.0, bw, bh)
+}
+
+/// The bounds of the anti-aliased rounded shapes a card draws (menu dots, the adjustment
+/// bar, the image placeholder's frame). Renderers may differ on their edge pixels; tests
+/// hold everything outside these rectangles to the strict tolerance.
+pub fn shape_rects(card: &Card, width: u32, height: u32) -> Vec<Rect> {
+    let (w, h) = (width as f32, height as f32);
+    match &card.content {
+        CardContent::MenuItem { count, .. } => dot_rects(*count, width, height),
+        CardContent::Adjust { .. } => vec![bar_rect(w, h)],
+        CardContent::Image { image: None, .. } => vec![placeholder_rect(w, h)],
+        _ => Vec::new(),
     }
 }
 
