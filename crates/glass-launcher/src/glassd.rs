@@ -1,8 +1,12 @@
 //! The launcher as a `glassd` client (glass-services `docs/api.md`, version 1).
 //!
 //! - **Session:** `Hello` as `glass-launcher`, `Subscribe` to `TOPIC_GESTURE`,
-//!   `TOPIC_SCREEN`, `TOPIC_SETTINGS` and `TOPIC_WEAR` (wear is not used yet), then
-//!   `AcquireInputFocus`.
+//!   `TOPIC_SCREEN`, `TOPIC_SETTINGS`, `TOPIC_WEAR` (wear is not used yet) and
+//!   `TOPIC_COMPANION` (setup, dictation), then `AcquireInputFocus` (on Android only while
+//!   the activity is resumed: [`Session::set_wants_focus`]).
+//! - **Dictation:** [`Request::DictationStart`] and `DictationCancel` go to glassd; its
+//!   `DictationState`, `Transcript` and an error answer to the start (matched by `seq`)
+//!   go to the app.
 //! - **Input:** `Gesture` and `Scroll` become [`InputEvent`]s field by field
 //!   ([`to_input`]); they are ignored while the launcher does not hold the focus
 //!   (`FocusState{focused:false}`, an app is in front).
@@ -14,10 +18,12 @@
 //!   off. When `glassd` goes away it reconnects with a [`Backoff`].
 
 use crate::settings::ServiceInfo;
+use crate::setup::Companion;
 use crate::{App, Request};
 use glass_api::proto::{
-    client_frame, screen_request, service_frame, ErrorCode, GestureKind as ProtoKind, Screen,
-    ScreenRequest, ScreenState, ServiceFrame, SetSettings, Settings, Topic,
+    client_frame, screen_request, service_frame, DictationCancel, DictationStart, ErrorCode,
+    GestureKind as ProtoKind, Screen, ScreenRequest, ScreenState, ServiceFrame, SetSettings,
+    Settings, Topic,
 };
 use glass_api::{Client, ClientError};
 use glass_gfx::{Display, GfxError};
@@ -29,7 +35,13 @@ use std::time::{Duration, Instant};
 pub const CLIENT_NAME: &str = "glass-launcher";
 
 /// The subscribed topics.
-pub const TOPICS: [Topic; 4] = [Topic::Gesture, Topic::Screen, Topic::Settings, Topic::Wear];
+pub const TOPICS: [Topic; 5] = [
+    Topic::Gesture,
+    Topic::Screen,
+    Topic::Settings,
+    Topic::Wear,
+    Topic::Companion,
+];
 
 /// A wake within this time of a timeout or gesture sleep keeps the card that was shown.
 pub const STAY_ON_CARD_MS: u32 = 5_000;
@@ -153,6 +165,13 @@ impl From<GfxError> for GlassdError {
 pub struct Session {
     client: Client,
     focused: bool,
+    /// Whether the launcher wants the focus (false while its activity is paused).
+    wants_focus: bool,
+    /// Take the focus back when glassd says it was lost while it is wanted (Android: the
+    /// glue may take it after the launcher, api.md "Android glue").
+    reacquire: bool,
+    /// `seq` and request id of the last `DictationStart`, to match an error answer.
+    dictation_seq: Option<(u32, u32)>,
     settings: Option<Settings>,
     log: Vec<String>,
 }
@@ -160,6 +179,16 @@ pub struct Session {
 impl Session {
     /// Connects, says hello, subscribes and asks for the input focus.
     pub fn connect(path: &Path) -> Result<Session, ClientError> {
+        Self::connect_with(path, true, false)
+    }
+
+    /// Connects; takes the focus at once if `wants_focus`, and with `reacquire` takes it
+    /// back whenever it is lost while wanted.
+    pub fn connect_with(
+        path: &Path,
+        wants_focus: bool,
+        reacquire: bool,
+    ) -> Result<Session, ClientError> {
         let mut client = Client::connect_as(path, CLIENT_NAME)?;
         if client.welcome().api_version < 1 {
             return Err(ClientError::Handshake(Box::new(ServiceFrame {
@@ -167,13 +196,43 @@ impl Session {
             })));
         }
         client.subscribe(&TOPICS)?;
-        client.acquire_focus()?;
+        if wants_focus {
+            client.acquire_focus()?;
+        }
         Ok(Session {
             client,
             focused: false,
+            wants_focus,
+            reacquire,
+            dictation_seq: None,
             settings: None,
             log: Vec::new(),
         })
+    }
+
+    /// Takes (`true`) or gives back (`false`) the input focus: the Android activity was
+    /// resumed or paused.
+    pub fn set_wants_focus(&mut self, wants: bool, app: &mut App) -> Result<(), ClientError> {
+        if wants == self.wants_focus {
+            return Ok(());
+        }
+        self.wants_focus = wants;
+        if wants {
+            self.client.acquire_focus()?;
+        } else {
+            self.client.release_focus()?;
+            if self.focused {
+                app.cancel_touch();
+            }
+            self.focused = false;
+        }
+        Ok(())
+    }
+
+    /// The socket's descriptor, to wait on it together with other events.
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.client.stream().as_raw_fd()
     }
 
     /// glassd's version and capabilities from its `Welcome`.
@@ -237,13 +296,34 @@ impl Session {
                     app.cancel_touch();
                 }
                 self.focused = f.focused;
+                if !f.focused && self.wants_focus && self.reacquire {
+                    self.client.acquire_focus()?;
+                    self.log
+                        .push("focus lost while in front: taking it back".into());
+                }
             }
+            service_frame::Body::CompanionState(c) => app.companion_changed(Companion {
+                provider: c.provider,
+                connected: c.phone_connected,
+                phone_name: c.phone_name,
+            }),
+            service_frame::Body::DictationState(d) => app.dictation_state(&d),
+            service_frame::Body::Transcript(t) => app.dictation_transcript(&t),
             service_frame::Body::ScreenState(s) => apply_screen(app, &s),
             service_frame::Body::Settings(s) => {
                 self.settings = Some(s);
                 app.settings_changed(s);
             }
             service_frame::Body::Error(e) => {
+                if let Some((seq, request_id)) = self.dictation_seq {
+                    if e.seq == seq && seq != 0 {
+                        self.dictation_seq = None;
+                        app.dictation_refused(
+                            request_id,
+                            ErrorCode::try_from(e.code).unwrap_or(ErrorCode::Unspecified),
+                        );
+                    }
+                }
                 let code = ErrorCode::try_from(e.code)
                     .map(|c| c.as_str_name().to_string())
                     .unwrap_or_else(|_| format!("error code {}", e.code));
@@ -267,6 +347,36 @@ impl Session {
                         }))?;
                     self.log.push(format!("SetSettings {patch:?}"));
                 }
+                Request::DictationStart(request_id) => {
+                    let seq =
+                        self.client
+                            .send(client_frame::Body::DictationStart(DictationStart {
+                                request_id,
+                                purpose: "free".into(),
+                                ..Default::default()
+                            }))?;
+                    self.dictation_seq = Some((seq, request_id));
+                    self.log.push(format!("DictationStart {request_id}"));
+                }
+                Request::DictationCancel(request_id) => {
+                    self.client
+                        .send(client_frame::Body::DictationCancel(DictationCancel {
+                            request_id,
+                        }))?;
+                    self.log.push(format!("DictationCancel {request_id}"));
+                }
+                Request::KeepScreenOn(on) => {
+                    let action = if on {
+                        screen_request::Action::KeepOn
+                    } else {
+                        screen_request::Action::ReleaseKeepOn
+                    };
+                    // One minute: glassd ends a dictation after 55 s anyway.
+                    self.client.send(client_frame::Body::Screen(ScreenRequest {
+                        action: action as i32,
+                        duration_ms: if on { 60_000 } else { 0 },
+                    }))?;
+                }
             }
         }
         Ok(())
@@ -282,9 +392,22 @@ impl Session {
         };
         self.handle(first, app)?;
         n += 1;
-        // Frames already decoded or already in the socket: a 1 µs deadline reads what is
-        // there and does not wait for more.
-        while let Some(f) = self.client.recv(Some(Duration::from_micros(1)))? {
+        // Frames already decoded or already in the socket, without waiting for more.
+        n += self.drain_received(app)?;
+        Ok(n)
+    }
+
+    /// Sends pending requests, then applies every frame already received, without blocking
+    /// (for a loop that polls the socket itself); returns how many were applied.
+    pub fn drain(&mut self, app: &mut App) -> Result<usize, ClientError> {
+        self.send_requests(app)?;
+        self.drain_received(app)
+    }
+
+    fn drain_received(&mut self, app: &mut App) -> Result<usize, ClientError> {
+        let mut n = 0;
+        // try_recv never blocks; recv with a tiny timeout would wait a scheduler tick.
+        while let Some(f) = self.client.try_recv()? {
             self.handle(f, app)?;
             n += 1;
         }
@@ -411,6 +534,9 @@ pub fn run<D: Display>(
             let wait = wait_time(app, clock().now_s, options.fps, options.max_wait);
             let pumped = session.pump(app, wait);
             for line in session.take_log() {
+                log(&line);
+            }
+            for line in app.take_log() {
                 log(&line);
             }
             if let Err(e) = pumped {

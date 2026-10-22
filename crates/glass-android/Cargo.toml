@@ -1,0 +1,23 @@
+[package]
+name = "glass-android"
+description = "The Android wrapper's native side: JNI entry points and the render thread of the launcher (libglass_launcher_jni.so)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "glass_launcher_jni"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+glass-launcher.workspace = true
+glass-gfx.workspace = true
+glass-gfx-gles.workspace = true
+glass-ui.workspace = true
+glass-api.workspace = true
+libc = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni-sys = "0.3"

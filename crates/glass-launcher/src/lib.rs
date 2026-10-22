@@ -9,20 +9,29 @@
 
 pub mod clock;
 pub mod demo;
+pub mod dictation;
 pub mod glassd;
+pub mod panel;
 pub mod script;
+pub mod setup;
 
 pub mod platform;
 pub mod renderer;
 pub mod settings;
 
-use glass_api::proto::Settings;
+use dictation::{Dictation, DictationOut, NOTE_CARD, NOTE_SOURCE};
+use glass_api::proto::{DictationState, ErrorCode, Settings, Transcript};
 use glass_gfx::{Color, Compositor, Display, Frame, GfxError, SoftwareCompositor};
 use glass_ui::{
     Action, Adjuster, CardId, GestureKind, InputEvent, Menu, Outcome, RenderContext, Timeline,
 };
+use glass_ui::{Card, CardContent};
+use panel::Panel;
+use platform::PlatformEvent;
 use platform::{MockPlatform, Platform};
 use settings::{Choice, ServiceInfo, SettingsView};
+use setup::{Companion, Setup, SetupEffect};
+use std::path::PathBuf;
 
 /// What is shown over the timeline.
 enum Overlay {
@@ -30,6 +39,8 @@ enum Overlay {
     Menu(Menu<Choice>, CardId),
     /// The wake-angle sub-screen.
     Adjust(Adjuster),
+    /// Taking a note by dictation.
+    Dictation(Dictation, Panel),
 }
 
 /// Which overlay is open (for tests and logs).
@@ -40,13 +51,23 @@ pub enum OverlayKind {
         index: usize,
     },
     Adjust,
+    Dictation,
 }
 
 /// A request for `glassd`, made by the app (the caller sends it).
 #[derive(Clone, Debug, PartialEq)]
 pub enum Request {
     SetSettings(Settings),
+    /// `DictationStart{request_id, purpose: "free"}`.
+    DictationStart(u32),
+    DictationCancel(u32),
+    /// Keep the screen on while dictating (`ScreenRequest{ACTION_KEEP_ON}`, true) or let it
+    /// time out again (`ACTION_RELEASE_KEEP_ON`, false): glassd's timeout counts touches only.
+    KeepScreenOn(bool),
 }
+
+/// The first note card's id; later notes count up.
+const FIRST_NOTE_ID: CardId = 1_000;
 
 /// Who decides whether the screen is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,6 +94,13 @@ pub struct App {
     requests: Vec<Request>,
     log: Vec<String>,
     ctx: RenderContext,
+    /// The setup flow while it runs, with its card.
+    setup: Option<(Setup, Panel)>,
+    /// A file whose presence means the setup flow was done.
+    setup_marker: Option<PathBuf>,
+    companion: Companion,
+    next_request: u32,
+    next_note: CardId,
 }
 
 impl App {
@@ -101,9 +129,210 @@ impl App {
             requests: Vec::new(),
             log: Vec::new(),
             ctx,
+            setup: None,
+            setup_marker: None,
+            companion: Companion::default(),
+            next_request: 1,
+            next_note: FIRST_NOTE_ID,
         };
         app.refresh_settings_cards();
         app
+    }
+
+    /// Starts the setup flow, unless `marker` exists (it is created when the flow ends).
+    /// Returns whether the flow runs.
+    pub fn start_setup(&mut self, marker: Option<PathBuf>) -> bool {
+        if marker.as_ref().is_some_and(|m| m.exists()) {
+            return false;
+        }
+        self.setup_marker = marker;
+        let mut s = Setup::new();
+        s.set_bluetooth_name(self.platform.bluetooth_name());
+        s.set_companion(self.companion.clone());
+        let panel = Panel::new(s.card(), self.ctx);
+        self.close_overlay();
+        self.timeline.release_layers(self.compositor.as_mut());
+        self.setup = Some((s, panel));
+        self.shown = false;
+        true
+    }
+
+    /// The setup flow's state, while it runs.
+    pub fn setup(&self) -> Option<&Setup> {
+        self.setup.as_ref().map(|(s, _)| s)
+    }
+
+    fn apply_setup(&mut self, fx: Vec<SetupEffect>) {
+        for e in fx {
+            match e {
+                SetupEffect::Platform(r) => {
+                    use platform::PlatformRequest as R;
+                    let res = match &r {
+                        R::Wifi(on) => self.platform.set_wifi(*on),
+                        R::Bluetooth(on) => self.platform.set_bluetooth(*on),
+                        R::Discoverable(secs) => self.platform.set_discoverable(*secs),
+                        R::AnswerPairing(a) => self.platform.answer_pairing(*a),
+                        R::SetProvisioned => self.platform.set_provisioned(),
+                        R::OpenApp(p) => self.platform.open_app(p),
+                    };
+                    if let Err(e) = res {
+                        self.log.push(format!("setup: {r:?}: {e}"));
+                    }
+                }
+                SetupEffect::Done { skipped } => {
+                    self.log.push(format!(
+                        "setup: done{}",
+                        if skipped { " (skipped)" } else { "" }
+                    ));
+                    if let Some(m) = &self.setup_marker {
+                        if let Err(e) = std::fs::write(m, b"done\n") {
+                            self.log.push(format!("setup: {}: {e}", m.display()));
+                        }
+                    }
+                    if let Some((_, mut panel)) = self.setup.take() {
+                        panel.release(self.compositor.as_mut());
+                    }
+                    self.timeline.show_home();
+                    self.shown = false;
+                }
+            }
+        }
+        self.refresh_setup_card();
+        self.refresh_settings_cards();
+    }
+
+    fn refresh_setup_card(&mut self) {
+        if let Some((s, panel)) = self.setup.as_mut() {
+            panel.set(s.card());
+        }
+    }
+
+    /// A state change from the platform back end (radios, pairing, set-up state).
+    pub fn platform_event(&mut self, e: &PlatformEvent) {
+        self.platform.on_event(e);
+        if let Some((s, _)) = self.setup.as_mut() {
+            let fx = s.platform_event(e);
+            self.apply_setup(fx);
+        } else {
+            self.refresh_settings_cards();
+        }
+    }
+
+    /// glassd's `CompanionState`: whether a phone is connected through the companion.
+    pub fn companion_changed(&mut self, c: Companion) {
+        self.companion = c.clone();
+        if let Some((s, _)) = self.setup.as_mut() {
+            s.set_companion(c);
+        }
+        self.refresh_setup_card();
+        self.refresh_note_card();
+    }
+
+    pub fn companion(&self) -> &Companion {
+        &self.companion
+    }
+
+    fn dictation_offered(&self) -> bool {
+        self.owner == ScreenOwner::Glassd
+            && self
+                .service
+                .as_ref()
+                .is_some_and(|s| s.capabilities.iter().any(|c| c == "dictation"))
+    }
+
+    /// The "Take a note" card: present while glassd relays dictation.
+    fn refresh_note_card(&mut self) {
+        let exists = self.timeline.cards().iter().any(|c| c.id == NOTE_CARD);
+        if !self.dictation_offered() {
+            if exists {
+                self.timeline.remove_card(NOTE_CARD);
+            }
+            return;
+        }
+        let content = CardContent::Settings {
+            title: "Take a note".into(),
+            subtitle: Some(if self.companion.connected {
+                "Tap to speak".into()
+            } else {
+                "Phone not connected".into()
+            }),
+        };
+        if exists {
+            self.timeline.update_card(NOTE_CARD, content);
+        } else {
+            self.timeline.insert_backward(Card::new(NOTE_CARD, content));
+        }
+    }
+
+    fn start_dictation(&mut self) {
+        let id = self.next_request;
+        self.next_request = self.next_request.wrapping_add(1).max(1);
+        self.requests.push(Request::DictationStart(id));
+        self.requests.push(Request::KeepScreenOn(true));
+        let d = Dictation::new(id);
+        let panel = Panel::new(d.card(self.ctx.now_s), self.ctx);
+        self.show_overlay(Overlay::Dictation(d, panel));
+    }
+
+    fn with_dictation(&mut self, f: impl FnOnce(&mut Dictation) -> Option<DictationOut>) {
+        let now = self.ctx.now_s;
+        let out = match self.overlay.as_mut() {
+            Some(Overlay::Dictation(d, panel)) => {
+                let out = f(d);
+                panel.set(d.card(now));
+                out
+            }
+            _ => return,
+        };
+        match out {
+            None => {}
+            Some(DictationOut::Cancel(id)) => {
+                self.requests.push(Request::DictationCancel(id));
+                if let Some(Overlay::Dictation(d, _)) = self.overlay.as_mut() {
+                    // Already cancelled: closing must not cancel again.
+                    d.refused(ErrorCode::Unspecified);
+                }
+                self.close_overlay();
+            }
+            Some(DictationOut::Close) => self.close_overlay(),
+            Some(DictationOut::Note(text)) => {
+                self.close_overlay();
+                let id = self.next_note;
+                self.next_note += 1;
+                self.timeline.insert_history(Card::new(
+                    id,
+                    CardContent::Text {
+                        body: text,
+                        source: NOTE_SOURCE.into(),
+                        timestamp_s: self.ctx.now_s,
+                    },
+                ));
+                self.log.push(format!("note: card {id}"));
+            }
+        }
+    }
+
+    /// glassd's `DictationState` for a request of this app.
+    pub fn dictation_state(&mut self, s: &DictationState) {
+        self.with_dictation(|d| d.on_state(s));
+    }
+
+    /// glassd's `Transcript` for a request of this app.
+    pub fn dictation_transcript(&mut self, t: &Transcript) {
+        self.with_dictation(|d| {
+            d.on_transcript(t);
+            None
+        });
+    }
+
+    /// glassd refused the `DictationStart` of `request_id`.
+    pub fn dictation_refused(&mut self, request_id: u32, code: ErrorCode) {
+        self.with_dictation(|d| {
+            if d.request_id() == request_id {
+                d.refused(code);
+            }
+            None
+        });
     }
 
     /// Uses `platform` for Wi-Fi and Bluetooth.
@@ -146,6 +375,7 @@ impl App {
     pub fn set_service(&mut self, info: Option<ServiceInfo>) {
         self.service = info;
         self.refresh_settings_cards();
+        self.refresh_note_card();
     }
 
     /// Requests for glassd made since the last call.
@@ -164,6 +394,7 @@ impl App {
             None => None,
             Some(Overlay::Menu(m, _)) => Some(OverlayKind::Menu { index: m.index() }),
             Some(Overlay::Adjust(_)) => Some(OverlayKind::Adjust),
+            Some(Overlay::Dictation(..)) => Some(OverlayKind::Dictation),
         }
     }
 
@@ -253,6 +484,13 @@ impl App {
         match self.overlay.take() {
             Some(Overlay::Menu(mut m, _)) => m.release(self.compositor.as_mut()),
             Some(Overlay::Adjust(mut a)) => a.release(self.compositor.as_mut()),
+            Some(Overlay::Dictation(d, mut panel)) => {
+                if d.is_open() {
+                    self.requests.push(Request::DictationCancel(d.request_id()));
+                }
+                self.requests.push(Request::KeepScreenOn(false));
+                panel.release(self.compositor.as_mut());
+            }
             None => return,
         }
         self.shown = false;
@@ -313,6 +551,10 @@ impl App {
                 Some(Outcome::Closed) => None,
                 Some(Outcome::Selected(c)) => Some(c),
             },
+            Some(Overlay::Dictation(..)) => {
+                self.with_dictation(|d| d.input(event));
+                return;
+            }
             Some(Overlay::Adjust(a)) => match a.handle(event) {
                 None => return,
                 Some(Outcome::Closed) => None,
@@ -387,12 +629,30 @@ impl App {
     /// The connection to glassd is gone: its settings are unknown again and requests made
     /// for it are dropped (a new session sends a fresh snapshot).
     pub fn glassd_disconnected(&mut self) {
+        // An open dictation ended with the connection (glassd forgets it, no state will come).
+        let open = match &self.overlay {
+            Some(Overlay::Dictation(d, _)) if d.is_open() => Some(d.request_id()),
+            _ => None,
+        };
+        if let Some(request_id) = open {
+            self.dictation_state(&DictationState {
+                request_id,
+                state: glass_api::proto::dictation_state::State::Failed as i32,
+                error: "link-lost".into(),
+            });
+        }
+        self.companion = Companion::default();
+        if let Some((s, _)) = self.setup.as_mut() {
+            s.set_companion(Companion::default());
+        }
         self.requests.clear();
         self.service = None;
         if self.owner == ScreenOwner::Glassd {
             self.settings = None;
         }
         self.refresh_settings_cards();
+        self.refresh_setup_card();
+        self.refresh_note_card();
     }
 
     /// Whether the timeline is moving (frames are due at the frame rate).
@@ -440,11 +700,20 @@ impl App {
     /// Input with the screen on: the overlay if one is open, else the timeline (whose
     /// `TAP` opens the card's menu).
     fn timeline_input(&mut self, event: &InputEvent) -> Option<Action> {
+        if let Some((s, _)) = self.setup.as_mut() {
+            let fx = s.input(event);
+            self.apply_setup(fx);
+            return None;
+        }
         if self.overlay.is_some() {
             self.overlay_input(event);
             return None;
         }
         let action = self.timeline.handle(event);
+        if action == Some(Action::OpenMenu(NOTE_CARD)) && self.dictation_offered() {
+            self.start_dictation();
+            return action;
+        }
         if let Some(Action::OpenMenu(id)) = action {
             if !self.open_menu(id) {
                 return None; // this card has no menu
@@ -461,7 +730,11 @@ impl App {
         match &mut self.overlay {
             Some(Overlay::Menu(m, _)) => m.tick(dt),
             Some(Overlay::Adjust(a)) => a.set_context(ctx),
+            Some(Overlay::Dictation(_, p)) => p.set_context(ctx),
             None => {}
+        }
+        if let Some((_, p)) = self.setup.as_mut() {
+            p.set_context(ctx);
         }
     }
 
@@ -476,7 +749,21 @@ impl App {
             self.shown = true;
             return Ok(true);
         }
+        if let Some((_, p)) = self.setup.as_mut() {
+            if self.shown && !p.needs_redraw() {
+                return Ok(false);
+            }
+            p.render(self.compositor.as_mut())?;
+            self.shown = true;
+            return Ok(true);
+        }
         match &mut self.overlay {
+            Some(Overlay::Dictation(_, p)) => {
+                if self.shown && !p.needs_redraw() {
+                    return Ok(false);
+                }
+                p.render(self.compositor.as_mut())?;
+            }
             Some(Overlay::Menu(m, _)) => {
                 if self.shown && !m.needs_redraw() {
                     return Ok(false);
@@ -507,6 +794,16 @@ impl App {
         }
         self.compositor.present(display)?;
         Ok(true)
+    }
+
+    /// The compositor's native-window side, if it draws into a window (Android).
+    pub fn window_target(&mut self) -> Option<&mut dyn glass_gfx::WindowTarget> {
+        self.compositor.window_target()
+    }
+
+    /// Draws the next frame even if nothing changed (a new window surface is empty).
+    pub fn invalidate(&mut self) {
+        self.shown = false;
     }
 
     /// How many layers the compositor holds (tests: the GPU memory bound).

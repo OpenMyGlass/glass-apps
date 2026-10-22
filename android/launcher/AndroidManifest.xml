@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The OpenMyGlass launcher wrapper: a HOME activity that hands its Surface to the native
+     launcher (libglass_launcher_jni.so, installed in /system/lib). Installed as a privileged
+     system app signed with the platform key (see android/README.md). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="org.openmyglass.launcher"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="22" />
+
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <!-- Signature|system: setPairingConfirmation in the setup flow. -->
+    <uses-permission android:name="android.permission.BLUETOOTH_PRIVILEGED" />
+    <!-- Signature|system: device_provisioned and user_setup_complete when setup ends. -->
+    <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
+
+    <application
+        android:label="OpenMyGlass"
+        android:allowBackup="false"
+        android:persistent="false">
+        <activity
+            android:name=".HomeActivity"
+            android:label="OpenMyGlass"
+            android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:launchMode="singleTask"
+            android:stateNotNeeded="true"
+            android:excludeFromRecents="true"
+            android:clearTaskOnLaunch="true"
+            android:screenOrientation="landscape"
+            android:configChanges="mcc|mnc|locale|touchscreen|keyboard|keyboardHidden|navigation|screenLayout|fontScale|uiMode|orientation|screenSize|smallestScreenSize|layoutDirection">
+            <intent-filter android:priority="2">
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.HOME" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

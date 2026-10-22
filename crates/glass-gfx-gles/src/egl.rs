@@ -47,8 +47,13 @@ pub struct EglInfo {
 pub struct EglContext {
     egl: egl::DynamicInstance<egl::EGL1_4>,
     display: egl::Display,
+    config: egl::Config,
     context: egl::Context,
+    /// The 1×1 pbuffer that keeps the context current without a window (or the off-screen
+    /// surface); `None` with a surfaceless context, or when the config has no pbuffers.
     surface: Option<egl::Surface>,
+    /// The window surface while a native window is attached ([`EglContext::attach_window`]).
+    window: Option<egl::Surface>,
     gles: libloading::Library,
     info: EglInfo,
     _not_send: std::marker::PhantomData<*const ()>,
@@ -67,6 +72,20 @@ impl EglContext {
     /// surfaceless platform and context and uses the default display with a pbuffer, the
     /// set-up of EGL 1.4 libraries (tests that path on Mesa).
     pub fn offscreen(force_pbuffer: bool) -> Result<EglContext, String> {
+        Self::create(force_pbuffer, false)
+    }
+
+    /// A GLES2 context for rendering into a native window (Android's `ANativeWindow`):
+    /// the default display and a config with `EGL_WINDOW_BIT` (with `EGL_PBUFFER_BIT` too
+    /// when there is one, so a 1×1 pbuffer keeps the context current while no window is
+    /// attached). The context is current on the pbuffer if there is one; attach the window
+    /// with [`EglContext::attach_window`]. Call [`EglContext::native_visual_id`] first to
+    /// set the window's buffer format to the config's.
+    pub fn for_window() -> Result<EglContext, String> {
+        Self::create(true, true)
+    }
+
+    fn create(force_pbuffer: bool, for_window: bool) -> Result<EglContext, String> {
         // SAFETY: the library is the system's EGL; its symbols follow the EGL API.
         let egl = unsafe {
             egl::DynamicInstance::<egl::EGL1_4>::load_required_from_filename(EGL_LIBRARY)
@@ -79,7 +98,7 @@ impl EglContext {
             .unwrap_or_default();
         let mut setup = String::new();
         let mut display = None;
-        if !force_pbuffer && has_ext(&client_ext, "EGL_MESA_platform_surfaceless") {
+        if !force_pbuffer && !for_window && has_ext(&client_ext, "EGL_MESA_platform_surfaceless") {
             display = Self::surfaceless_display(&egl, &client_ext);
             if display.is_some() {
                 setup.push_str("surfaceless");
@@ -107,24 +126,42 @@ impl EglContext {
             .unwrap_or_default();
         let surfaceless_ctx =
             !force_pbuffer && has_ext(&display_ext, "EGL_KHR_surfaceless_context");
-        let surface_type = if surfaceless_ctx { 0 } else { egl::PBUFFER_BIT };
-        let attribs = [
-            egl::RED_SIZE,
-            8,
-            egl::GREEN_SIZE,
-            8,
-            egl::BLUE_SIZE,
-            8,
-            egl::RENDERABLE_TYPE,
-            egl::OPENGL_ES2_BIT,
-            egl::SURFACE_TYPE,
-            surface_type,
-            egl::NONE,
-        ];
-        let config = egl
-            .choose_first_config(display, &attribs)
-            .map_err(|e| egl_err("eglChooseConfig", e))?
-            .ok_or("no EGL config for GLES2 with 8-bit colour")?;
+        let attribs = |surface_type| {
+            [
+                egl::RED_SIZE,
+                8,
+                egl::GREEN_SIZE,
+                8,
+                egl::BLUE_SIZE,
+                8,
+                egl::RENDERABLE_TYPE,
+                egl::OPENGL_ES2_BIT,
+                egl::SURFACE_TYPE,
+                surface_type,
+                egl::NONE,
+            ]
+        };
+        let choose = |surface_type| {
+            egl.choose_first_config(display, &attribs(surface_type))
+                .map_err(|e| egl_err("eglChooseConfig", e))
+        };
+        // (config, whether it has pbuffers)
+        let (config, pbuffers) = if for_window {
+            match choose(egl::WINDOW_BIT | egl::PBUFFER_BIT)? {
+                Some(c) => (c, true),
+                None => (
+                    choose(egl::WINDOW_BIT)?
+                        .ok_or("no EGL window config for GLES2 with 8-bit colour")?,
+                    false,
+                ),
+            }
+        } else {
+            let surface_type = if surfaceless_ctx { 0 } else { egl::PBUFFER_BIT };
+            (
+                choose(surface_type)?.ok_or("no EGL config for GLES2 with 8-bit colour")?,
+                !surfaceless_ctx,
+            )
+        };
         egl.bind_api(egl::OPENGL_ES_API)
             .map_err(|e| egl_err("eglBindAPI", e))?;
         let context = egl
@@ -137,7 +174,10 @@ impl EglContext {
             .map_err(|e| egl_err("eglCreateContext", e))?;
         let mut surface = None;
         let rest = (|| {
-            if surfaceless_ctx {
+            if for_window {
+                setup.push_str(", window");
+            }
+            if surfaceless_ctx || (for_window && !pbuffers) {
                 setup.push_str(", no surface");
             } else {
                 setup.push_str(", pbuffer");
@@ -150,8 +190,11 @@ impl EglContext {
                     .map_err(|e| egl_err("eglCreatePbufferSurface", e))?,
                 );
             }
-            egl.make_current(display, surface, surface, Some(context))
-                .map_err(|e| egl_err("eglMakeCurrent", e))?;
+            // A window context without pbuffers becomes current with its first window.
+            if !(for_window && !pbuffers && !surfaceless_ctx) {
+                egl.make_current(display, surface, surface, Some(context))
+                    .map_err(|e| egl_err("eglMakeCurrent", e))?;
+            }
             // SAFETY: the system's GLES2 library.
             unsafe { libloading::Library::new(GLES_LIBRARY) }
                 .map_err(|e| format!("cannot load {GLES_LIBRARY}: {e}"))
@@ -171,8 +214,10 @@ impl EglContext {
         Ok(EglContext {
             egl,
             display,
+            config,
             context,
             surface,
+            window: None,
             gles,
             info: EglInfo {
                 version: (major, minor),
@@ -227,11 +272,80 @@ impl EglContext {
     }
 
     /// Makes the context current on this thread (several contexts can live on one thread,
-    /// in tests).
+    /// in tests), on the window if one is attached, else on the pbuffer (or no surface).
     pub fn make_current(&self) -> Result<(), String> {
+        let s = self.window.or(self.surface);
         self.egl
-            .make_current(self.display, self.surface, self.surface, Some(self.context))
+            .make_current(self.display, s, s, Some(self.context))
             .map_err(|e| egl_err("eglMakeCurrent", e))
+    }
+
+    /// The config's `EGL_NATIVE_VISUAL_ID`: on Android the window's buffer format to set
+    /// (`ANativeWindow_setBuffersGeometry`) before [`EglContext::attach_window`].
+    pub fn native_visual_id(&self) -> Result<i32, String> {
+        self.egl
+            .get_config_attrib(self.display, self.config, egl::NATIVE_VISUAL_ID)
+            .map_err(|e| egl_err("eglGetConfigAttrib(EGL_NATIVE_VISUAL_ID)", e))
+    }
+
+    /// Whether a window surface is attached.
+    pub fn has_window(&self) -> bool {
+        self.window.is_some()
+    }
+
+    /// Creates a window surface for `window` and makes the context current on it. Any
+    /// window attached before is detached first.
+    ///
+    /// # Safety
+    /// `window` must be a valid native window (an `ANativeWindow*` on Android) that stays
+    /// valid until [`EglContext::detach_window`] (or the drop of this context) returns.
+    pub unsafe fn attach_window(&mut self, window: *mut c_void) -> Result<(), String> {
+        self.detach_window();
+        // SAFETY: the caller guarantees the window; the pointer type differs per platform.
+        let s = unsafe {
+            self.egl.create_window_surface(
+                self.display,
+                self.config,
+                window as egl::NativeWindowType,
+                None,
+            )
+        }
+        .map_err(|e| egl_err("eglCreateWindowSurface", e))?;
+        self.window = Some(s);
+        if let Err(e) = self.make_current() {
+            self.detach_window();
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Releases the window surface: the context stays, current on the pbuffer if there is
+    /// one (else on no surface: GL calls fail until the next window). After this returns
+    /// the native window is no longer used.
+    pub fn detach_window(&mut self) {
+        let Some(w) = self.window.take() else {
+            return;
+        };
+        let _ = self.egl.make_current(self.display, None, None, None);
+        let _ = self.egl.destroy_surface(self.display, w);
+        if self.surface.is_some() {
+            let _ = self.make_current();
+        }
+    }
+
+    /// The window surface's size in pixels, if one is attached.
+    pub fn window_size(&self) -> Option<(u32, u32)> {
+        let w = self.window?;
+        let q = |a| self.egl.query_surface(self.display, w, a).ok();
+        Some((q(egl::WIDTH)? as u32, q(egl::HEIGHT)? as u32))
+    }
+
+    /// Shows the window's back buffer (`eglSwapBuffers`).
+    pub fn swap_buffers(&self) -> Result<(), String> {
+        let w = self.window.ok_or("no window attached")?;
+        self.egl
+            .swap_buffers(self.display, w)
+            .map_err(|e| egl_err("eglSwapBuffers", e))
     }
 
     /// Whether this context is the current one.
@@ -269,6 +383,9 @@ impl Drop for EglContext {
         // The display is not terminated: other contexts of this process may share it.
         let _ = self.egl.make_current(self.display, None, None, None);
         let _ = self.egl.destroy_context(self.display, self.context);
+        if let Some(w) = self.window.take() {
+            let _ = self.egl.destroy_surface(self.display, w);
+        }
         if let Some(s) = self.surface {
             let _ = self.egl.destroy_surface(self.display, s);
         }

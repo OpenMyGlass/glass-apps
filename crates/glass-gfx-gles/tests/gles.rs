@@ -576,3 +576,60 @@ fn pbuffer_context_renders_the_goldens_too() {
         Tolerance::Max(2),
     );
 }
+
+/// The window path composes with y flipped (GL window row 0 is the bottom) and the
+/// read-back un-flips: rendering with the window orientation into the off-screen target
+/// must give the same goldens, so a missing or doubled flip fails here and not only on
+/// the device.
+#[test]
+fn window_orientation_renders_the_goldens_too() {
+    if !enabled() {
+        return;
+    }
+    let mut c = compositor_with(GlesOptions {
+        sgx540_checks: true,
+        window_orientation: true,
+        ..GlesOptions::default()
+    });
+    assert!(!c.is_window());
+    for name in ["home", "text", "menu-item", "adjust"] {
+        let card = scene(name);
+        let f = render_card_gles(&mut c, &card);
+        check_golden(name, &f, shapes_of(&card));
+    }
+    // Asymmetric in x and y: two cards side by side, text near the top.
+    let mut t = Timeline::new(
+        vec![Card::new(1, CardContent::settings("Settings"))],
+        Card::new(10, CardContent::Home),
+        vec![message()],
+    );
+    t.set_context(ctx());
+    t.render(&mut c).unwrap();
+    t.handle(&InputEvent::Scroll {
+        displacement: 0.35 / CARDS_PER_PAD_WIDTH,
+        delta: 0.0,
+        velocity: 0.0,
+        fingers: 1,
+        ended: false,
+        cancelled: false,
+        timestamp_us: 0,
+    });
+    t.render(&mut c).unwrap();
+    check_golden(
+        "timeline-mid-scroll",
+        &c.read_frame().unwrap(),
+        Tolerance::Max(2),
+    );
+}
+
+/// An off-screen compositor has no window to attach.
+#[test]
+fn offscreen_compositor_refuses_a_window() {
+    if !enabled() {
+        return;
+    }
+    let mut c = compositor();
+    let r = unsafe { c.attach_window(std::ptr::null_mut()) };
+    assert!(r.is_err());
+    assert!(!c.has_window());
+}

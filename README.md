@@ -11,7 +11,8 @@ Plans and decisions are in [`docs/plans/`](docs/plans/).
 | [`glass-gfx`](crates/glass-gfx) | The `Painter` (draw commands) and `Compositor` (layers, frames) traits; text layout into whole-pixel glyph runs shared by both renderers (single line, wrapping, ellipsis); the software renderer: `Frame` (RGBA8888, premultiplied), `SkiaPainter` (tiny-skia, fontdue), `SoftwareCompositor`; the `Display` trait with a headless back end (memory, PNG files) and a host window back end (`window` feature, minifb) |
 | [`glass-gfx-gles`](crates/glass-gfx-gles) | The GLES2 renderer: EGL and GLES loaded at run time (khronos-egl, glow), off-screen contexts (Mesa surfaceless or pbuffer), `GlesPainter` (distance-function rounded rects, CPU-downscaled image textures, ALPHA glyph atlas), `GlesCompositor` (FBO texture layers), the SGX540 assertion layer |
 | [`glass-ui`](crates/glass-ui) | Cards (home clock, text, settings entry, image) in Glass style, drawn through `Painter`; the timeline: gestures, live drag from `Scroll`, settle animation, cached per-card layers through `Compositor` (at most 4); `InputEvent` mirroring the glass-services messages |
-| [`glass-launcher`](crates/glass-launcher) | The launcher binary: a `glassd` client (`--glassd`, through glass-services' `glass-api`: focus, gestures, screen state, reconnection), mock scripts headless, or a host window driven by the keyboard; `--renderer gles\|software` |
+| [`glass-launcher`](crates/glass-launcher) | The launcher binary: a `glassd` client (`--glassd`, through glass-services' `glass-api`: focus, gestures, screen state, companion state, dictation, reconnection), mock scripts headless, or a host window driven by the keyboard; `--renderer gles\|software`; the first-boot setup flow (`--setup`) and "Take a note" |
+| [`glass-android`](crates/glass-android) | `libglass_launcher_jni.so` for the Android wrapper ([`android/`](android/README.md)): JNI entry points, the render thread (EGL window compositor, the launcher, the `glassd` session), the platform line protocol to Java |
 
 ## Running on a desktop
 
@@ -44,6 +45,10 @@ cargo run -p glass-launcher --features window -- --glassd /tmp/glassd.sock
 
 In this mode the keyboard does nothing; `glassd` owns the screen: a one-finger swipe down on the home card sends `ScreenRequest{ACTION_SLEEP}`, nothing is drawn while the screen is off, and on a wake the launcher shows the home card unless the last sleep was a timeout or a gesture (nudge, two-finger swipe down) at most 5 s ago (a swipe wake always shows home). Input is ignored while another client holds the input focus. If `glassd` goes away the launcher reconnects, with a delay from 100 ms doubling up to 5 s. The loop blocks on the socket: one frame at a time while the timeline moves, until the next minute (the home clock) at rest, and with no timeout while the screen is off. `tools/e2e_glassd.sh GLASSD LAUNCHER` runs a scripted session (CI runs it in the `host` job against glassd built at the pinned revision).
 
+## Android (route 1)
+
+The launcher runs on Android 4.4.4 (Track A) and 6.0.1 (Track B) as the HOME app `org.openmyglass.launcher`, a small Java wrapper whose `Surface` the native launcher draws with GLES2 on its own thread; input comes from `glassd`. One build (API 19, NDK r25c) serves both tracks. `tools/android-dist.sh DIR` builds the prebuilt directory for `<aosp>/vendor/openmyglass/glass-apps/`; how the device tree includes it, and what is untested, is in [`android/README.md`](android/README.md). Nothing of it has run on a Glass yet.
+
 ## Tests
 
 ```sh
@@ -59,7 +64,7 @@ Golden images are compared with a tolerance of 3 per channel; on a mismatch the 
 
 The GLES tests render the same scenes and compare them with the same goldens: solid fills, layers and text within ±2 per channel on every pixel; anti-aliased rounded-rect edges within ±2 except on at most 1 % of the pixels, which stay within 64, and only inside the rounded shapes' rectangles (`glass_ui::card::shape_rects`), strict everywhere else. Mismatching GLES images go to `target/golden-actual-gles/`. Without `GLASS_GLES_TESTS=1` (macOS, hosts without EGL) they are skipped. The SGX540 assertion layer is on in tests: NPOT textures without `CLAMP_TO_EDGE` or with mipmaps, `glGenerateMipmap`, textures above `GL_MAX_TEXTURE_SIZE` and shaders without `#version 100` panic. Precision (`mediump` on the SGX540) can only be checked on the device.
 
-CI (`.github/workflows/ci.yml`): `host` (format, clippy with and without the window feature and without `gles`, tests, benchmarks, headless demo, dependency licences), `gles` (ubuntu-24.04, Mesa llvmpipe: GL_RENDERER/GL_VERSION, the GLES tests, a headless demo with `--renderer gles`), `android-armv7` (`armv7-linux-androideabi`, API 22, the runner's NDK clang as linker), `linux-armv7-gnu` (dynamic `armv7-unknown-linux-gnueabihf` linked with `gcc-arm-linux-gnueabihf`, the GLES-capable plain-Linux build; checks the hard error without EGL and runs the software demo under QEMU), `linux-armv7` (static `armv7-unknown-linux-musleabihf` linked with `rust-lld`, the software-only debug build, tests and the demo under QEMU).
+CI (`.github/workflows/ci.yml`): `host` (format, clippy with and without the window feature and without `gles`, tests, benchmarks, headless demo, dependency licences), `gles` (ubuntu-24.04, Mesa llvmpipe: GL_RENDERER/GL_VERSION, the GLES tests, a headless demo with `--renderer gles`), `android-armv7` (the Android build for both tracks: NDK r25c and API 19, clippy for the JNI module, the wrapper's JVM tests, `tools/android-dist.sh`, checks of the library's dependencies and JNI entry points, of the APK's manifest and signature, of the product makefile, and the dist directory as artifact `glass-apps-android-dist`), `linux-armv7-gnu` (dynamic `armv7-unknown-linux-gnueabihf` linked with `gcc-arm-linux-gnueabihf`, the GLES-capable plain-Linux build; checks the hard error without EGL and runs the software demo under QEMU), `linux-armv7` (static `armv7-unknown-linux-musleabihf` linked with `rust-lld`, the software-only debug build, tests and the demo under QEMU).
 
 ## Design notes
 
@@ -90,11 +95,12 @@ The device builds (`armv7-linux-androideabi`, `armv7-unknown-linux-gnueabihf`, `
 | glow (GLES builds) | MIT OR Apache-2.0 OR Zlib |
 | libloading (GLES builds) | ISC |
 | glass-api (glass-services, pinned git revision) | Apache-2.0 |
+| jni-sys (Android builds) | MIT OR Apache-2.0 |
 | prost | Apache-2.0 |
 | bytes | MIT |
 | anyhow, either, itertools | MIT OR Apache-2.0 |
 
-The host window back end (`window` feature, not part of device builds) adds minifb (MIT OR Apache-2.0) and, on Linux, X11 and Wayland client crates (MIT; ISC for libloading; Unlicense OR MIT for memchr; MIT OR Apache-2.0 with the Unicode-3.0 terms for unicode-ident). glass-api generates its message types at build time with prost-build and protox (no `protoc`); these run on the build host only (Apache-2.0, MIT OR Apache-2.0, Unlicense OR MIT for memchr and aho-corasick, and prost-derive's proc-macro crates). `tools/check_licenses.sh` checks the full dependency tree of each build in CI against this permissive set.
+The host window back end (`window` feature, not part of device builds) adds minifb (MIT OR Apache-2.0) and, on Linux, X11 and Wayland client crates (MIT; ISC for libloading; Unlicense OR MIT for memchr; MIT OR Apache-2.0 with the Unicode-3.0 terms for unicode-ident). glass-api generates its message types at build time with prost-build and protox (no `protoc`); these run on the build host only (Apache-2.0, MIT OR Apache-2.0, Unlicense OR MIT for memchr and aho-corasick, and the proc-macro crates of prost-derive and, in Android builds, jni-sys-macros, MIT OR Apache-2.0). `tools/check_licenses.sh` checks the full dependency tree of each build in CI against this permissive set.
 
 Fonts: Inter 4.1 Light, SIL Open Font License 1.1, in [`assets/fonts/`](assets/fonts/) with the licence and the checksums of the release files.
 

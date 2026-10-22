@@ -65,3 +65,29 @@ pub fn timeline_at(now_s: i64) -> Timeline {
         ],
     )
 }
+
+/// The timeline a device starts with: the settings cards, the home clock and a welcome card
+/// (no demo content). Settings show "Waiting for glassd" until its snapshot.
+pub fn device_timeline(now_s: i64, platform: &'static str, renderer: &'static str) -> Timeline {
+    let view = SettingsView {
+        settings: None,
+        wifi: crate::platform::RadioStatus::off(),
+        bluetooth: crate::platform::RadioStatus::off(),
+        service: None,
+        platform,
+        renderer,
+    };
+    Timeline::new(
+        settings::cards(&view),
+        Card::new(10, CardContent::Home),
+        vec![Card::new(
+            14,
+            CardContent::Text {
+                body: "Welcome. Swipe forward for older cards, backward for settings, down to go back."
+                    .into(),
+                source: "OpenMyGlass".into(),
+                timestamp_s: now_s,
+            },
+        )],
+    )
+}

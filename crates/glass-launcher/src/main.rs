@@ -39,7 +39,9 @@ usage:
                   --fps is the frame rate while the timeline moves (default 60).
                   Reconnects when glassd restarts
   --renderer R    gles (GPU, the default) or software (debugging aid). On the device a
-                  failing EGL is an error; on a host without EGL the default is software";
+                  failing EGL is an error; on a host without EGL the default is software
+  --setup         start with the first-boot setup flow (mock platform: Bluetooth is
+                  simulated; with --glassd the phone step follows glassd's companion)";
 
 #[derive(Default)]
 struct Args {
@@ -53,6 +55,7 @@ struct Args {
     renderer: Option<Renderer>,
     /// `--glassd`, with the socket if one was given.
     glassd: Option<Option<PathBuf>>,
+    setup: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -67,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
         let mut value = |name: &str| it.next().ok_or(format!("{name} needs a value"));
         match arg.as_str() {
             "--headless" => a.headless = true,
+            "--setup" => a.setup = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -124,6 +128,9 @@ fn run_headless(args: &Args) -> Result<(), String> {
     let ctx = clock(0.0);
     let compositor = compositor_for(args.renderer)?;
     let mut app = App::with_compositor(demo::timeline_at(ctx.now_s), ctx, compositor);
+    if args.setup {
+        app.start_setup(None);
+    }
     let mut display = HeadlessDisplay::new(glass_gfx::GLASS_WIDTH, glass_gfx::GLASS_HEIGHT)
         .with_output_dir(out)
         .map_err(|e| e.to_string())?;
@@ -152,6 +159,9 @@ fn run_window(args: &Args) -> Result<(), String> {
     let ctx = clock(0.0);
     let compositor = compositor_for(args.renderer)?;
     let mut app = App::with_compositor(demo::timeline_at(ctx.now_s), ctx, compositor);
+    if args.setup {
+        app.start_setup(None);
+    }
     let mut display = WindowDisplay::new(
         "glass-launcher",
         glass_gfx::GLASS_WIDTH,
@@ -215,6 +225,9 @@ fn run_glassd(args: &Args) -> Result<(), String> {
     let ctx = clock(0.0);
     let compositor = compositor_for(args.renderer)?;
     let mut app = App::with_compositor(demo::timeline_at(ctx.now_s), ctx, compositor);
+    if args.setup {
+        app.start_setup(None);
+    }
     let log = |line: &str| eprintln!("glass-launcher: {line}");
     let mut options = glassd::LoopOptions {
         fps: args.fps.unwrap_or(60),

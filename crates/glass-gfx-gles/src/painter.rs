@@ -211,15 +211,26 @@ impl Resources {
         self.atlas.clears
     }
 
-    /// Uses `p` for a target of `w`×`h` pixels (pixel (0,0) is the first row in memory,
-    /// which holds for FBOs; a window surface, M3, needs the y axis flipped).
+    /// Uses `p` for a target of `w`×`h` pixels where pixel (0,0) is the first row in
+    /// memory, which holds for FBOs.
     pub(crate) fn use_program(&self, which: Which, w: u32, h: u32) {
+        self.use_program_oriented(which, w, h, false);
+    }
+
+    /// [`Resources::use_program`] with the y axis optionally flipped: a window surface's
+    /// row 0 is its bottom row, so pixel y = 0 (the top of a card) must go to clip y = +1.
+    pub(crate) fn use_program_oriented(&self, which: Which, w: u32, h: u32, flip_y: bool) {
         let p = self.program(which);
         let raw = self.gl.raw();
+        let (sy, by) = if flip_y {
+            (-2.0 / h as f32, 1.0)
+        } else {
+            (2.0 / h as f32, -1.0)
+        };
         unsafe {
             raw.use_program(Some(p.program));
-            raw.uniform_2_f32(p.scale.as_ref(), 2.0 / w as f32, 2.0 / h as f32);
-            raw.uniform_2_f32(p.bias.as_ref(), -1.0, -1.0);
+            raw.uniform_2_f32(p.scale.as_ref(), 2.0 / w as f32, sy);
+            raw.uniform_2_f32(p.bias.as_ref(), -1.0, by);
             if let Some(t) = &p.tex {
                 raw.uniform_1_i32(Some(t), 0);
             }

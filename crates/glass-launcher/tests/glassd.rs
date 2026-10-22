@@ -210,7 +210,7 @@ fn session_says_hello_subscribes_and_takes_the_focus() {
     };
     let mut topics = sub.topics.clone();
     topics.sort();
-    let mut want: Vec<i32> = [Topic::Gesture, Topic::Screen, Topic::Settings, Topic::Wear]
+    let mut want: Vec<i32> = glass_launcher::glassd::TOPICS
         .iter()
         .map(|&t| t as i32)
         .collect();
@@ -457,7 +457,6 @@ fn the_loop_reconnects_when_glassd_restarts() {
     });
 
     let mut a = App::new(demo::timeline(), ctx());
-    let home = a.timeline().home_index();
     let mut display = HeadlessDisplay::new(640, 360);
     let mut lines = vec![];
     run(
@@ -484,9 +483,10 @@ fn the_loop_reconnects_when_glassd_restarts() {
     assert!(lines
         .iter()
         .any(|l| l.contains("reconnecting") || l.contains("unavailable")));
+    // (The home index moves when the "Take a note" card comes with glassd's capabilities.)
     assert_eq!(
         a.timeline().current_index(),
-        home + 1,
+        a.timeline().home_index() + 1,
         "input after the reconnect"
     );
     assert!(display.presented() >= 1);

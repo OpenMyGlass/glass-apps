@@ -74,7 +74,15 @@ Glass used Roboto Light and Thin. We bundle **Inter** (Rasmus Andersson, SIL Ope
 - **GPU-1** (before M1b): the GLES2 renderer becomes the primary path, see [`2026-10-22-gpu-rendering.md`](2026-10-22-gpu-rendering.md).
 - **M1b:** the launcher connects to `glassd` (see item 3 above).
 - **M2:** settings (head wake, wink, screen timeout through `SetSettings`; Wi-Fi and Bluetooth through a small platform trait), menus; the Linux framebuffer back end only as a debug fallback. Menus, settings cards, the wake-angle screen, the device card and the `Platform` seam (mock only) are done; the framebuffer back end is not (it is a debug fallback, and the GPU path comes first).
-- **M3:** Android glue (launcher wrapper, `ANativeWindow`, intents), setup (pairing with the OpenMyGlass phone app), dictation.
+- **M3:** Android glue (launcher wrapper, `ANativeWindow`, intents), setup (pairing with the OpenMyGlass phone app), dictation. Done:
+  - **Tracks:** one Android build for Track A (4.4.4, API 19) and Track B (6.0.1): API 19 with NDK r25c, Java against `android-19` (ruling recorded in the GPU plan, "API level").
+  - **Wrapper** ([`android/`](../../android/README.md)): `org.openmyglass.launcher`, one HOME activity with a `SurfaceView`; a privileged app re-signed with the platform key; the native library in `/system/lib` (KitKat does not extract system apps' JNI libraries). The JNI surface is a handful of calls and one callback, all strings for platform data.
+  - **Native side** (`crates/glass-android`): a render thread owning EGL, the `App` and the `glassd` session; it blocks in `poll` on a command pipe and the socket. Focus: taken on resume, given back on pause, taken again when lost while resumed (glass-services api.md, "Android glue"). A failing EGL is a hard error (logged, nothing drawn).
+  - **GLES window target** (`glass-gfx-gles`): y-flipped composition into the window, swap, attach and detach with layers kept; checked on Mesa by rendering with the window orientation off screen against the goldens.
+  - **Setup flow** (`setup.rs`): welcome, pair (Bluetooth on, discoverable, the code confirmed with a tap), open OpenMyGlass on the phone (glassd's `CompanionState`), done (`device_provisioned`); skippable with a swipe down; a `setup-done` file keeps it from running again. `--setup` runs it on a host with the mock platform.
+  - **Dictation** (`dictation.rs`): the "Take a note" card next to home (only when glassd offers `dictation`), free dictation through glassd's relay, the final transcript becomes a note card; errors and `SWIPE_DOWN` (cancel) handled. Tested with glass-api's mock and a test provider, and end to end with `glassd --mock`'s simulated companion.
+  - **Platform:** the Android back end is a line protocol to Java (Wi-Fi, Bluetooth, discoverable, pairing, provisioned, open an app by package); no app list UI yet.
+  - **Packaging:** `tools/android-dist.sh` builds `vendor/openmyglass/glass-apps/` (prebuilt `Android.mk`, `glass-apps.mk`); the CI job `android-armv7` builds and checks it and uploads it as `glass-apps-android-dist`.
 - **M4:** camera (through the platform: Android camera API or V4L2/Ducati on Linux), voice hotword and commands.
 
 ## Device checklist (not run: no Glass available)
@@ -85,3 +93,13 @@ Glass used Roboto Light and Thin. We bundle **Inter** (Rasmus Andersson, SIL Ope
 - [ ] M2 settings, each against a real `glassd`: head wake off and on (look-up no longer wakes, then wakes again); wake angle changed to 20° and 40° (look-up needs a lower or higher pitch); wink on (needs the glasshub calibration); on-head detection on (taking Glass off turns the screen off); nudge to sleep on; every screen timeout choice (5 s and 10 min timed). Each card shows the value `glassd` applied.
 - [ ] M2 device card: the launcher version, renderer `gles`, and `glassd`'s capabilities on the device (touchpad, screen, wear, and head/wink when found).
 - [ ] M2 Wi-Fi and Bluetooth cards: only the mock exists; with a real platform back end (M3 or route 2), turning each radio off and on and the shown network and devices.
+
+### Milestone 3 (not run: no Glass available)
+
+- [ ] Track A and Track B: the image boots into the launcher (HOME), `libglass_launcher_jni.so` loads from `/system/lib`, logcat tag `glass-launcher` shows "renderer gles" and "connected to glassd".
+- [ ] `glassd` lets the launcher connect (`--allow-package org.openmyglass.launcher`); on 6.0 SELinux allows it.
+- [ ] Gestures move the timeline; with another Android app in front the launcher has given the focus back (the glue injects keys), and takes it again when HOME returns.
+- [ ] Screen off and on: the surface is released and re-attached, the timeline is redrawn; the CPU is idle with the screen off (the render thread blocks in `poll`).
+- [ ] Setup on a fresh `/data`: Bluetooth turns on, the Glass is discoverable for 300 s, a phone's pairing request shows its code and a tap pairs; the phone card turns to "Connected" when OpenMyGlass connects; `device_provisioned` is 1 afterwards and setup does not come back after a reboot. The system pairing dialog does not appear (our receiver takes the ordered broadcast first).
+- [ ] Dictation with a phone offering `dictation-free`: "Take a note" → "Speak now" → the partial text → a note card; swipe down cancels; without the phone the card says so.
+- [ ] Wi-Fi and Bluetooth settings cards turn the radios off and on through the Android back end and show the network and paired devices.
