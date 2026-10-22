@@ -1,11 +1,13 @@
 //! Demo content for the mock launcher until cards come from services.
 
+use crate::platform::{MockPlatform, Platform};
+use crate::settings::{self, SettingsView};
 use glass_ui::{Card, CardContent, Timeline};
 
 /// A fixed "now" for reproducible demo frames: 2026-10-21 10:42:00 UTC.
 pub const DEMO_NOW_S: i64 = 1_792_579_320;
 
-/// A timeline with a settings card, a "now" card, the home clock and four history cards,
+/// A timeline with the settings cards, a "now" card, the home clock and four history cards,
 /// with times relative to [`DEMO_NOW_S`].
 pub fn timeline() -> Timeline {
     timeline_at(DEMO_NOW_S)
@@ -23,17 +25,20 @@ pub fn timeline_at(now_s: i64) -> Timeline {
             },
         )
     };
+    // The settings cards start with glassd's defaults and the mock radios; the app
+    // refreshes them from what it learns.
+    let view = SettingsView {
+        settings: Some(settings::settings_defaults()),
+        wifi: MockPlatform::default().wifi(),
+        bluetooth: MockPlatform::default().bluetooth(),
+        service: None,
+        platform: "mock",
+        renderer: "software",
+    };
+    let mut backward = vec![text(2, "Partly cloudy, 14°", "Weather", 20 * 60)];
+    backward.extend(settings::cards(&view));
     Timeline::new(
-        vec![
-            text(2, "Partly cloudy, 14°", "Weather", 20 * 60),
-            Card::new(
-                1,
-                CardContent::Settings {
-                    title: "Settings".into(),
-                    subtitle: Some("Wi-Fi, Bluetooth, device".into()),
-                },
-            ),
-        ],
+        backward,
         Card::new(10, CardContent::Home),
         vec![
             text(

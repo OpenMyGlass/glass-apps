@@ -219,13 +219,12 @@ impl Runner {
 
     fn input(&mut self, app: &mut App, event: InputEvent) {
         match app.input(&event) {
-            Some(Action::OpenMenu(id)) => self
-                .log
-                .push(format!("menu: card {id} (placeholder, menus come in M2)")),
+            Some(Action::OpenMenu(id)) => self.log.push(format!("menu: card {id}")),
             Some(Action::RequestSleep) => self.log.push("sleep: screen off".into()),
             Some(Action::Back) => self.log.push("back: to the home card".into()),
             None => {}
         }
+        self.log.extend(app.take_log());
     }
 
     /// One frame of time: advance, then present if changed.

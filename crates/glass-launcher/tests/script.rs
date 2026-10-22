@@ -120,11 +120,21 @@ fn swipe_down_on_home_sleeps_and_the_waking_touch_is_consumed() {
 }
 
 #[test]
-fn tap_logs_the_menu_placeholder() {
-    let (_, _, runner) = run("tap\n");
+fn tap_on_home_opens_nothing() {
+    let (app, _, runner) = run("tap\n");
+    assert_eq!(app.overlay(), None);
+    assert!(!runner.log().iter().any(|l| l.contains("menu")));
+}
+
+#[test]
+fn deleting_a_text_card_through_its_menu() {
+    let (app, _, runner) = run("swipe forward\nwait 500ms\ntap\nwait 100ms\ntap\nwait 500ms\n");
     assert!(
-        runner.log().iter().any(|l| l.contains("menu")),
+        runner.log().iter().any(|l| l == "menu: card 11"),
         "{:?}",
         runner.log()
     );
+    assert!(runner.log().iter().any(|l| l == "delete: card 11"));
+    assert_eq!(app.overlay(), None);
+    assert!(app.timeline().cards().iter().all(|c| c.id != 11));
 }
