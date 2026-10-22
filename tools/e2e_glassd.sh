@@ -56,8 +56,8 @@ wait_for logged "$work/glassd.log" "screen On (tap)"
 sleep 0.3
 before=$(frames)
 echo "scroll 0.3" >&3
-wait_for test "$(frames)" -gt "$before" || true
-sleep 0.5
+scrolled() { [ "$(frames)" -gt "$before" ]; }
+wait_for scrolled || true
 after=$(frames)
 exec 3>&-
 
