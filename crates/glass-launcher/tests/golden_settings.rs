@@ -91,16 +91,14 @@ fn scenes() -> Vec<(String, Card, Tolerance)> {
         .find(|c| c.id == ids::SCREEN_TIMEOUT)
         .unwrap();
     let (items, first) = settings::menu_for(&timeout, &v).unwrap();
-    out.push((
-        "settings-menu-timeout".into(),
-        menu_card(
-            &items[first].label,
-            items[first].detail.clone(),
-            first,
-            items.len(),
-        ),
-        Tolerance::Edges,
-    ));
+    let card = menu_card(
+        &items[first].label,
+        items[first].detail.clone(),
+        first,
+        items.len(),
+    );
+    let tol = gles_tolerance(&card);
+    out.push(("settings-menu-timeout".into(), card, tol));
     out
 }
 
