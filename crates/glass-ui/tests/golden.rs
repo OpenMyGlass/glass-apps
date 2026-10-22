@@ -159,3 +159,53 @@ fn golden_timeline_mid_scroll() {
     t.render(&mut f).unwrap();
     check("timeline-mid-scroll", f.frame());
 }
+
+fn menu_item() -> Card {
+    Card::new(
+        20,
+        CardContent::MenuItem {
+            label: "Turn off".into(),
+            detail: Some("Head wake is on".into()),
+            index: 1,
+            count: 3,
+        },
+    )
+}
+
+fn adjust() -> Card {
+    Card::new(
+        21,
+        CardContent::Adjust {
+            title: "Wake angle".into(),
+            value: "30°".into(),
+            fraction: 2.0 / 3.0,
+        },
+    )
+}
+
+#[test]
+fn golden_menu_item() {
+    check("menu-item", &render_card(&menu_item(), &ctx(), 640, 360));
+}
+
+#[test]
+fn golden_adjust() {
+    check("adjust", &render_card(&adjust(), &ctx(), 640, 360));
+}
+
+#[test]
+fn golden_info() {
+    let card = Card::new(
+        22,
+        CardContent::Info {
+            title: "Device".into(),
+            lines: vec![
+                "glass-launcher 0.1.0, renderer gles".into(),
+                "glassd mock-0.1.0".into(),
+                "touchpad, screen, head, wear, wink, button-camera, button-power, hinge".into(),
+                "Platform: mock".into(),
+            ],
+        },
+    );
+    check("info", &render_card(&card, &ctx(), 640, 360));
+}

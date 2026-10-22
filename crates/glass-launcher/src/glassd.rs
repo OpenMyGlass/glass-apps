@@ -13,10 +13,11 @@
 //!   until the next minute (the home clock) at rest, without a timeout while the screen is
 //!   off. When `glassd` goes away it reconnects with a [`Backoff`].
 
-use crate::App;
+use crate::settings::ServiceInfo;
+use crate::{App, Request};
 use glass_api::proto::{
     client_frame, screen_request, service_frame, ErrorCode, GestureKind as ProtoKind, Screen,
-    ScreenRequest, ScreenState, ServiceFrame, Settings, Topic,
+    ScreenRequest, ScreenState, ServiceFrame, SetSettings, Settings, Topic,
 };
 use glass_api::{Client, ClientError};
 use glass_gfx::{Display, GfxError};
@@ -175,6 +176,15 @@ impl Session {
         })
     }
 
+    /// glassd's version and capabilities from its `Welcome`.
+    pub fn service_info(&self) -> ServiceInfo {
+        let w = self.client.welcome();
+        ServiceInfo {
+            version: w.service_version.clone(),
+            capabilities: w.capabilities.clone(),
+        }
+    }
+
     /// Whether glassd says the launcher holds the input focus.
     pub fn focused(&self) -> bool {
         self.focused
@@ -212,13 +222,12 @@ impl Session {
                     }))?;
                     self.log.push("sleep: ScreenRequest{ACTION_SLEEP}".into());
                 }
-                Some(Action::OpenMenu(id)) => self
-                    .log
-                    .push(format!("menu: card {id} (placeholder, menus come in M2)")),
+                Some(Action::OpenMenu(id)) => self.log.push(format!("menu: card {id}")),
                 Some(Action::Back) => self.log.push("back: to the home card".into()),
                 None => {}
             }
-            return Ok(());
+            self.log.extend(app.take_log());
+            return self.send_requests(app);
         }
         match body {
             service_frame::Body::FocusState(f) => {
@@ -230,7 +239,10 @@ impl Session {
                 self.focused = f.focused;
             }
             service_frame::Body::ScreenState(s) => apply_screen(app, &s),
-            service_frame::Body::Settings(s) => self.settings = Some(s),
+            service_frame::Body::Settings(s) => {
+                self.settings = Some(s);
+                app.settings_changed(s);
+            }
             service_frame::Body::Error(e) => {
                 let code = ErrorCode::try_from(e.code)
                     .map(|c| c.as_str_name().to_string())
@@ -244,9 +256,26 @@ impl Session {
         Ok(())
     }
 
-    /// Waits up to `timeout` (`None`: no limit) for a frame, applies it and every frame
-    /// already received; returns how many were applied.
+    /// Sends the requests the app made (settings changes chosen in a menu).
+    pub fn send_requests(&mut self, app: &mut App) -> Result<(), ClientError> {
+        for req in app.take_requests() {
+            match req {
+                Request::SetSettings(patch) => {
+                    self.client
+                        .send(client_frame::Body::SetSettings(SetSettings {
+                            settings: Some(patch),
+                        }))?;
+                    self.log.push(format!("SetSettings {patch:?}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Sends pending requests, then waits up to `timeout` (`None`: no limit) for a frame,
+    /// applies it and every frame already received; returns how many were applied.
     pub fn pump(&mut self, app: &mut App, timeout: Option<Duration>) -> Result<usize, ClientError> {
+        self.send_requests(app)?;
         let mut n = 0;
         let Some(first) = self.client.recv(timeout)? else {
             return Ok(0);
@@ -368,6 +397,7 @@ pub fn run<D: Display>(
         options.backoff.reset();
         // A touch from before the connection was lost never ends: drop it.
         app.cancel_touch();
+        app.set_service(Some(session.service_info()));
         log(&format!(
             "connected to glassd at {} (capabilities: {})",
             path.display(),
@@ -384,6 +414,7 @@ pub fn run<D: Display>(
                 log(&line);
             }
             if let Err(e) = pumped {
+                app.glassd_disconnected();
                 log(&format!("glassd connection lost ({e}); reconnecting"));
                 break;
             }

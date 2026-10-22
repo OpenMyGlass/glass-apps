@@ -34,6 +34,23 @@ pub enum CardContent {
         caption: String,
         timestamp_s: i64,
     },
+    /// One item of a menu, one per screen as on Glass: a large label, optionally a grey
+    /// detail line ("current"), and dots for the position (`index` of `count`).
+    MenuItem {
+        label: String,
+        detail: Option<String>,
+        index: usize,
+        count: usize,
+    },
+    /// A value being adjusted (a sub-screen): a grey title, the value in large text and a
+    /// bar filled to `fraction` (`0.0..=1.0`).
+    Adjust {
+        title: String,
+        value: String,
+        fraction: f32,
+    },
+    /// Facts in short lines under a grey title (the device card).
+    Info { title: String, lines: Vec<String> },
 }
 
 /// An image shown by a card. `id` names the picture: a new picture needs a new id, which is
@@ -140,6 +157,33 @@ pub fn render_key(card: &Card, ctx: &RenderContext) -> u64 {
             caption.hash(&mut h);
             relative_time(ctx.now_s, *timestamp_s).hash(&mut h);
         }
+        CardContent::MenuItem {
+            label,
+            detail,
+            index,
+            count,
+        } => {
+            4u8.hash(&mut h);
+            label.hash(&mut h);
+            detail.hash(&mut h);
+            index.hash(&mut h);
+            count.hash(&mut h);
+        }
+        CardContent::Adjust {
+            title,
+            value,
+            fraction,
+        } => {
+            5u8.hash(&mut h);
+            title.hash(&mut h);
+            value.hash(&mut h);
+            fraction.to_bits().hash(&mut h);
+        }
+        CardContent::Info { title, lines } => {
+            6u8.hash(&mut h);
+            title.hash(&mut h);
+            lines.hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -221,8 +265,7 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
                 None => {
                     f.clear(style::PLACEHOLDER);
                     // A simple picture-frame mark in the middle.
-                    let (bw, bh) = (150.0, 104.0);
-                    let r = Rect::new((w - bw) / 2.0, (h - bh) / 2.0 - 20.0, bw, bh);
+                    let r = placeholder_rect(w, h);
                     f.fill_rounded_rect(r, 10.0, glass_gfx::Color::grey(0x55));
                     let inner = Rect::new(r.x + 8.0, r.y + 8.0, r.w - 16.0, r.h - 16.0);
                     f.fill_rounded_rect(inner, 4.0, style::PLACEHOLDER);
@@ -235,6 +278,152 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
                 style::TEXT,
             );
         }
+        CardContent::MenuItem {
+            label,
+            detail,
+            index,
+            count,
+        } => {
+            let center = if detail.is_some() { h * 0.44 } else { h / 2.0 };
+            centered_line(
+                f,
+                Weight::Light,
+                style::MENU_SIZE,
+                label,
+                center,
+                style::TEXT,
+            );
+            if let Some(d) = detail {
+                centered_line(
+                    f,
+                    Weight::Light,
+                    style::SUBTITLE_SIZE,
+                    d,
+                    h * 0.66,
+                    style::SECONDARY,
+                );
+            }
+            position_dots(f, *index, *count);
+        }
+        CardContent::Adjust {
+            title,
+            value,
+            fraction,
+        } => {
+            centered_line(
+                f,
+                Weight::Light,
+                style::SUBTITLE_SIZE,
+                title,
+                style::MARGIN + 20.0,
+                style::SECONDARY,
+            );
+            centered_line(
+                f,
+                Weight::Light,
+                style::ADJUST_VALUE_SIZE,
+                value,
+                h * 0.48,
+                style::TEXT,
+            );
+            let track = bar_rect(w, h);
+            let r = style::BAR_HEIGHT / 2.0;
+            f.fill_rounded_rect(track, r, style::TRACK);
+            let fill = track.w * fraction.clamp(0.0, 1.0);
+            if fill > 0.0 {
+                f.fill_rounded_rect(
+                    Rect::new(track.x, track.y, fill.max(2.0 * r), track.h),
+                    r,
+                    style::TEXT,
+                );
+            }
+        }
+        CardContent::Info { title, lines } => {
+            centered_line(
+                f,
+                Weight::Light,
+                style::SUBTITLE_SIZE,
+                title,
+                style::MARGIN + 20.0,
+                style::SECONDARY,
+            );
+            info_lines(f, lines);
+        }
+    }
+}
+
+/// The info card's lines: left-aligned, wrapped, as many as fit above the bottom margin.
+fn info_lines(f: &mut dyn Painter, lines: &[String]) {
+    let font = fonts::font(Weight::Light);
+    let (w, h) = f.size();
+    let size = style::INFO_SIZE;
+    let step = size * style::BODY_LINE_HEIGHT;
+    let max_w = w as f32 - 2.0 * style::MARGIN;
+    let mut baseline = style::INFO_TOP;
+    for line in lines.iter().flat_map(|l| text::wrap(font, size, l, max_w)) {
+        if baseline > h as f32 - style::FOOTER_BASELINE_FROM_BOTTOM {
+            break;
+        }
+        let (run, _) = text::layout_line(font, size, style::MARGIN, baseline, &line);
+        f.draw_glyph_run(&run, style::TEXT);
+        baseline += step;
+    }
+}
+
+/// Dots showing which of `count` menu items is shown, centred near the bottom.
+fn position_dots(f: &mut dyn Painter, index: usize, count: usize) {
+    if count < 2 {
+        return;
+    }
+    let (w, h) = f.size();
+    for (i, r) in dot_rects(count, w, h).into_iter().enumerate() {
+        let c = if i == index {
+            style::TEXT
+        } else {
+            style::TRACK
+        };
+        f.fill_rounded_rect(r, r.w / 2.0, c);
+    }
+}
+
+fn dot_rects(count: usize, w: u32, h: u32) -> Vec<Rect> {
+    if count < 2 {
+        return Vec::new();
+    }
+    let d = style::DOT_SIZE;
+    let gap = style::DOT_GAP;
+    let total = count as f32 * d + (count - 1) as f32 * gap;
+    let x0 = ((w as f32 - total) / 2.0).round();
+    let y = h as f32 - style::FOOTER_BASELINE_FROM_BOTTOM - d;
+    (0..count)
+        .map(|i| Rect::new(x0 + i as f32 * (d + gap), y, d, d))
+        .collect()
+}
+
+fn bar_rect(w: f32, h: f32) -> Rect {
+    Rect::new(
+        style::MARGIN,
+        h - style::FOOTER_BASELINE_FROM_BOTTOM - 20.0,
+        w - 2.0 * style::MARGIN,
+        style::BAR_HEIGHT,
+    )
+}
+
+fn placeholder_rect(w: f32, h: f32) -> Rect {
+    let (bw, bh) = (150.0, 104.0);
+    Rect::new((w - bw) / 2.0, (h - bh) / 2.0 - 20.0, bw, bh)
+}
+
+/// The bounds of the anti-aliased rounded shapes a card draws (menu dots, the adjustment
+/// bar, the image placeholder's frame). Renderers may differ on their edge pixels; tests
+/// hold everything outside these rectangles to the strict tolerance.
+pub fn shape_rects(card: &Card, width: u32, height: u32) -> Vec<Rect> {
+    let (w, h) = (width as f32, height as f32);
+    match &card.content {
+        CardContent::MenuItem { count, .. } => dot_rects(*count, width, height),
+        CardContent::Adjust { .. } => vec![bar_rect(w, h)],
+        CardContent::Image { image: None, .. } => vec![placeholder_rect(w, h)],
+        _ => Vec::new(),
     }
 }
 

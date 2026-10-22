@@ -172,12 +172,15 @@ fn run_window(args: &Args) -> Result<(), String> {
                 Key::Escape => return Ok(()),
             };
             match app.input(&InputEvent::gesture(kind)) {
-                Some(Action::OpenMenu(id)) => eprintln!("menu: card {id} (placeholder)"),
+                Some(Action::OpenMenu(id)) => eprintln!("menu: card {id}"),
                 Some(Action::RequestSleep) => {
                     eprintln!("sleep: screen off (Enter or an arrow left/right wakes)")
                 }
                 Some(Action::Back) => eprintln!("back: to the home card"),
                 None => {}
+            }
+            for line in app.take_log() {
+                eprintln!("{line}");
             }
         }
         let now = Instant::now();

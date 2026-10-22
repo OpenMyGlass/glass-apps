@@ -14,6 +14,7 @@ mod color;
 mod display;
 pub mod fonts;
 mod frame;
+pub mod golden;
 mod render;
 pub mod text;
 #[cfg(feature = "window")]

@@ -4,13 +4,16 @@
 //! - [`timeline`]: the ordered timeline with the home card in the middle, navigation by
 //!   gestures, live dragging by `Scroll`, settle animation, and compositing of cached
 //!   per-card layers.
+//! - [`menu`]: card menus and adjustment sub-screens, overlays over the timeline.
 //! - [`input`]: the input events, mirroring the glass-services interface 1:1.
 
 pub mod card;
 pub mod input;
+pub mod menu;
 pub mod style;
 pub mod timeline;
 
 pub use card::{Card, CardContent, CardId, CardImage, RenderContext};
 pub use input::{GestureKind, InputEvent};
+pub use menu::{Adjuster, Menu, MenuItem, Outcome};
 pub use timeline::{Action, Timeline, CARDS_PER_PAD_WIDTH};
