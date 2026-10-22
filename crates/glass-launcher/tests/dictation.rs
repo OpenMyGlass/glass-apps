@@ -174,3 +174,18 @@ fn cancel_while_listening_reaches_the_provider() {
         }
     }
 }
+
+#[test]
+fn the_note_card_sits_next_to_home_on_the_backward_side() {
+    let m = MockService::start().unwrap();
+    let (_s, mut a) = launcher(&m);
+    let home = a.timeline().home_index();
+    assert_eq!(a.timeline().cards()[home - 1].id, NOTE_CARD);
+    a.input(&glass_ui::InputEvent::gesture(
+        glass_ui::GestureKind::SwipeBackward,
+    ));
+    for _ in 0..60 {
+        a.step(1.0 / 30.0, ctx());
+    }
+    assert_eq!(a.timeline().current_card().id, NOTE_CARD);
+}

@@ -2,8 +2,8 @@
 # End-to-end check: glass-launcher against a real `glassd --mock` (glass-services).
 # Usage: tools/e2e_glassd.sh GLASSD LAUNCHER
 # Drives glassd's mock from its standard input and checks both logs: the launcher connects,
-# moves, asks for sleep on the home card, glassd turns the screen off and on again, and a
-# final scroll still draws.
+# moves, asks for sleep on the home card, glassd turns the screen off and on again, a
+# scroll still draws, and a note is dictated through the mock's simulated companion.
 set -eu
 glassd=$1
 launcher=$2
@@ -59,6 +59,18 @@ echo "scroll 0.3" >&3
 scrolled() { [ "$(frames)" -gt "$before" ]; }
 wait_for scrolled || true
 after=$(frames)
+# Dictation through glassd's simulated companion: home, one card backward is "Take a note".
+echo "companion on dictation-free" >&3
+sleep 0.5
+echo "swipe down" >&3
+sleep 0.6
+echo "scroll -0.5" >&3 # one card backward (a mock swipe may travel two)
+sleep 0.6
+echo "tap" >&3
+wait_for logged "$work/launcher.log" "DictationStart" || true
+sleep 0.3
+echo "transcript-final buy milk" >&3
+wait_for logged "$work/launcher.log" "note: card" || true
 exec 3>&-
 
 status=0
@@ -72,6 +84,8 @@ check "$work/launcher.log" "back: to the home card" "a swipe down went back home
 check "$work/launcher.log" "ScreenRequest{ACTION_SLEEP}" "swipe down on home asked for sleep"
 check "$work/glassd.log" "screen Off (request)" "glassd turned the screen off"
 check "$work/glassd.log" "screen On (tap)" "a tap woke it"
+check "$work/launcher.log" "DictationStart" "a tap on Take a note started dictation"
+check "$work/launcher.log" "note: card" "the final transcript became a note card"
 echo "frames: $before before the scroll, $after after"
 if [ "$after" -gt "$before" ]; then echo "ok: the scroll drew frames"; else echo "MISSING: scroll frames"; status=1; fi
 exit "$status"

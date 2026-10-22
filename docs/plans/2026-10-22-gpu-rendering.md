@@ -41,7 +41,7 @@ The card and timeline code must not know which renderer draws it. Two seams:
 |---|---|---|
 | Host tests and CI | Mesa llvmpipe: `eglGetPlatformDisplay(EXT)` with `EGL_PLATFORM_SURFACELESS_MESA` when the client extensions offer it, else a pbuffer; context made current with `EGL_NO_SURFACE` (`EGL_KHR_surfaceless_context`); rendering into an FBO and reading it back | GPU-1 |
 | Host development | the same, with the frame read back and copied to the `minifb` window (slow, fine for development) | GPU-1 |
-| Android (route 1) | an `ANativeWindow` from the launcher wrapper's `Surface`: the renderer runs inside the wrapper's process, as a native library called through JNI (not the standalone binary) | M3 |
+| Android (route 1) | an `ANativeWindow` from the launcher wrapper's `Surface`: the renderer runs inside the wrapper's process, as a native library called through JNI (not the standalone binary). Done in M3: `GlesCompositor::for_window` (default display, a config with window and pbuffer bits so a 1×1 pbuffer keeps the context and layers while the surface is gone), `attach_window`/`detach_window`, frames composed into the default framebuffer with y flipped in the projection, `eglSwapBuffers`; the window's buffers are set to 640×360 in the config's native visual format | M3 |
 | Plain Linux (route 2) | libhybris `libEGL` with the PowerVR libraries, an fbdev or hwcomposer window from libhybris | later, with glass-services' route-2 packaging (its M5) |
 
 **Linking:** `dlopen` does not work in a statically linked musl binary, so the GPU path needs dynamically linked builds:
@@ -51,7 +51,7 @@ The card and timeline code must not know which renderer draws it. Two seams:
 
 **No silent fallback:** `--renderer gles|software`. On device builds the default is `gles`, and a missing or failing EGL is a hard error with a clear message; `software` must be asked for. On host builds the default is `gles` when EGL initializes and `software` otherwise, with a log line.
 
-**API level:** the GLES build targets Android API 22 (the open ROM on Android 5.1 and 6.0, route 1). The KitKat track (stock Android 4.4) is not targeted by the launcher; if it is needed later, the build targets API 19 with NDK r25.
+**API level** (ruling of 2026-10-22, milestone 3): the roadmap made Track A (Android 4.4.4 KitKat with ART) the near-term target, so the launcher **does** target it. One Android build serves both tracks: `armv7-linux-androideabi` at **API 19** with **NDK r25c** (the last NDK that supports API 19; linker `armv7a-linux-androideabi19-clang`, linked with `--no-undefined` so every symbol resolves against API 19's libraries), loaded unchanged by 4.4 and 6.0. The Java wrapper compiles against `android-19` (minSdk 19, targetSdk 22). This replaces the earlier "API 22 only, KitKat later with r25".
 
 ### Tests
 
@@ -74,3 +74,7 @@ The card and timeline code must not know which renderer draws it. Two seams:
 - [ ] Rounded-rect edges and text show no precision banding (`mediump` on the SGX540).
 - [ ] A scrolling frame takes under 4 ms on the GPU, measured as the CPU time of `glFinish` after the frame's draw calls in a debug build; the CPU is idle while the timeline is at rest.
 - [ ] Text in the GLES path is as sharp as in the software path.
+- [ ] M3, Android: `eglCreateWindowSurface` on the wrapper's `ANativeWindow` works on the SGX540 with the chosen config (window and pbuffer bits), and the 1×1 pbuffer keeps the context while the surface is gone.
+- [ ] M3: the image is upright on the panel (the y-flip; CI checks it only by rendering with the window orientation off screen).
+- [ ] M3: after the screen goes off and on, or another app comes to the front and leaves, the surface is re-attached and the timeline is redrawn without recreating layers; nothing is drawn while paused.
+- [ ] M3: a failing EGL on the device logs "GLES renderer failed" and draws nothing (no software fallback).

@@ -511,6 +511,9 @@ pub fn run<D: Display>(
             for line in session.take_log() {
                 log(&line);
             }
+            for line in app.take_log() {
+                log(&line);
+            }
             if let Err(e) = pumped {
                 app.glassd_disconnected();
                 log(&format!("glassd connection lost ({e}); reconnecting"));
