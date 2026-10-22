@@ -150,6 +150,27 @@ pub trait Compositor {
     fn present(&mut self, display: &mut dyn Display) -> Result<(), GfxError>;
     /// The composed frame as pixels (tests, host development). Slow on a GPU.
     fn read_frame(&mut self) -> Result<Frame, GfxError>;
+    /// The native-window side of a compositor that presents into a window surface
+    /// (`None` for off-screen compositors).
+    fn window_target(&mut self) -> Option<&mut dyn WindowTarget> {
+        None
+    }
+}
+
+/// A compositor that draws into a native window (Android's `ANativeWindow`), which comes
+/// and goes with the app's surface while the compositor and its layers stay.
+pub trait WindowTarget {
+    /// The buffer format the window must have (EGL's native visual id).
+    fn native_visual_id(&self) -> Result<i32, GfxError>;
+    /// Attaches `window`; frames are presented into it from now on.
+    ///
+    /// # Safety
+    /// `window` must be a valid native window that stays valid until
+    /// [`WindowTarget::detach_window`] returns or the compositor is dropped.
+    unsafe fn attach_window(&mut self, window: *mut std::ffi::c_void) -> Result<(), GfxError>;
+    /// Stops using the window (it is about to be destroyed).
+    fn detach_window(&mut self);
+    fn has_window(&self) -> bool;
 }
 
 struct SoftLayer {

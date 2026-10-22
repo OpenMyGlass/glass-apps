@@ -773,6 +773,16 @@ impl App {
         Ok(true)
     }
 
+    /// The compositor's native-window side, if it draws into a window (Android).
+    pub fn window_target(&mut self) -> Option<&mut dyn glass_gfx::WindowTarget> {
+        self.compositor.window_target()
+    }
+
+    /// Draws the next frame even if nothing changed (a new window surface is empty).
+    pub fn invalidate(&mut self) {
+        self.shown = false;
+    }
+
     /// How many layers the compositor holds (tests: the GPU memory bound).
     pub fn layer_count(&self) -> usize {
         self.compositor.layer_count()

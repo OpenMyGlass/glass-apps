@@ -177,10 +177,7 @@ pub struct LinePlatform {
 }
 
 impl LinePlatform {
-    pub fn new(
-        name: &'static str,
-        send: LineSender,
-    ) -> LinePlatform {
+    pub fn new(name: &'static str, send: LineSender) -> LinePlatform {
         LinePlatform {
             name,
             send,

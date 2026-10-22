@@ -27,6 +27,7 @@ pub use fonts::Weight;
 pub use frame::{Frame, ImageError, Rect};
 pub use render::{
     Compositor, GfxError, LayerId, Painter, Placement, SkiaPainter, SoftwareCompositor,
+    WindowTarget,
 };
 
 /// Width of the Glass display in pixels.

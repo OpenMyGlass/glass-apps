@@ -7,7 +7,9 @@
 use crate::egl::{EglContext, EglInfo};
 use crate::painter::{texture_params, GlesPainter, Resources, Which};
 use crate::sgx::Gl;
-use glass_gfx::{Color, Compositor, Display, Frame, GfxError, LayerId, Painter, Placement};
+use glass_gfx::{
+    Color, Compositor, Display, Frame, GfxError, LayerId, Painter, Placement, WindowTarget,
+};
 use glow::HasContext;
 use std::collections::HashMap;
 
@@ -534,6 +536,14 @@ impl Compositor for GlesCompositor {
         Ok(())
     }
 
+    fn window_target(&mut self) -> Option<&mut dyn WindowTarget> {
+        if self.is_window() {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
     fn read_frame(&mut self) -> Result<Frame, GfxError> {
         self.current()?;
         let (w, h) = self.screen_size();
@@ -563,6 +573,25 @@ impl Compositor for GlesCompositor {
             }
         }
         Ok(frame)
+    }
+}
+
+impl WindowTarget for GlesCompositor {
+    fn native_visual_id(&self) -> Result<i32, GfxError> {
+        GlesCompositor::native_visual_id(self)
+    }
+
+    unsafe fn attach_window(&mut self, window: *mut std::ffi::c_void) -> Result<(), GfxError> {
+        // SAFETY: forwarded from the caller.
+        unsafe { GlesCompositor::attach_window(self, window) }
+    }
+
+    fn detach_window(&mut self) {
+        GlesCompositor::detach_window(self)
+    }
+
+    fn has_window(&self) -> bool {
+        GlesCompositor::has_window(self)
     }
 }
 

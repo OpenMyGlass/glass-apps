@@ -5,6 +5,7 @@ members = [
     "crates/glass-gfx-gles",
     "crates/glass-ui",
     "crates/glass-launcher",
+    "crates/glass-android",
 ]
 
 [workspace.package]
@@ -27,6 +28,7 @@ glass-api = { git = "https://github.com/OpenMyGlass/glass-services", rev = "c8bd
 glass-gfx = { path = "crates/glass-gfx" }
 glass-gfx-gles = { path = "crates/glass-gfx-gles" }
 glass-ui = { path = "crates/glass-ui" }
+glass-launcher = { path = "crates/glass-launcher" }
 
 [profile.release]
 lto = "thin"
