@@ -26,8 +26,8 @@ use settings::{Choice, ServiceInfo, SettingsView};
 
 /// What is shown over the timeline.
 enum Overlay {
-    /// A card's menu.
-    Menu(Menu<Choice>),
+    /// The menu of card `.1`.
+    Menu(Menu<Choice>, CardId),
     /// The wake-angle sub-screen.
     Adjust(Adjuster),
 }
@@ -136,6 +136,12 @@ impl App {
         self.refresh_settings_cards();
     }
 
+    /// The menus offer what is true now (also after a radio or settings change).
+    fn refresh_settings_cards(&mut self) {
+        self.refresh_settings_card_contents();
+        self.refresh_open_menu();
+    }
+
     /// glassd's version and capabilities, for the device card.
     pub fn set_service(&mut self, info: Option<ServiceInfo>) {
         self.service = info;
@@ -156,7 +162,7 @@ impl App {
     pub fn overlay(&self) -> Option<OverlayKind> {
         match &self.overlay {
             None => None,
-            Some(Overlay::Menu(m)) => Some(OverlayKind::Menu { index: m.index() }),
+            Some(Overlay::Menu(m, _)) => Some(OverlayKind::Menu { index: m.index() }),
             Some(Overlay::Adjust(_)) => Some(OverlayKind::Adjust),
         }
     }
@@ -164,12 +170,12 @@ impl App {
     /// The labels of the open menu's items.
     pub fn menu_labels(&self) -> Vec<String> {
         match &self.overlay {
-            Some(Overlay::Menu(m)) => m.items().iter().map(|i| i.label.clone()).collect(),
+            Some(Overlay::Menu(m, _)) => m.items().iter().map(|i| i.label.clone()).collect(),
             _ => Vec::new(),
         }
     }
 
-    fn refresh_settings_cards(&mut self) {
+    fn refresh_settings_card_contents(&mut self) {
         let v = self.settings_view();
         for id in settings::ORDER {
             if let Some(c) = settings::card_content(id, &v) {
@@ -201,8 +207,38 @@ impl App {
             return false;
         };
         menu.select_index(first);
-        self.show_overlay(Overlay::Menu(menu));
+        self.show_overlay(Overlay::Menu(menu, id));
         true
+    }
+
+    /// After a change of what menus offer (settings, radios): an open menu of a settings
+    /// card is rebuilt on the same item, or closed if the card has no menu any more.
+    fn refresh_open_menu(&mut self) {
+        let Some(Overlay::Menu(m, id)) = &self.overlay else {
+            return;
+        };
+        let (id, index) = (*id, m.index());
+        if !settings::ORDER.contains(&id) {
+            return;
+        }
+        let rebuilt = self
+            .timeline
+            .cards()
+            .iter()
+            .find(|c| c.id == id)
+            .and_then(|card| settings::menu_for(card, &self.settings_view()))
+            .and_then(|(items, _)| Menu::new(items));
+        match rebuilt {
+            Some(mut menu) => {
+                menu.select_index(index);
+                if let Some(Overlay::Menu(old, _)) = self.overlay.as_mut() {
+                    old.release(self.compositor.as_mut());
+                }
+                self.overlay = Some(Overlay::Menu(menu, id));
+                self.shown = false;
+            }
+            None => self.close_overlay(),
+        }
     }
 
     fn show_overlay(&mut self, o: Overlay) {
@@ -215,7 +251,7 @@ impl App {
 
     fn close_overlay(&mut self) {
         match self.overlay.take() {
-            Some(Overlay::Menu(mut m)) => m.release(self.compositor.as_mut()),
+            Some(Overlay::Menu(mut m, _)) => m.release(self.compositor.as_mut()),
             Some(Overlay::Adjust(mut a)) => a.release(self.compositor.as_mut()),
             None => return,
         }
@@ -272,7 +308,7 @@ impl App {
 
     fn overlay_input(&mut self, event: &InputEvent) {
         let choice = match self.overlay.as_mut() {
-            Some(Overlay::Menu(m)) => match m.handle(event) {
+            Some(Overlay::Menu(m, _)) => match m.handle(event) {
                 None => return,
                 Some(Outcome::Closed) => None,
                 Some(Outcome::Selected(c)) => Some(c),
@@ -343,11 +379,25 @@ impl App {
     /// [`glass_ui::Timeline::cancel_touch`].
     pub fn cancel_touch(&mut self) {
         self.timeline.cancel_touch();
+        if let Some(Overlay::Menu(m, _)) = self.overlay.as_mut() {
+            m.cancel_touch();
+        }
+    }
+
+    /// The connection to glassd is gone: its settings are unknown again and requests made
+    /// for it are dropped (a new session sends a fresh snapshot).
+    pub fn glassd_disconnected(&mut self) {
+        self.requests.clear();
+        self.service = None;
+        if self.owner == ScreenOwner::Glassd {
+            self.settings = None;
+        }
+        self.refresh_settings_cards();
     }
 
     /// Whether the timeline is moving (frames are due at the frame rate).
     pub fn is_animating(&self) -> bool {
-        let menu_moving = matches!(&self.overlay, Some(Overlay::Menu(m)) if !m.is_settled());
+        let menu_moving = matches!(&self.overlay, Some(Overlay::Menu(m, _)) if !m.is_settled());
         menu_moving || !self.timeline.is_settled()
     }
 
@@ -409,7 +459,7 @@ impl App {
         self.timeline.set_context(ctx);
         self.timeline.tick(dt);
         match &mut self.overlay {
-            Some(Overlay::Menu(m)) => m.tick(dt),
+            Some(Overlay::Menu(m, _)) => m.tick(dt),
             Some(Overlay::Adjust(a)) => a.set_context(ctx),
             None => {}
         }
@@ -427,7 +477,7 @@ impl App {
             return Ok(true);
         }
         match &mut self.overlay {
-            Some(Overlay::Menu(m)) => {
+            Some(Overlay::Menu(m, _)) => {
                 if self.shown && !m.needs_redraw() {
                     return Ok(false);
                 }

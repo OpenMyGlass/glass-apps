@@ -121,6 +121,12 @@ impl<T: Clone> Menu<T> {
         self.strip.tick(dt);
     }
 
+    /// Ends a touch whose end will not arrive (focus lost, glassd gone): a drag returns to
+    /// the item it started from.
+    pub fn cancel_touch(&mut self) {
+        self.strip.cancel_touch();
+    }
+
     pub fn is_settled(&self) -> bool {
         self.strip.is_settled()
     }
@@ -156,8 +162,18 @@ pub struct Adjuster {
     screen: Timeline,
 }
 
+/// `v` clamped to `min..=max` and moved to the nearest step from `min`.
+fn snap(v: f32, min: f32, max: f32, step: f32) -> f32 {
+    let v = v.clamp(min, max);
+    if step <= 0.0 {
+        return v;
+    }
+    (min + ((v - min) / step).round() * step).clamp(min, max)
+}
+
 impl Adjuster {
-    /// `value` starts clamped to `min..=max`; `format` turns it into the text shown.
+    /// `value` starts clamped to `min..=max` and snapped to the step grid from `min`;
+    /// `format` turns it into the text shown.
     pub fn new(
         title: impl Into<String>,
         min: f32,
@@ -171,7 +187,7 @@ impl Adjuster {
             min,
             max,
             step,
-            value: value.clamp(min, max),
+            value: snap(value, min, max, step),
             format,
             screen: Timeline::new(vec![], Card::new(0, CardContent::Home), vec![]),
         };

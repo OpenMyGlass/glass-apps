@@ -414,7 +414,7 @@ pub fn run<D: Display>(
                 log(&line);
             }
             if let Err(e) = pumped {
-                app.set_service(None);
+                app.glassd_disconnected();
                 log(&format!("glassd connection lost ({e}); reconnecting"));
                 break;
             }

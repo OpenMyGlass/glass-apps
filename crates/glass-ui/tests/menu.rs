@@ -139,3 +139,37 @@ fn adjuster_redraws_only_when_the_value_changes() {
     a.release(&mut c);
     assert_eq!(c.layer_count(), 0);
 }
+
+#[test]
+fn cancel_touch_returns_a_menu_drag_to_its_item() {
+    let mut m = menu();
+    m.handle(&InputEvent::Scroll {
+        displacement: 0.4,
+        delta: 0.4,
+        velocity: 0.0,
+        fingers: 1,
+        ended: false,
+        cancelled: false,
+        timestamp_us: 0,
+    });
+    assert!(!m.is_settled());
+    m.cancel_touch();
+    settle(&mut m);
+    assert_eq!(m.index(), 0);
+}
+
+#[test]
+fn adjuster_snaps_to_its_step_grid() {
+    assert_eq!(
+        Adjuster::new("a", 10.0, 40.0, 5.0, 23.0, degrees).value(),
+        25.0
+    );
+    assert_eq!(
+        Adjuster::new("a", 10.0, 40.0, 5.0, 22.4, degrees).value(),
+        20.0
+    );
+    assert_eq!(
+        Adjuster::new("a", 10.0, 40.0, 5.0, 39.9, degrees).value(),
+        40.0
+    );
+}

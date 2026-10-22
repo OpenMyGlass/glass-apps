@@ -673,7 +673,7 @@ fn the_wake_angle_screen_sends_the_angle() {
 #[test]
 fn a_clamped_value_is_shown_as_glassd_applied_it() {
     use glass_launcher::settings::ids;
-    let (m, mut s, mut a) = connected();
+    let (_m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
     a.change_settings(glass_api::proto::Settings {
         head_wake_angle_deg: Some(55.0),
@@ -685,7 +685,6 @@ fn a_clamped_value_is_shown_as_glassd_applied_it() {
     });
     assert_eq!(settings_subtitle(&a, ids::HEAD_WAKE), "On, at 40°");
     assert_eq!(settings_subtitle(&a, ids::SCREEN_TIMEOUT), "3 seconds");
-    drop(m);
 }
 
 #[test]
@@ -730,4 +729,85 @@ fn the_device_card_lists_glassd_and_its_capabilities() {
     assert!(lines
         .iter()
         .any(|l| l.contains("touchpad") && l.contains("mock")));
+}
+
+#[test]
+fn focus_loss_mid_drag_in_a_menu_returns_the_drag_and_the_next_tap_selects() {
+    use glass_launcher::settings::ids;
+    use glass_launcher::OverlayKind;
+    let (m, mut s, mut a) = connected();
+    pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
+    show(&mut a, ids::SCREEN_TIMEOUT);
+    m.publish_body(gesture(PKind::Tap));
+    pump_until(&mut s, &mut a, |_, a| a.overlay().is_some());
+    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 2 }));
+    m.publish_body(Body::Scroll(Scroll {
+        displacement: 0.3,
+        delta: 0.3,
+        fingers: 1,
+        timestamp_us: 5,
+        ..Default::default()
+    }));
+    pump_for(&mut s, &mut a, Duration::from_millis(200));
+    let mut other = Client::connect_as(m.path(), "an-app").unwrap();
+    other.subscribe(&[Topic::Gesture]).unwrap();
+    other.acquire_focus().unwrap();
+    pump_until(&mut s, &mut a, |s, _| !s.focused());
+    pump_for(&mut s, &mut a, Duration::from_millis(200));
+    a.step(1.0, ctx());
+    assert!(!a.is_animating(), "settled: no frame-rate wake-ups");
+    assert_eq!(
+        a.overlay(),
+        Some(OverlayKind::Menu { index: 2 }),
+        "back to the item"
+    );
+    drop(other);
+    pump_until(&mut s, &mut a, |s, _| s.focused());
+    while m.next_client_frame(Duration::from_millis(100)).is_some() {}
+    m.publish_body(gesture(PKind::Tap));
+    assert_eq!(
+        next_set_settings(&m, &mut s, &mut a).screen_timeout_ms,
+        Some(15_000),
+        "the TAP selected the item shown"
+    );
+}
+
+#[test]
+fn an_open_menu_follows_a_settings_change() {
+    use glass_launcher::settings::ids;
+    use glass_launcher::OverlayKind;
+    let (m, mut s, mut a) = connected();
+    pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
+    show(&mut a, ids::WINK);
+    m.publish_body(gesture(PKind::Tap));
+    pump_until(&mut s, &mut a, |_, a| a.overlay().is_some());
+    assert_eq!(a.menu_labels(), vec!["Turn on"]);
+    let mut other = Client::connect_as(m.path(), "settings-app").unwrap();
+    other
+        .send(client_frame::Body::SetSettings(
+            glass_api::proto::SetSettings {
+                settings: Some(glass_api::proto::Settings {
+                    wink_enabled: Some(true),
+                    ..Default::default()
+                }),
+            },
+        ))
+        .unwrap();
+    pump_until(&mut s, &mut a, |_, a| a.menu_labels() == vec!["Turn off"]);
+    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 0 }));
+}
+
+#[test]
+fn losing_glassd_forgets_its_settings_and_pending_requests() {
+    use glass_launcher::settings::ids;
+    let (_m, mut s, mut a) = connected();
+    pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
+    a.change_settings(glass_api::proto::Settings {
+        wink_enabled: Some(true),
+        ..Default::default()
+    });
+    a.glassd_disconnected();
+    assert!(a.take_requests().is_empty());
+    assert!(a.settings().is_none());
+    assert_eq!(settings_subtitle(&a, ids::WINK), "Waiting for glassd");
 }

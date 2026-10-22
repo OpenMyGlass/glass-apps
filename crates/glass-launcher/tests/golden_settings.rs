@@ -1,7 +1,8 @@
 //! Goldens of the settings cards, the menus they open and the wake-angle screen, rendered
 //! in software (`tests/golden/settings-*.png`). With `GLASS_GLES_TESTS=1` and the `gles`
 //! feature, the same cards are also rendered with GLES2 and compared with the same goldens
-//! (text only: within ±2 everywhere; menus with dots and the angle bar: the edge rule).
+//! (within ±2, except the edge rule on the menu dots). The wake-angle screen is the
+//! `adjust` golden of glass-ui.
 //! `GLASS_UPDATE_GOLDEN=1` rewrites the software goldens.
 
 use glass_gfx::golden::{self, Tolerance};
@@ -44,6 +45,16 @@ fn view() -> SettingsView {
 }
 
 /// Every scene: name, card, tolerance on the GLES path.
+/// The GLES tolerance of a card: strict, with the edge rule only on its rounded shapes.
+fn gles_tolerance(card: &Card) -> Tolerance {
+    let shapes = glass_ui::card::shape_rects(card, 640, 360);
+    if shapes.is_empty() {
+        Tolerance::Max(2)
+    } else {
+        Tolerance::Shapes(shapes)
+    }
+}
+
 fn scenes() -> Vec<(String, Card, Tolerance)> {
     let v = view();
     let mut out: Vec<(String, Card, Tolerance)> = settings::cards(&v)
@@ -69,10 +80,11 @@ fn scenes() -> Vec<(String, Card, Tolerance)> {
         .find(|c| c.id == ids::HEAD_WAKE)
         .unwrap();
     let (items, _) = settings::menu_for(&head, &v).unwrap();
+    let card = menu_card(&items[1].label, items[1].detail.clone(), 1, items.len());
     out.push((
         "settings-menu-wake-angle".into(),
-        menu_card(&items[1].label, items[1].detail.clone(), 1, items.len()),
-        Tolerance::Edges,
+        card.clone(),
+        gles_tolerance(&card),
     ));
     let timeout = settings::cards(&v)
         .into_iter()
@@ -86,19 +98,6 @@ fn scenes() -> Vec<(String, Card, Tolerance)> {
             items[first].detail.clone(),
             first,
             items.len(),
-        ),
-        Tolerance::Edges,
-    ));
-    // What settings::wake_angle_adjuster shows at the default angle.
-    out.push((
-        "settings-wake-angle".into(),
-        Card::new(
-            0,
-            CardContent::Adjust {
-                title: "Wake angle".into(),
-                value: settings::angle_text(30.0),
-                fraction: (30.0 - 10.0) / 30.0,
-            },
         ),
         Tolerance::Edges,
     ));
@@ -123,7 +122,7 @@ fn check(name: &str, frame: &Frame, tol: Tolerance, actual: &str, update: bool) 
         &root().join("target").join(actual),
         name,
         frame,
-        tol,
+        &tol,
         update,
     );
     println!("scene {name}: {d:?}");

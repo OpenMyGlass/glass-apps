@@ -200,7 +200,7 @@ fn patch(f: impl FnOnce(&mut Settings)) -> Choice {
 }
 
 fn toggle_item(enabled: Option<bool>, set: fn(&mut Settings, bool)) -> MenuItem<Choice> {
-    // Unknown: offer to turn it on (the glassd default for most switches is off).
+    // Called only with known settings; a field glassd left out counts as off.
     let on = enabled.unwrap_or(false);
     let label = if on { "Turn off" } else { "Turn on" };
     MenuItem::new(patch(|s| set(s, !on)), label)
@@ -208,18 +208,34 @@ fn toggle_item(enabled: Option<bool>, set: fn(&mut Settings, bool)) -> MenuItem<
 
 /// The menu of `card`, with the item to show first; `None` when it has no menu.
 pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>, usize)> {
+    let owned_by_glassd = matches!(
+        card.id,
+        ids::SCREEN_TIMEOUT | ids::HEAD_WAKE | ids::WINK | ids::ON_HEAD | ids::NUDGE
+    );
+    if owned_by_glassd && v.settings.is_none() {
+        // Unknown until glassd sends them: no menu, so nothing is written blind.
+        return None;
+    }
     let s = v.settings.unwrap_or_default();
-    let known = v.settings.is_some();
     let items = match card.id {
         ids::WIFI => vec![radio_item(&v.wifi, Choice::Wifi)],
         ids::BLUETOOTH => vec![radio_item(&v.bluetooth, Choice::Bluetooth)],
         ids::SCREEN_TIMEOUT => {
-            let items: Vec<MenuItem<Choice>> = TIMEOUT_CHOICES_MS
+            // The fixed choices, plus the current value when it is none of them (set by
+            // another client), in order.
+            let mut choices = TIMEOUT_CHOICES_MS.to_vec();
+            if let Some(ms) = s.screen_timeout_ms {
+                if !choices.contains(&ms) {
+                    choices.push(ms);
+                    choices.sort_unstable();
+                }
+            }
+            let items: Vec<MenuItem<Choice>> = choices
                 .iter()
                 .map(|&ms| {
                     let it =
                         MenuItem::new(patch(|p| p.screen_timeout_ms = Some(ms)), timeout_text(ms));
-                    if known && s.screen_timeout_ms == Some(ms) {
+                    if s.screen_timeout_ms == Some(ms) {
                         it.with_detail("Current")
                     } else {
                         it
@@ -228,7 +244,7 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
                 .collect();
             let first = s
                 .screen_timeout_ms
-                .and_then(|ms| TIMEOUT_CHOICES_MS.iter().position(|&c| c == ms))
+                .and_then(|ms| choices.iter().position(|&c| c == ms))
                 .unwrap_or(2);
             return Some((items, first));
         }
@@ -391,6 +407,41 @@ mod tests {
             },
         );
         assert_eq!(menu_for(&text, &v).unwrap().0[0].value, Choice::Delete(11));
+    }
+
+    #[test]
+    fn no_menu_for_glassd_settings_until_they_are_known() {
+        let v = view(None);
+        for id in [
+            ids::SCREEN_TIMEOUT,
+            ids::HEAD_WAKE,
+            ids::WINK,
+            ids::ON_HEAD,
+            ids::NUDGE,
+        ] {
+            let card = Card::new(id, card_content(id, &v).unwrap());
+            assert!(menu_for(&card, &v).is_none(), "card {id}");
+        }
+        // The radios belong to the platform: their menus do not wait for glassd.
+        let wifi = Card::new(ids::WIFI, card_content(ids::WIFI, &v).unwrap());
+        assert!(menu_for(&wifi, &v).is_some());
+    }
+
+    #[test]
+    fn a_timeout_outside_the_choices_is_offered_as_current() {
+        let mut s = settings_defaults();
+        s.screen_timeout_ms = Some(20_000);
+        let v = view(Some(s));
+        let card = Card::new(
+            ids::SCREEN_TIMEOUT,
+            card_content(ids::SCREEN_TIMEOUT, &v).unwrap(),
+        );
+        let (items, first) = menu_for(&card, &v).unwrap();
+        assert_eq!(items.len(), TIMEOUT_CHOICES_MS.len() + 1);
+        assert_eq!(first, 3, "between 15 and 30 seconds");
+        assert_eq!(items[first].label, "20 seconds");
+        assert_eq!(items[first].detail.as_deref(), Some("Current"));
+        assert_eq!(items.iter().filter(|i| i.detail.is_some()).count(), 1);
     }
 
     #[test]
