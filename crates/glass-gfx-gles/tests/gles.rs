@@ -195,6 +195,18 @@ fn scene(name: &str) -> Card {
                 fraction: 2.0 / 3.0,
             },
         ),
+        "info" => Card::new(
+            22,
+            CardContent::Info {
+                title: "Device".into(),
+                lines: vec![
+                    "glass-launcher 0.1.0, renderer gles".into(),
+                    "glassd mock-0.1.0".into(),
+                    "touchpad, screen, head, wear, wink, button-camera, button-power, hinge".into(),
+                    "Platform: mock".into(),
+                ],
+            },
+        ),
         _ => unreachable!(),
     }
 }
@@ -224,6 +236,7 @@ fn golden_cards() {
         // Menu position dots and the adjustment bar are rounded rects.
         ("menu-item", Tolerance::Edges),
         ("adjust", Tolerance::Edges),
+        ("info", Tolerance::Strict),
     ] {
         let f = render_card_gles(&mut c, &scene(name));
         check_golden(name, &f, tol);

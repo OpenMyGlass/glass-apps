@@ -49,6 +49,8 @@ pub enum CardContent {
         value: String,
         fraction: f32,
     },
+    /// Facts in short lines under a grey title (the device card).
+    Info { title: String, lines: Vec<String> },
 }
 
 /// An image shown by a card. `id` names the picture: a new picture needs a new id, which is
@@ -176,6 +178,11 @@ pub fn render_key(card: &Card, ctx: &RenderContext) -> u64 {
             title.hash(&mut h);
             value.hash(&mut h);
             fraction.to_bits().hash(&mut h);
+        }
+        CardContent::Info { title, lines } => {
+            6u8.hash(&mut h);
+            title.hash(&mut h);
+            lines.hash(&mut h);
         }
     }
     h.finish()
@@ -337,6 +344,35 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
                 );
             }
         }
+        CardContent::Info { title, lines } => {
+            centered_line(
+                f,
+                Weight::Light,
+                style::SUBTITLE_SIZE,
+                title,
+                style::MARGIN + 20.0,
+                style::SECONDARY,
+            );
+            info_lines(f, lines);
+        }
+    }
+}
+
+/// The info card's lines: left-aligned, wrapped, as many as fit above the bottom margin.
+fn info_lines(f: &mut dyn Painter, lines: &[String]) {
+    let font = fonts::font(Weight::Light);
+    let (w, h) = f.size();
+    let size = style::INFO_SIZE;
+    let step = size * style::BODY_LINE_HEIGHT;
+    let max_w = w as f32 - 2.0 * style::MARGIN;
+    let mut baseline = style::INFO_TOP;
+    for line in lines.iter().flat_map(|l| text::wrap(font, size, l, max_w)) {
+        if baseline > h as f32 - style::FOOTER_BASELINE_FROM_BOTTOM {
+            break;
+        }
+        let (run, _) = text::layout_line(font, size, style::MARGIN, baseline, &line);
+        f.draw_glyph_run(&run, style::TEXT);
+        baseline += step;
     }
 }
 

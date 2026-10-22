@@ -42,3 +42,6 @@ pub const TRACK: Color = Color::grey(0x44);
 /// Menu position dots: diameter and gap.
 pub const DOT_SIZE: f32 = 8.0;
 pub const DOT_GAP: f32 = 10.0;
+/// Info card lines: size, and the first baseline.
+pub const INFO_SIZE: f32 = 30.0;
+pub const INFO_TOP: f32 = 130.0;

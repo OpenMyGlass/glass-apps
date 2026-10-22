@@ -192,3 +192,20 @@ fn golden_menu_item() {
 fn golden_adjust() {
     check("adjust", &render_card(&adjust(), &ctx(), 640, 360));
 }
+
+#[test]
+fn golden_info() {
+    let card = Card::new(
+        22,
+        CardContent::Info {
+            title: "Device".into(),
+            lines: vec![
+                "glass-launcher 0.1.0, renderer gles".into(),
+                "glassd mock-0.1.0".into(),
+                "touchpad, screen, head, wear, wink, button-camera, button-power, hinge".into(),
+                "Platform: mock".into(),
+            ],
+        },
+    );
+    check("info", &render_card(&card, &ctx(), 640, 360));
+}
