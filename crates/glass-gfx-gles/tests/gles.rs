@@ -178,6 +178,23 @@ fn scene(name: &str) -> Card {
                 timestamp_s: ctx().now_s - 26 * 3600,
             },
         ),
+        "menu-item" => Card::new(
+            20,
+            CardContent::MenuItem {
+                label: "Turn off".into(),
+                detail: Some("Head wake is on".into()),
+                index: 1,
+                count: 3,
+            },
+        ),
+        "adjust" => Card::new(
+            21,
+            CardContent::Adjust {
+                title: "Wake angle".into(),
+                value: "30°".into(),
+                fraction: 2.0 / 3.0,
+            },
+        ),
         _ => unreachable!(),
     }
 }
@@ -204,6 +221,9 @@ fn golden_cards() {
         ("text-long", Tolerance::Strict),
         ("settings", Tolerance::Strict),
         ("image-placeholder", Tolerance::Edges),
+        // Menu position dots and the adjustment bar are rounded rects.
+        ("menu-item", Tolerance::Edges),
+        ("adjust", Tolerance::Edges),
     ] {
         let f = render_card_gles(&mut c, &scene(name));
         check_golden(name, &f, tol);

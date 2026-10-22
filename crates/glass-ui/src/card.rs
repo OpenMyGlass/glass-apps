@@ -34,6 +34,21 @@ pub enum CardContent {
         caption: String,
         timestamp_s: i64,
     },
+    /// One item of a menu, one per screen as on Glass: a large label, optionally a grey
+    /// detail line ("current"), and dots for the position (`index` of `count`).
+    MenuItem {
+        label: String,
+        detail: Option<String>,
+        index: usize,
+        count: usize,
+    },
+    /// A value being adjusted (a sub-screen): a grey title, the value in large text and a
+    /// bar filled to `fraction` (`0.0..=1.0`).
+    Adjust {
+        title: String,
+        value: String,
+        fraction: f32,
+    },
 }
 
 /// An image shown by a card. `id` names the picture: a new picture needs a new id, which is
@@ -140,6 +155,28 @@ pub fn render_key(card: &Card, ctx: &RenderContext) -> u64 {
             caption.hash(&mut h);
             relative_time(ctx.now_s, *timestamp_s).hash(&mut h);
         }
+        CardContent::MenuItem {
+            label,
+            detail,
+            index,
+            count,
+        } => {
+            4u8.hash(&mut h);
+            label.hash(&mut h);
+            detail.hash(&mut h);
+            index.hash(&mut h);
+            count.hash(&mut h);
+        }
+        CardContent::Adjust {
+            title,
+            value,
+            fraction,
+        } => {
+            5u8.hash(&mut h);
+            title.hash(&mut h);
+            value.hash(&mut h);
+            fraction.to_bits().hash(&mut h);
+        }
     }
     h.finish()
 }
@@ -235,6 +272,93 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
                 style::TEXT,
             );
         }
+        CardContent::MenuItem {
+            label,
+            detail,
+            index,
+            count,
+        } => {
+            let center = if detail.is_some() { h * 0.44 } else { h / 2.0 };
+            centered_line(
+                f,
+                Weight::Light,
+                style::MENU_SIZE,
+                label,
+                center,
+                style::TEXT,
+            );
+            if let Some(d) = detail {
+                centered_line(
+                    f,
+                    Weight::Light,
+                    style::SUBTITLE_SIZE,
+                    d,
+                    h * 0.66,
+                    style::SECONDARY,
+                );
+            }
+            position_dots(f, *index, *count);
+        }
+        CardContent::Adjust {
+            title,
+            value,
+            fraction,
+        } => {
+            centered_line(
+                f,
+                Weight::Light,
+                style::SUBTITLE_SIZE,
+                title,
+                style::MARGIN + 20.0,
+                style::SECONDARY,
+            );
+            centered_line(
+                f,
+                Weight::Light,
+                style::ADJUST_VALUE_SIZE,
+                value,
+                h * 0.48,
+                style::TEXT,
+            );
+            let track = Rect::new(
+                style::MARGIN,
+                h - style::FOOTER_BASELINE_FROM_BOTTOM - 20.0,
+                w - 2.0 * style::MARGIN,
+                style::BAR_HEIGHT,
+            );
+            let r = style::BAR_HEIGHT / 2.0;
+            f.fill_rounded_rect(track, r, style::TRACK);
+            let fill = track.w * fraction.clamp(0.0, 1.0);
+            if fill > 0.0 {
+                f.fill_rounded_rect(
+                    Rect::new(track.x, track.y, fill.max(2.0 * r), track.h),
+                    r,
+                    style::TEXT,
+                );
+            }
+        }
+    }
+}
+
+/// Dots showing which of `count` menu items is shown, centred near the bottom.
+fn position_dots(f: &mut dyn Painter, index: usize, count: usize) {
+    if count < 2 {
+        return;
+    }
+    let (w, h) = f.size();
+    let d = style::DOT_SIZE;
+    let gap = style::DOT_GAP;
+    let total = count as f32 * d + (count - 1) as f32 * gap;
+    let x0 = ((w as f32 - total) / 2.0).round();
+    let y = h as f32 - style::FOOTER_BASELINE_FROM_BOTTOM - d;
+    for i in 0..count {
+        let c = if i == index {
+            style::TEXT
+        } else {
+            style::TRACK
+        };
+        let x = x0 + i as f32 * (d + gap);
+        f.fill_rounded_rect(Rect::new(x, y, d, d), d / 2.0, c);
     }
 }
 

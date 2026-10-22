@@ -337,6 +337,12 @@ impl Timeline {
         self.jump_to(home);
     }
 
+    /// Shows card `index` at once, without animation (clamped to the last card).
+    pub fn show_index(&mut self, index: usize) {
+        let i = index.min(self.last());
+        self.jump_to(i);
+    }
+
     /// Ends a touch whose end will not arrive (the input focus moved away, the connection
     /// to glassd was lost): a drag animates back to where it started, as a cancelled
     /// `Scroll` would. Without a drag, nothing changes.
@@ -650,6 +656,18 @@ impl Timeline {
         }
         self.dirty = false;
         Ok(())
+    }
+
+    /// Frees every layer of this timeline in `comp` (an overlay hides it, or it is closed);
+    /// visible cards are painted again at the next render.
+    pub fn release_layers(&mut self, comp: &mut dyn Compositor) {
+        for id in self.dropped.drain(..) {
+            comp.drop_layer(id);
+        }
+        for (_, l) in self.layers.drain() {
+            comp.drop_layer(l.id);
+        }
+        self.dirty = true;
     }
 
     fn prepare_neighbours(&mut self, comp: &mut dyn Compositor) -> Result<(), GfxError> {

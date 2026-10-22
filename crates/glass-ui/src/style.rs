@@ -31,3 +31,14 @@ pub const TITLE_SIZE: f32 = 64.0;
 pub const SUBTITLE_SIZE: f32 = 32.0;
 /// Image placeholder fill.
 pub const PLACEHOLDER: Color = Color::grey(0x26);
+/// Menu item label size.
+pub const MENU_SIZE: f32 = 64.0;
+/// The value of an adjustment sub-screen.
+pub const ADJUST_VALUE_SIZE: f32 = 96.0;
+/// Height of the adjustment bar.
+pub const BAR_HEIGHT: f32 = 8.0;
+/// Unfilled bar and inactive menu dots.
+pub const TRACK: Color = Color::grey(0x44);
+/// Menu position dots: diameter and gap.
+pub const DOT_SIZE: f32 = 8.0;
+pub const DOT_GAP: f32 = 10.0;
