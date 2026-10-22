@@ -73,7 +73,7 @@ Glass used Roboto Light and Thin. We bundle **Inter** (Rasmus Andersson, SIL Ope
 
 - **GPU-1** (before M1b): the GLES2 renderer becomes the primary path, see [`2026-10-22-gpu-rendering.md`](2026-10-22-gpu-rendering.md).
 - **M1b:** the launcher connects to `glassd` (see item 3 above).
-- **M2:** settings (head wake, wink, screen timeout through `SetSettings`; Wi-Fi and Bluetooth through a small platform trait), menus; the Linux framebuffer back end only as a debug fallback.
+- **M2:** settings (head wake, wink, screen timeout through `SetSettings`; Wi-Fi and Bluetooth through a small platform trait), menus; the Linux framebuffer back end only as a debug fallback. Menus, settings cards, the wake-angle screen, the device card and the `Platform` seam (mock only) are done; the framebuffer back end is not (it is a debug fallback, and the GPU path comes first).
 - **M3:** Android glue (launcher wrapper, `ANativeWindow`, intents), setup (pairing with the OpenMyGlass phone app), dictation.
 - **M4:** camera (through the platform: Android camera API or V4L2/Ducati on Linux), voice hotword and commands.
 
@@ -81,3 +81,7 @@ Glass used Roboto Light and Thin. We bundle **Inter** (Rasmus Andersson, SIL Ope
 
 - [ ] The launcher draws at 640×360 on the panel, text is sharp, the timeline scrolls without visible stutter.
 - [ ] Frame time while scrolling, render time of one card, CPU use while idle (only the home clock redraws, once a minute).
+- [ ] M2 menus: `TAP` on a text card opens its menu, swipes move between items as smoothly as the timeline, `SWIPE_DOWN` closes; text in menus is sharp on GLES and in software.
+- [ ] M2 settings, each against a real `glassd`: head wake off and on (look-up no longer wakes, then wakes again); wake angle changed to 20° and 40° (look-up needs a lower or higher pitch); wink on (needs the glasshub calibration); on-head detection on (taking Glass off turns the screen off); nudge to sleep on; every screen timeout choice (5 s and 10 min timed). Each card shows the value `glassd` applied.
+- [ ] M2 device card: the launcher version, renderer `gles`, and `glassd`'s capabilities on the device (touchpad, screen, wear, and head/wink when found).
+- [ ] M2 Wi-Fi and Bluetooth cards: only the mock exists; with a real platform back end (M3 or route 2), turning each radio off and on and the shown network and devices.
