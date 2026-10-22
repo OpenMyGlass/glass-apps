@@ -230,8 +230,8 @@ jobs:
       - run: cargo build --release --locked --target armv7-unknown-linux-musleabihf -p glass-launcher --no-default-features
       - run: file target/armv7-unknown-linux-musleabihf/release/glass-launcher
       - name: Tests on armv7 under QEMU (golden images included)
-        # glass-gfx-gles needs libdl, which a static musl build does not have.
-        run: cargo test --locked --target armv7-unknown-linux-musleabihf --workspace --exclude glass-gfx-gles --no-default-features
+        # glass-gfx-gles (and glass-android, which uses it) need libdl, which a static musl build does not have.
+        run: cargo test --locked --target armv7-unknown-linux-musleabihf --workspace --exclude glass-gfx-gles --exclude glass-android --no-default-features
       - name: Golden images that did not match
         if: failure()
         uses: actions/upload-artifact@v4
