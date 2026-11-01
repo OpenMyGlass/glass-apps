@@ -340,6 +340,7 @@ name = "glass-gfx"
 version = "0.1.0"
 dependencies = [
  "fontdue",
+ "libc",
  "minifb",
  "png",
  "tiny-skia",
