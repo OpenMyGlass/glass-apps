@@ -113,6 +113,53 @@ fn toggling_a_radio_plays_a_distinct_tick() {
 }
 
 #[test]
+fn a_resting_or_dragging_finger_is_silent() {
+    // Regression for the "continuous buzz on touch": feedback must be edge-triggered on a
+    // committed card change, never on the live touch/drag position.
+    let rec = Recorder::default();
+    let mut a = app_with(&rec);
+    rec.clear();
+
+    // A finger resting on the pad: many Scroll frames, no movement, never ended.
+    for i in 0..12u64 {
+        a.input(&InputEvent::Scroll {
+            displacement: 0.1,
+            delta: 0.0,
+            velocity: 0.0,
+            fingers: 1,
+            ended: false,
+            cancelled: false,
+            timestamp_us: i * 16_000,
+        });
+        a.step(0.016, ctx());
+    }
+    assert!(
+        rec.cues().is_empty(),
+        "a resting finger must be silent, got {:?}",
+        rec.cues()
+    );
+
+    // A finger dragging across several cards: still silent until the touch ends.
+    for i in 0..12u64 {
+        a.input(&InputEvent::Scroll {
+            displacement: 0.25 * (i as f32 + 1.0),
+            delta: 0.25,
+            velocity: 2.0,
+            fingers: 1,
+            ended: false,
+            cancelled: false,
+            timestamp_us: 200_000 + i * 16_000,
+        });
+        a.step(0.016, ctx());
+    }
+    assert!(
+        rec.cues().is_empty(),
+        "an in-progress drag must be silent (no per-delta ticks), got {:?}",
+        rec.cues()
+    );
+}
+
+#[test]
 fn the_default_player_is_silent() {
     // An app with no installed player makes no sound and does not panic on navigation.
     let mut a = App::new(demo::timeline(), ctx());

@@ -214,9 +214,18 @@ impl App {
         self.last_index = self.timeline.current_index();
     }
 
-    /// Plays a soft tick if the centred card changed since the last check (a swipe that
-    /// moves the timeline, or a drag that crosses into another card).
+    /// Plays a soft tick when the committed destination card changes (a swipe, or a drag
+    /// that settles on a new card). Edge-triggered on the discrete target only: it stays
+    /// silent while a finger is dragging or merely resting on the touchpad (the live drag
+    /// position is never used), so a held/jittering touch makes no sound. Called from
+    /// discrete input handling, not per frame.
     fn tick_on_card_change(&mut self) {
+        // While a touch is dragging (or resting), the timeline's "current index" follows
+        // the live finger position and can flip rapidly; do not sound on that. The tick
+        // fires when the touch ends and the destination is committed.
+        if self.timeline.is_dragging() {
+            return;
+        }
         let now = self.timeline.current_index();
         if now != self.last_index {
             self.last_index = now;
@@ -894,10 +903,8 @@ impl App {
         self.ctx = ctx;
         self.timeline.set_context(ctx);
         self.timeline.tick(dt);
-        // A drag crossing into another card (no discrete event) still ticks.
-        if self.overlay.is_none() {
-            self.tick_on_card_change();
-        }
+        // No feedback is emitted here: card-change ticks are edge-triggered on discrete
+        // input (see `timeline_input`), never per frame, so a drag/rest never buzzes.
         match &mut self.overlay {
             Some(Overlay::Menu(m, _)) => m.tick(dt),
             Some(Overlay::Adjust(a)) => a.set_context(ctx),

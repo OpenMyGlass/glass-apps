@@ -282,7 +282,9 @@ pub fn route_controls(headset: bool) -> Vec<(&'static str, i32)> {
         v.push(("Headset Left Playback", 0));
         v.push(("Headset Right Playback", 0));
         v.push(("Earphone Playback Switch", 1));
-        v.push(("Earphone Playback Volume", 12)); // TWL6040 EP gain, 0 dB (HAL default, safe)
+        // TWL6040 EP gain: 14 ~= +4 dB, nudged up from the 0 dB default for audibility on
+        // the transducer; still one step below the stock hardware cap of 15 (+6 dB).
+        v.push(("Earphone Playback Volume", 14));
     }
     v
 }
@@ -694,55 +696,55 @@ impl Clips {
             card_change: render(
                 &[Seg {
                     freq: 1800.0,
-                    ms: 14.0,
+                    ms: 18.0,
                 }],
-                0.10,
+                0.22,
             ),
             select: render(
                 &[
                     Seg {
                         freq: 1200.0,
-                        ms: 16.0,
+                        ms: 18.0,
                     },
                     Seg {
                         freq: 1600.0,
-                        ms: 26.0,
+                        ms: 30.0,
                     },
                 ],
-                0.13,
+                0.28,
             ),
             menu_move: render(
                 &[Seg {
                     freq: 2300.0,
-                    ms: 10.0,
+                    ms: 14.0,
                 }],
-                0.09,
+                0.20,
             ),
             toggle_on: render(
                 &[
                     Seg {
                         freq: 900.0,
-                        ms: 18.0,
+                        ms: 20.0,
                     },
                     Seg {
                         freq: 1400.0,
-                        ms: 24.0,
+                        ms: 28.0,
                     },
                 ],
-                0.12,
+                0.26,
             ),
             toggle_off: render(
                 &[
                     Seg {
                         freq: 1400.0,
-                        ms: 18.0,
+                        ms: 20.0,
                     },
                     Seg {
                         freq: 900.0,
-                        ms: 24.0,
+                        ms: 28.0,
                     },
                 ],
-                0.12,
+                0.26,
             ),
         }
     }
@@ -788,21 +790,15 @@ pub fn tone(freq: f32, ms: f32, peak: f32) -> Vec<i16> {
     out
 }
 
-/// A clear startup test tone (two notes), for the init's audio self-test.
+/// A clear, unmistakable startup chime: three ascending sustained notes, each long and
+/// loud with a short fade. Deliberately well above the cue level so it is obvious on the
+/// bone-conduction transducer (the earlier short/quiet two-note tone was inaudible).
 pub fn startup_tone() -> Vec<i16> {
-    render(
-        &[
-            Seg {
-                freq: 880.0,
-                ms: 150.0,
-            },
-            Seg {
-                freq: 1320.0,
-                ms: 150.0,
-            },
-        ],
-        0.18,
-    )
+    let mut v = Vec::new();
+    for &freq in &[660.0f32, 880.0, 1320.0] {
+        v.extend_from_slice(&tone(freq, 230.0, 0.5));
+    }
+    v
 }
 
 // ---- the installed Feedback player -------------------------------------------------
@@ -874,14 +870,27 @@ impl AlsaFeedback {
         thread::Builder::new()
             .name("ui-audio".into())
             .spawn(move || {
+                use std::time::{Duration, Instant};
+                // Minimum gap between repeatable ticks (CardChange/MenuMove), so a fast
+                // scroll or any rapid repeat collapses to at most one tick per interval
+                // instead of stacking into a buzz. Discrete cues (Select/Toggle) always
+                // play. Each play is prepare->write->START->drain, so the PCM is drained
+                // (silent) between cues; nothing is emitted while idle.
+                const MIN_GAP: Duration = Duration::from_millis(70);
                 let clips = Clips::new();
                 // keep the mixer handle alive for the session
                 let _mixer = mixer;
+                let mut last = Instant::now() - Duration::from_secs(1);
                 while let Ok(mut cue) = rx.recv() {
                     // Coalesce a backlog (fast swipes) down to the latest cue.
                     while let Ok(newer) = rx.try_recv() {
                         cue = newer;
                     }
+                    let repeatable = matches!(cue, Cue::CardChange | Cue::MenuMove);
+                    if repeatable && last.elapsed() < MIN_GAP {
+                        continue;
+                    }
+                    last = Instant::now();
                     let _ = pcm.play_explicit(clips.for_cue(cue));
                 }
             })
