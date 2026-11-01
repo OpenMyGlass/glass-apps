@@ -287,6 +287,49 @@ pub fn route_controls(headset: bool) -> Vec<(&'static str, i32)> {
     v
 }
 
+/// The full cold-start **priming** control set — the "V5" recipe confirmed working on the
+/// real Glass. On a cold boot, neither route-first alone nor route-first + a minimal PLL
+/// tweak made the OMAP4 ABE → McPDM → TWL6040 back-end clock; this full set did. Once it
+/// has clocked the codec **once** (with [`Pcm::play_explicit`], an explicit START), the
+/// path stays primed and every later open drains normally, in any order.
+///
+/// It is: the codec power/PLL in **High-Performance** mode (so the McPDM PDM clock runs
+/// from cold), the stock ABE DL1 mixer settings (spec 4.2), and the output [`route_controls`].
+/// Applied **before** opening the front-end PCM (so DPCM links the McPDM back-end at open).
+///
+/// | Control | Value | Why |
+/// |---|---|---|
+/// | `PLL Selection` | 1 = High-Performance (HPPLL) | McPDM clock from the 38.4 MHz MCLK, cold-reliable |
+/// | `TWL6040 Power Mode` | 1 = High-Performance | codec analog in high-performance mode |
+/// | `Headset Power Mode` | 1 = High-Performance | HSDAC (feeds the Earphone) in high-performance |
+/// | `DL1 Mono Mixer` | 0 | off (stock) |
+/// | `Sidetone Mixer Playback` | 1 | stock DL1 path |
+/// | `DL1 Mixer Voice` | 0 | only Multimedia feeds DL1 |
+/// | …then [`route_controls`] | | DL1 Mixer Multimedia / Media Vol / PDM Switch + EP (or Headset) output |
+pub fn prime_controls(headset: bool) -> Vec<(&'static str, i32)> {
+    let mut v = vec![
+        ("PLL Selection", 1),      // High-Performance (HPPLL)
+        ("TWL6040 Power Mode", 1), // High-Performance
+        ("Headset Power Mode", 1), // High-Performance
+        ("DL1 Mono Mixer", 0),
+        ("Sidetone Mixer Playback", 1),
+        ("DL1 Mixer Voice", 0),
+    ];
+    v.extend(route_controls(headset));
+    v
+}
+
+/// Applies [`prime_controls`] on the mixer, returning the per-control results for logging.
+pub fn set_prime(mixer: &Mixer, headset: bool) -> Vec<(&'static str, i32, io::Result<()>)> {
+    prime_controls(headset)
+        .into_iter()
+        .map(|(name, val)| {
+            let r = mixer.set(name, val);
+            (name, val, r)
+        })
+        .collect()
+}
+
 /// True if a USB earbud/headset is plugged into the Glass USB connector (the HAL reads
 /// this sysfs attribute, which measures the ID-pin resistor).
 pub fn headset_present() -> bool {
@@ -460,6 +503,27 @@ impl Pcm {
         )
         .map_err(|e| Error::new(e.kind(), format!("WRITEI: {e}")))?;
         Ok(x.result as usize)
+    }
+
+    /// Plays `samples` with an **explicit START** after one period is queued: PREPARE,
+    /// write one period, START, write the rest, DRAIN. This is the sequence that makes the
+    /// OMAP4 ABE → McPDM → TWL6040 back-end actually clock from cold (confirmed on
+    /// hardware: variant V5). Writing a full period before START (rather than relying on
+    /// the start threshold) is what gets the DMA running on a cold codec.
+    pub fn play_explicit(&self, samples: &[i16]) -> io::Result<()> {
+        let ch = CHANNELS as usize;
+        let total = samples.len() / ch;
+        if total == 0 {
+            return Ok(());
+        }
+        let one = (self.period_size as usize).min(total);
+        self.prepare()?;
+        self.writei(&samples[..one * ch])?;
+        self.start()?;
+        if one < total {
+            self.writei(&samples[one * ch..])?;
+        }
+        self.drain()
     }
 }
 
@@ -749,10 +813,17 @@ pub struct AlsaFeedback {
     tx: mpsc::Sender<Cue>,
 }
 
+/// Playback period/count for the UI player: 1056 frames × 4 = low latency (~22 ms period,
+/// ~88 ms buffer) for snappy cues. Confirmed working on hardware once primed.
+const UI_PERIOD: u32 = 1056;
+const UI_PERIODS: u32 = 4;
+
 impl AlsaFeedback {
-    /// Opens the mixer and PCM, sets the bone-conduction (EP) route (or the USB earbud
-    /// route if one is plugged in), and starts the audio thread. Returns the player and a
-    /// human-readable report of what it did (for the log).
+    /// Opens the mixer, applies the cold-start priming set ([`prime_controls`], the "V5"
+    /// recipe), opens the PCM (1056×4), and **primes the codec once** by playing a short
+    /// startup tone with an explicit START (the step that makes the bone-conduction path
+    /// clock from cold). Then starts the audio thread, which plays each cue on the primed
+    /// path. Returns the player and a human-readable report (for the log).
     pub fn start() -> (Option<AlsaFeedback>, Vec<String>) {
         let mut report = Vec::new();
         let mixer = match Mixer::open() {
@@ -771,13 +842,15 @@ impl AlsaFeedback {
                 "bone conduction (Earphone/EP)"
             }
         ));
-        for (name, val, r) in set_route(&mixer, headset) {
+        // Apply the full priming controls BEFORE opening the front-end (route-first), so
+        // DPCM links the McPDM back-end at open.
+        for (name, val, r) in set_prime(&mixer, headset) {
             match r {
                 Ok(()) => report.push(format!("mixer {name} = {val}: ok")),
                 Err(e) => report.push(format!("mixer {name} = {val}: {e}")),
             }
         }
-        let pcm = match Pcm::open() {
+        let pcm = match Pcm::open_params(UI_PERIOD, UI_PERIODS, 0) {
             Ok(p) => {
                 report.push(format!(
                     "pcm card{CARD} dev{DEVICE}: open ok (period {} buffer {} frames @ {RATE} Hz)",
@@ -790,6 +863,12 @@ impl AlsaFeedback {
                 return (None, report);
             }
         };
+        // Cold-prime + startup tone: one explicit-START play clocks the codec. After this,
+        // every per-cue play drains normally.
+        match pcm.play_explicit(&startup_tone()) {
+            Ok(()) => report.push("codec primed (startup tone played, explicit START)".into()),
+            Err(e) => report.push(format!("prime/startup tone FAILED: {e}")),
+        }
 
         let (tx, rx) = mpsc::channel::<Cue>();
         thread::Builder::new()
@@ -803,7 +882,7 @@ impl AlsaFeedback {
                     while let Ok(newer) = rx.try_recv() {
                         cue = newer;
                     }
-                    let _ = pcm.play(clips.for_cue(cue));
+                    let _ = pcm.play_explicit(clips.for_cue(cue));
                 }
             })
             .ok();
@@ -820,9 +899,9 @@ impl Feedback for AlsaFeedback {
 
 // ---- audio self-test (for the init's startup tone) ---------------------------------
 
-/// Sets the EP (bone-conduction) route and plays a startup tone, returning a log of each
-/// step. Used by `glass-launcher --audio-selftest` from the init. `true` if a tone was
-/// played.
+/// Applies the cold-start priming set ([`prime_controls`]) and plays a startup tone with
+/// an explicit START (the "V5" recipe), returning a log of each step. Used by
+/// `glass-launcher --audio-selftest` from the init. `true` if a tone was played.
 pub fn selftest() -> (bool, Vec<String>) {
     let mut log = Vec::new();
     let mixer = match Mixer::open() {
@@ -837,13 +916,13 @@ pub fn selftest() -> (bool, Vec<String>) {
     };
     let headset = headset_present();
     log.push(format!("headset detected: {headset}"));
-    for (name, val, r) in set_route(&mixer, headset) {
+    for (name, val, r) in set_prime(&mixer, headset) {
         match r {
             Ok(()) => log.push(format!("mixer {name} = {val}: ok")),
             Err(e) => log.push(format!("mixer {name} = {val}: FAIL: {e}")),
         }
     }
-    let pcm = match Pcm::open() {
+    let pcm = match Pcm::open_params(UI_PERIOD, UI_PERIODS, 0) {
         Ok(p) => {
             log.push(format!(
                 "pcmC0D0p open: ok (period {} buffer {} frames @ {RATE} Hz S16_LE stereo)",
@@ -856,9 +935,9 @@ pub fn selftest() -> (bool, Vec<String>) {
             return (false, log);
         }
     };
-    match pcm.play(&startup_tone()) {
+    match pcm.play_explicit(&startup_tone()) {
         Ok(()) => {
-            log.push("startup tone: played (writei+drain ok)".into());
+            log.push("startup tone: played (prime + explicit START + drain ok)".into());
             (true, log)
         }
         Err(e) => {
@@ -872,18 +951,18 @@ pub fn selftest() -> (bool, Vec<String>) {
 
 fn diag_play(emit: &mut dyn FnMut(&str), pcm: &Pcm, label: &str, buf: &[i16]) {
     let frames = buf.len() / CHANNELS as usize;
-    match pcm.play(buf) {
+    match pcm.play_explicit(buf) {
         Ok(()) => emit(&format!(
-            "{label}: wrote {frames} frames ({} bytes), writei+drain ok",
+            "{label}: wrote {frames} frames ({} bytes), explicit-START+drain ok",
             frames * CHANNELS as usize * 2
         )),
         Err(e) => emit(&format!("{label}: PLAY FAIL: {e}{}", errno_suffix(&e))),
     }
 }
 
-/// Sets a route's controls and reads each back, reporting written-vs-stuck values.
-fn diag_route(emit: &mut dyn FnMut(&str), mixer: &Mixer, headset: bool) {
-    for (name, val) in route_controls(headset) {
+/// Applies `controls` on the mixer and reads each back, reporting written-vs-stuck values.
+fn diag_apply(emit: &mut dyn FnMut(&str), mixer: &Mixer, controls: &[(&'static str, i32)]) {
+    for &(name, val) in controls {
         let w = mixer.set(name, val);
         let rb = mixer.get(name);
         match (w, rb) {
@@ -954,6 +1033,11 @@ pub fn diag(emit: &mut dyn FnMut(&str)) {
         Err(e) => emit(&format!("mixer control list: FAIL: {e}")),
     }
 
+    // --- ROUTE 1: bone conduction (EP) ---
+    // Prime the route BEFORE opening the front-end (route-first) so the McPDM back-end is
+    // linked at open and the codec clocks from cold (the hardware-confirmed order).
+    emit("---- ROUTE 1: BONE CONDUCTION (TWL6040 Earphone / EP) ----");
+    diag_apply(emit, &mixer, &prime_controls(false));
     // c. open the playback PCM once (reused for both routes)
     let pcm = match Pcm::open_diag(emit) {
         Ok(p) => p,
@@ -962,10 +1046,6 @@ pub fn diag(emit: &mut dyn FnMut(&str)) {
             return;
         }
     };
-
-    // --- ROUTE 1: bone conduction (EP) ---
-    emit("---- ROUTE 1: BONE CONDUCTION (TWL6040 Earphone / EP) ----");
-    diag_route(emit, &mixer, false);
     emit("playing a clear 1 kHz tone (1.5 s) on BONE CONDUCTION ...");
     diag_play(emit, &pcm, "EP tone", &tone(1000.0, 1500.0, 0.25));
     sl(500);
@@ -988,7 +1068,7 @@ pub fn diag(emit: &mut dyn FnMut(&str)) {
 
     // --- ROUTE 2: USB earbud / headset ---
     emit("---- ROUTE 2: AURICOLARE/USB -- ATTACCA L'AURICOLARE SE VUOI ----");
-    diag_route(emit, &mixer, true);
+    diag_apply(emit, &mixer, &prime_controls(true));
     emit("playing a clear 1 kHz tone (1.5 s) on HEADSET ...");
     diag_play(emit, &pcm, "HS tone", &tone(1000.0, 1500.0, 0.25));
     sl(500);
@@ -1051,7 +1131,7 @@ fn run_variant(emit: &mut dyn FnMut(&str), mixer: &Mixer, v: &Variant) {
                 Err(e) => emit(&format!("  pre: {name} = {val}: FAIL: {e}")),
             }
         }
-        diag_route(emit, mixer, false); // EP / bone-conduction route
+        diag_apply(emit, mixer, &route_controls(false)); // EP / bone-conduction route
     };
 
     if v.route_first {
