@@ -46,7 +46,12 @@ usage:
   --renderer R    gles (GPU, the default) or software (debugging aid). On the device a
                   failing EGL is an error; on a host without EGL the default is software
   --setup         start with the first-boot setup flow (mock platform: Bluetooth is
-                  simulated; with --glassd the phone step follows glassd's companion)";
+                  simulated; with --glassd the phone step follows glassd's companion)
+  --no-sound      do not play UI audio feedback (sound-enabled device builds only)
+  --audio-selftest
+                  set the TWL6040 bone-conduction (Earphone/EP) mixer route and play a
+                  startup test tone on ALSA card 0, log each step, then exit (device
+                  builds with the `sound` feature)";
 
 #[derive(Default)]
 struct Args {
@@ -63,6 +68,10 @@ struct Args {
     /// `--display fb [DEV]`: the framebuffer device to present to.
     fb: Option<PathBuf>,
     setup: bool,
+    /// `--no-sound`: do not install the UI audio feedback player (sound builds only).
+    no_sound: bool,
+    /// `--audio-selftest`: set the bone-conduction mixer, play a startup tone, log, exit.
+    audio_selftest: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -90,6 +99,8 @@ fn parse_args() -> Result<Args, String> {
         match arg.as_str() {
             "--headless" => a.headless = true,
             "--setup" => a.setup = true,
+            "--no-sound" => a.no_sound = true,
+            "--audio-selftest" => a.audio_selftest = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -244,12 +255,59 @@ fn run_window(_: &Args) -> Result<(), String> {
     )
 }
 
+/// Installs the on-device ALSA UI-sound player on `app` (bone-conduction / EP output),
+/// unless `--no-sound` was given. A no-op in builds without the `sound` feature. Logs
+/// what it did to stderr (the init captures it as `OMGB-launcher:` / `OMGB-AUDIO:`).
+fn install_feedback(app: &mut App, args: &Args) {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        if args.no_sound {
+            eprintln!("glass-launcher: sound disabled (--no-sound)");
+            return;
+        }
+        let (player, report) = glass_launcher::audio::AlsaFeedback::start();
+        for line in &report {
+            eprintln!("OMGB-AUDIO: {line}");
+        }
+        match player {
+            Some(p) => app.set_feedback(Box::new(p)),
+            None => eprintln!("OMGB-AUDIO: UI sound unavailable; continuing silently"),
+        }
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        // Reference the sound-only field so non-sound builds have no "never read" warning.
+        let _ = (app, args.no_sound);
+    }
+}
+
+/// `--audio-selftest`: set the EP mixer route and play a startup tone, logging each step.
+fn run_audio_selftest() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        let (ok, log) = glass_launcher::audio::selftest();
+        for line in &log {
+            eprintln!("OMGB-AUDIO: {line}");
+        }
+        if ok {
+            Ok(())
+        } else {
+            Err("audio self-test failed (see OMGB-AUDIO lines)".into())
+        }
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
 fn run_glassd(args: &Args) -> Result<(), String> {
     let path = glassd::socket(args.glassd.clone().flatten());
     let clock = clock_for(args);
     let ctx = clock(0.0);
     let compositor = compositor_for(args.renderer)?;
     let mut app = App::with_compositor(demo::timeline_at(ctx.now_s), ctx, compositor);
+    install_feedback(&mut app, args);
     if args.setup {
         app.start_setup(None);
     }
@@ -356,7 +414,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.glassd.is_some() {
+    let result = if args.audio_selftest {
+        run_audio_selftest()
+    } else if args.glassd.is_some() {
         run_glassd(&args)
     } else if args.headless {
         run_headless(&args)

@@ -15,6 +15,9 @@ window = ["glass-gfx/window"]
 gles = ["dep:glass-gfx-gles"]
 # Present software frames to the Linux framebuffer (on-device, no GPU: Model B).
 fb = ["glass-gfx/fb"]
+# UI audio feedback on the device: play short clicks on the TWL6040 bone-conduction
+# (Earphone/EP) output through ALSA directly (Model B). No effect on host/CI builds.
+sound = []
 
 [dependencies]
 glass-gfx.workspace = true

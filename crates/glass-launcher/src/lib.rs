@@ -10,16 +10,23 @@
 pub mod clock;
 pub mod demo;
 pub mod dictation;
+pub mod feedback;
 pub mod glassd;
 pub mod panel;
 pub mod script;
 pub mod setup;
+
+/// The on-device ALSA sound player (bone-conduction UI feedback). Only on Linux with the
+/// `sound` feature; desktop, headless and CI builds use the silent default player.
+#[cfg(all(feature = "sound", target_os = "linux"))]
+pub mod audio;
 
 pub mod platform;
 pub mod renderer;
 pub mod settings;
 
 use dictation::{Dictation, DictationOut, NOTE_CARD};
+use feedback::{Cue, Feedback, Silent};
 use glass_api::proto::{DictationState, ErrorCode, Settings, Transcript};
 use glass_gfx::{Color, Compositor, Display, Frame, GfxError, SoftwareCompositor};
 use glass_ui::i18n::{Locale, Msg};
@@ -107,6 +114,11 @@ pub struct App {
     locale_set: bool,
     next_request: u32,
     next_note: CardId,
+    /// Plays UI sounds on navigation (silent by default; the on-device caller installs
+    /// the ALSA player with [`App::set_feedback`]).
+    feedback: Box<dyn Feedback>,
+    /// The centred card last seen, to tick only when it actually changes.
+    last_index: usize,
 }
 
 impl App {
@@ -123,6 +135,7 @@ impl App {
     ) -> App {
         ctx.locale = Locale::DEFAULT;
         timeline.set_context(ctx);
+        let last_index = timeline.current_index();
         let mut app = App {
             timeline,
             compositor,
@@ -143,6 +156,8 @@ impl App {
             locale_set: false,
             next_request: 1,
             next_note: FIRST_NOTE_ID,
+            feedback: Box::new(Silent),
+            last_index,
         };
         app.refresh_settings_cards();
         app
@@ -189,6 +204,23 @@ impl App {
         let locale = self.locale;
         if let Some(Overlay::Dictation(d, panel)) = self.overlay.as_mut() {
             panel.set(d.card(locale, now));
+        }
+    }
+
+    /// Installs the UI-sound player (the on-device ALSA player). Without this, navigation
+    /// is silent.
+    pub fn set_feedback(&mut self, feedback: Box<dyn Feedback>) {
+        self.feedback = feedback;
+        self.last_index = self.timeline.current_index();
+    }
+
+    /// Plays a soft tick if the centred card changed since the last check (a swipe that
+    /// moves the timeline, or a drag that crosses into another card).
+    fn tick_on_card_change(&mut self) {
+        let now = self.timeline.current_index();
+        if now != self.last_index {
+            self.last_index = now;
+            self.feedback.play(Cue::CardChange);
         }
     }
 
@@ -608,6 +640,13 @@ impl App {
     }
 
     fn apply(&mut self, choice: Choice) {
+        // Feedback for the chosen item: a distinct tick for a radio toggle, else a
+        // confirm blip.
+        match &choice {
+            Choice::Wifi(true) | Choice::Bluetooth(true) => self.feedback.play(Cue::ToggleOn),
+            Choice::Wifi(false) | Choice::Bluetooth(false) => self.feedback.play(Cue::ToggleOff),
+            _ => self.feedback.play(Cue::Select),
+        }
         match choice {
             Choice::Patch(p) => {
                 self.log.push(format!("settings: {p:?}"));
@@ -642,29 +681,52 @@ impl App {
     }
 
     fn overlay_input(&mut self, event: &InputEvent) {
-        let choice = match self.overlay.as_mut() {
-            Some(Overlay::Menu(m, _)) => match m.handle(event) {
-                None => return,
-                Some(Outcome::Closed) => None,
-                Some(Outcome::Selected(c)) => Some(c),
-            },
+        // The overlay's reaction, decided while it is borrowed so the feedback (a
+        // separate field) is played after the borrow ends. `OpenStill` keeps the overlay
+        // open; `Close`/`Selected` close it.
+        enum React {
+            /// The overlay stays open; `.0` is true when a menu item was highlighted anew.
+            OpenStill(bool),
+            Close,
+            Selected(Choice),
+            /// Already handled (dictation), nothing more to do.
+            Done,
+        }
+        let react = match self.overlay.as_mut() {
+            Some(Overlay::Menu(m, _)) => {
+                let before = m.index();
+                match m.handle(event) {
+                    None => React::OpenStill(m.index() != before),
+                    Some(Outcome::Closed) => React::Close,
+                    Some(Outcome::Selected(c)) => React::Selected(c),
+                }
+            }
             Some(Overlay::Dictation(..)) => {
                 self.with_dictation(|d| d.input(event));
-                return;
+                React::Done
             }
             Some(Overlay::Adjust(a)) => match a.handle(event) {
-                None => return,
-                Some(Outcome::Closed) => None,
-                Some(Outcome::Selected(v)) => Some(Choice::Patch(Settings {
+                None => React::OpenStill(false),
+                Some(Outcome::Closed) => React::Close,
+                Some(Outcome::Selected(v)) => React::Selected(Choice::Patch(Settings {
                     head_wake_angle_deg: Some(v),
                     ..Default::default()
                 })),
             },
-            None => return,
+            None => React::Done,
         };
-        self.close_overlay();
-        if let Some(c) = choice {
-            self.apply(c);
+        match react {
+            React::Done => {}
+            React::OpenStill(moved) => {
+                if moved {
+                    self.feedback.play(Cue::MenuMove);
+                }
+            }
+            React::Close => self.close_overlay(),
+            React::Selected(c) => {
+                self.close_overlay();
+                self.apply(c);
+            }
         }
     }
 
@@ -807,6 +869,12 @@ impl App {
             return None;
         }
         let action = self.timeline.handle(event);
+        // A tap on a card (whether or not it has a menu): a confirm blip.
+        if let Some(Action::OpenMenu(_)) = action {
+            self.feedback.play(Cue::Select);
+        }
+        // A swipe that moved the timeline to another card: a soft tick.
+        self.tick_on_card_change();
         if action == Some(Action::OpenMenu(NOTE_CARD)) && self.dictation_offered() {
             self.start_dictation();
             return action;
@@ -826,6 +894,10 @@ impl App {
         self.ctx = ctx;
         self.timeline.set_context(ctx);
         self.timeline.tick(dt);
+        // A drag crossing into another card (no discrete event) still ticks.
+        if self.overlay.is_none() {
+            self.tick_on_card_change();
+        }
         match &mut self.overlay {
             Some(Overlay::Menu(m, _)) => m.tick(dt),
             Some(Overlay::Adjust(a)) => a.set_context(ctx),
