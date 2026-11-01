@@ -80,6 +80,9 @@ struct Args {
     /// `--audio-diag`: verbose on-screen audio diagnostic (dump cards/mixer, read-back,
     /// PCM open, 1 kHz tone, EP + headset volume sweeps), log each step, exit.
     audio_diag: bool,
+    /// `--audio-diag2`: back-end bring-up experiment (several ordering/period/start/power
+    /// variants on the EP path), log each with timing, exit.
+    audio_diag2: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -110,6 +113,7 @@ fn parse_args() -> Result<Args, String> {
             "--no-sound" => a.no_sound = true,
             "--audio-selftest" => a.audio_selftest = true,
             "--audio-diag" => a.audio_diag = true,
+            "--audio-diag2" => a.audio_diag2 = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -329,6 +333,24 @@ fn run_audio_diag() -> Result<(), String> {
     }
 }
 
+/// `--audio-diag2`: the back-end bring-up experiment (several variants).
+fn run_audio_diag2() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::diag2(&mut |line: &str| {
+            let mut err = std::io::stderr();
+            let _ = writeln!(err, "OMGB-AUDIO: {line}");
+            let _ = err.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
 fn run_glassd(args: &Args) -> Result<(), String> {
     let path = glassd::socket(args.glassd.clone().flatten());
     let clock = clock_for(args);
@@ -442,7 +464,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.audio_diag {
+    let result = if args.audio_diag2 {
+        run_audio_diag2()
+    } else if args.audio_diag {
         run_audio_diag()
     } else if args.audio_selftest {
         run_audio_selftest()

@@ -56,6 +56,7 @@ const SNDRV_PCM_IOCTL_HW_PARAMS: libc::c_ulong =
 const SNDRV_PCM_IOCTL_SW_PARAMS: libc::c_ulong =
     ioc(IOC_READ | IOC_WRITE, A, 0x13, SIZEOF_SW_PARAMS);
 const SNDRV_PCM_IOCTL_PREPARE: libc::c_ulong = ioc(IOC_NONE, A, 0x40, 0);
+const SNDRV_PCM_IOCTL_START: libc::c_ulong = ioc(IOC_NONE, A, 0x42, 0);
 const SNDRV_PCM_IOCTL_DRAIN: libc::c_ulong = ioc(IOC_NONE, A, 0x44, 0);
 const SNDRV_PCM_IOCTL_DROP: libc::c_ulong = ioc(IOC_NONE, A, 0x43, 0);
 const SNDRV_PCM_IOCTL_WRITEI_FRAMES: libc::c_ulong = ioc(IOC_WRITE, A, 0x50, 12);
@@ -408,6 +409,58 @@ impl Pcm {
             .map_err(|e| Error::new(e.kind(), format!("DRAIN: {e}")))?;
         Ok(())
     }
+
+    /// Opens device 0 with an explicit period/count and start threshold (frames). Used by
+    /// the diagnostic to compare parameter sets. Leaves the stream PREPARED.
+    pub fn open_params(period: u32, periods: u32, start_threshold: u32) -> io::Result<Pcm> {
+        let fd = open_snd(&format!("pcmC{CARD}D{DEVICE}p"))?;
+        let (period_size, buffer_size) = set_hw_params(&fd, period, periods)?;
+        let st = if start_threshold == 0 {
+            buffer_size
+        } else {
+            start_threshold.min(buffer_size)
+        };
+        set_sw_params_st(&fd, period_size, buffer_size, st)?;
+        ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("PREPARE: {e}")))?;
+        Ok(Pcm {
+            fd,
+            period_size,
+            buffer_size,
+        })
+    }
+
+    pub fn prepare(&self) -> io::Result<()> {
+        ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("PREPARE: {e}")))
+    }
+
+    pub fn start(&self) -> io::Result<()> {
+        ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_START, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("START: {e}")))
+    }
+
+    pub fn drain(&self) -> io::Result<()> {
+        ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_DRAIN, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("DRAIN: {e}")))
+    }
+
+    /// One blocking interleaved write of `samples` (S16 stereo). Returns frames accepted.
+    pub fn writei(&self, samples: &[i16]) -> io::Result<usize> {
+        let frames = (samples.len() / CHANNELS as usize) as libc::c_ulong;
+        let mut x = Xferi {
+            result: 0,
+            buf: samples.as_ptr() as *const libc::c_void,
+            frames,
+        };
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_PCM_IOCTL_WRITEI_FRAMES,
+            &mut x as *mut _ as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("WRITEI: {e}")))?;
+        Ok(x.result as usize)
+    }
 }
 
 impl Drop for Pcm {
@@ -459,6 +512,15 @@ fn set_hw_params(fd: &Fd, period_size: u32, periods: u32) -> io::Result<(u32, u3
 }
 
 fn set_sw_params(fd: &Fd, period_size: u32, buffer_size: u32) -> io::Result<()> {
+    set_sw_params_st(fd, period_size, buffer_size, 1)
+}
+
+fn set_sw_params_st(
+    fd: &Fd,
+    period_size: u32,
+    buffer_size: u32,
+    start_threshold: u32,
+) -> io::Result<()> {
     // 26 u32 words = 104 bytes.
     let mut w = [0u32; SIZEOF_SW_PARAMS / 4];
     // boundary: largest multiple of buffer_size below 2^31.
@@ -472,7 +534,7 @@ fn set_sw_params(fd: &Fd, period_size: u32, buffer_size: u32) -> io::Result<()> 
     w[2] = 0; // sleep_min
     w[3] = period_size; // avail_min
     w[4] = 1; // xfer_align (obsolete)
-    w[5] = 1; // start_threshold (start as soon as any frames are queued)
+    w[5] = start_threshold.max(1); // start_threshold
     w[6] = buffer_size; // stop_threshold
     w[7] = 0; // silence_threshold
     w[8] = 0; // silence_size
@@ -953,4 +1015,205 @@ pub fn diag(emit: &mut dyn FnMut(&str)) {
         pcm.period_size, pcm.buffer_size
     ));
     emit("================ END OF DIAGNOSTIC PASS ================");
+}
+
+// ---- diag2: find the missing back-end (McPDM/TWL6040) bring-up ----------------------
+
+/// How a variant orders mixer-route vs PCM-open, and how it starts the stream.
+struct Variant {
+    label: &'static str,
+    /// Set the DAPM route/mixers BEFORE opening the PCM (true) or AFTER (false, the old
+    /// broken order).
+    route_first: bool,
+    /// Extra controls to apply before opening (codec power / PLL), name→value.
+    extra: &'static [(&'static str, i32)],
+    period: u32,
+    periods: u32,
+    /// Fill one period, issue SNDRV_PCM_IOCTL_START, then write the rest (true); else rely
+    /// on the start threshold to auto-start on the first write (false).
+    explicit_start: bool,
+}
+
+/// Runs one playback variant on the bone-conduction (EP) route and reports the result +
+/// elapsed time (a fast ~1 s = the DMA drained = SOUND; a ~19 s stall + EIO = back-end
+/// never clocked). Each variant is fully self-contained (own mixer route + PCM open).
+fn run_variant(emit: &mut dyn FnMut(&str), mixer: &Mixer, v: &Variant) {
+    use std::time::Instant;
+    emit(&format!("######## VARIANT {} ########", v.label));
+
+    let apply_controls = |emit: &mut dyn FnMut(&str)| {
+        for (name, val) in v.extra {
+            match mixer.set(name, *val) {
+                Ok(()) => {
+                    let rb = mixer.get(name).ok();
+                    emit(&format!("  pre: {name} = {val} (readback {rb:?})"));
+                }
+                Err(e) => emit(&format!("  pre: {name} = {val}: FAIL: {e}")),
+            }
+        }
+        diag_route(emit, mixer, false); // EP / bone-conduction route
+    };
+
+    if v.route_first {
+        apply_controls(emit);
+    }
+    let pcm = match Pcm::open_params(v.period, v.periods, if v.explicit_start { 0 } else { 1 }) {
+        Ok(p) => {
+            emit(&format!(
+                "  open ok: period {} buffer {} (requested {}/{})",
+                p.period_size, p.buffer_size, v.period, v.periods
+            ));
+            p
+        }
+        Err(e) => {
+            emit(&format!("  open FAIL: {e}{}", errno_suffix(&e)));
+            return;
+        }
+    };
+    if !v.route_first {
+        apply_controls(emit);
+    }
+
+    // ~0.8 s 1 kHz tone, interleaved stereo.
+    let buf = tone(1000.0, 800.0, 0.3);
+    let total = buf.len() / CHANNELS as usize;
+    let t0 = Instant::now();
+    let result: io::Result<()> = (|| {
+        if v.explicit_start {
+            // Fill one period, start, then write the remainder.
+            let one = (pcm.period_size as usize).min(total);
+            pcm.prepare()?;
+            pcm.writei(&buf[..one * CHANNELS as usize])?;
+            pcm.start()?;
+            if one < total {
+                pcm.writei(&buf[one * CHANNELS as usize..])?;
+            }
+        } else {
+            pcm.prepare()?;
+            pcm.writei(&buf)?; // auto-starts at the threshold
+        }
+        pcm.drain()
+    })();
+    let ms = t0.elapsed().as_millis();
+    match result {
+        Ok(()) => emit(&format!(
+            "  >>> PLAY OK in {ms} ms ({total} frames) -- SE SENTI UN TONO, QUESTA VARIANTE FUNZIONA ({})",
+            v.label
+        )),
+        Err(e) => emit(&format!(
+            "  >>> PLAY FAIL in {ms} ms: {e}{}",
+            errno_suffix(&e)
+        )),
+    }
+    // pcm dropped here (DROP ioctl) before the next variant.
+}
+
+/// Back-end bring-up experiment: try several orderings / periods / start methods / codec
+/// power-mode presets on the bone-conduction (EP) path, one per boot pass, so the log (and
+/// the ear) tell us which makes the DMA actually drain. Steps between variants with a gap.
+pub fn diag2(emit: &mut dyn FnMut(&str)) {
+    use std::time::Duration;
+    let sl = |ms: u64| std::thread::sleep(Duration::from_millis(ms));
+
+    emit("============ OMGB AUDIO DIAG2 (back-end bring-up) ============");
+    match fs::read_to_string("/proc/asound/cards") {
+        Ok(s) => {
+            for line in s.lines() {
+                emit(&format!("asound: {line}"));
+            }
+        }
+        Err(e) => emit(&format!("/proc/asound/cards: {e}")),
+    }
+    let mixer = match Mixer::open() {
+        Ok(m) => {
+            emit("controlC0 open: ok");
+            m
+        }
+        Err(e) => {
+            emit(&format!("controlC0 open FAIL: {e} -- abort"));
+            return;
+        }
+    };
+
+    // Codec power/PLL presets to try (enum item indices: 0=Low-Power, 1=High-Performance).
+    const HP: &[(&str, i32)] = &[
+        ("PLL Selection", 1),
+        ("TWL6040 Power Mode", 1),
+        ("Headset Power Mode", 1),
+    ];
+    // Full stock mixer table extras (spec 4.2), in case a widget is missing from the path.
+    const STOCK: &[(&str, i32)] = &[
+        ("PLL Selection", 1),
+        ("TWL6040 Power Mode", 1),
+        ("Headset Power Mode", 1),
+        ("DL1 Mono Mixer", 0),
+        ("Sidetone Mixer Playback", 1),
+        ("DL1 Mixer Voice", 0),
+    ];
+
+    let variants = [
+        // V0: the OLD (broken) order — route set AFTER opening the FE. Control case.
+        Variant {
+            label: "V0 old-order (route AFTER open), 14784/2, autostart",
+            route_first: false,
+            extra: &[],
+            period: 14784,
+            periods: 2,
+            explicit_start: false,
+        },
+        // V1: route FIRST, small non-mmap period (spec 7 recommendation), autostart.
+        Variant {
+            label: "V1 route-FIRST, 1056/4, autostart",
+            route_first: true,
+            extra: &[],
+            period: 1056,
+            periods: 4,
+            explicit_start: false,
+        },
+        // V2: route FIRST, small period, explicit PREPARE+START after one period.
+        Variant {
+            label: "V2 route-FIRST, 1056/4, explicit START",
+            route_first: true,
+            extra: &[],
+            period: 1056,
+            periods: 4,
+            explicit_start: true,
+        },
+        // V3: route FIRST, ABE period, explicit START.
+        Variant {
+            label: "V3 route-FIRST, 14784/2, explicit START",
+            route_first: true,
+            extra: &[],
+            period: 14784,
+            periods: 2,
+            explicit_start: true,
+        },
+        // V4: route FIRST + codec HP power/PLL preset, small period, explicit START.
+        Variant {
+            label: "V4 route-FIRST + PLL/PowerMode HP, 1056/4, explicit START",
+            route_first: true,
+            extra: HP,
+            period: 1056,
+            periods: 4,
+            explicit_start: true,
+        },
+        // V5: route FIRST + full stock mixer table + HP, small period, explicit START.
+        Variant {
+            label: "V5 route-FIRST + stock table + HP, 1056/4, explicit START",
+            route_first: true,
+            extra: STOCK,
+            period: 1056,
+            periods: 4,
+            explicit_start: true,
+        },
+    ];
+
+    for v in &variants {
+        run_variant(emit, &mixer, v);
+        sl(1200); // gap so a working tone is clearly separated from the next
+    }
+
+    emit("DIAG2 SUMMARY: read which VARIANT shows 'PLAY OK' in ~1 s (and you heard a tone).");
+    emit("A ~19 s stall + 'PLAY FAIL ... EIO' = that variant's back-end still did not clock.");
+    emit("================ END OF DIAG2 PASS ================");
 }
