@@ -61,6 +61,11 @@ const SNDRV_PCM_IOCTL_DROP: libc::c_ulong = ioc(IOC_NONE, A, 0x43, 0);
 const SNDRV_PCM_IOCTL_WRITEI_FRAMES: libc::c_ulong = ioc(IOC_WRITE, A, 0x50, 12);
 const SNDRV_CTL_IOCTL_ELEM_WRITE: libc::c_ulong =
     ioc(IOC_READ | IOC_WRITE, U, 0x13, SIZEOF_CTL_ELEM_VALUE);
+const SNDRV_CTL_IOCTL_ELEM_READ: libc::c_ulong =
+    ioc(IOC_READ | IOC_WRITE, U, 0x12, SIZEOF_CTL_ELEM_VALUE);
+const SIZEOF_CTL_ELEM_LIST: usize = 72;
+const SNDRV_CTL_IOCTL_ELEM_LIST: libc::c_ulong =
+    ioc(IOC_READ | IOC_WRITE, U, 0x10, SIZEOF_CTL_ELEM_LIST);
 
 // hw_params layout (byte offsets inside the 604-byte struct).
 const HWP_MASK0: usize = 4; // masks[0] (ACCESS); each snd_mask is 32 bytes.
@@ -94,6 +99,14 @@ impl Drop for Fd {
 
 fn errno() -> i32 {
     Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// " (errno N)" when the error carries an OS errno, else "".
+fn errno_suffix(e: &Error) -> String {
+    match e.raw_os_error() {
+        Some(n) => format!(" (errno {n})"),
+        None => String::new(),
+    }
 }
 
 /// Opens `/dev/snd/<name>`, creating the node from `/sys/class/sound/<name>/dev` if the
@@ -187,6 +200,63 @@ impl Mixer {
         )
         .map_err(|e| Error::new(e.kind(), format!("set {name:?}={value}: {e}")))
     }
+
+    /// Reads an integer/boolean control by name; returns its first two values.
+    pub fn get(&self, name: &str) -> io::Result<[i32; 2]> {
+        if name.len() >= 44 {
+            return Err(Error::new(ErrorKind::InvalidInput, "control name too long"));
+        }
+        let mut buf = [0u8; SIZEOF_CTL_ELEM_VALUE];
+        put_u32(&mut buf, 4, SNDRV_CTL_ELEM_IFACE_MIXER);
+        buf[16..16 + name.len()].copy_from_slice(name.as_bytes());
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_CTL_IOCTL_ELEM_READ,
+            buf.as_mut_ptr() as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("get {name:?}: {e}")))?;
+        Ok([get_i32(&buf, 72), get_i32(&buf, 76)])
+    }
+
+    /// Lists every control on the card: (numid, iface, name). For diagnosis — so we see
+    /// the exact control names the driver exposes.
+    pub fn list(&self) -> io::Result<Vec<(u32, u32, String)>> {
+        // First pass: ask for the count (space = 0).
+        let mut hdr = [0u8; SIZEOF_CTL_ELEM_LIST];
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_CTL_IOCTL_ELEM_LIST,
+            hdr.as_mut_ptr() as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("ELEM_LIST count: {e}")))?;
+        let count = get_u32(&hdr, 12) as usize; // field `count`
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        // Second pass: give it an array of `count` snd_ctl_elem_id (64 bytes each).
+        let mut ids = vec![0u8; count * 64];
+        put_u32(&mut hdr, 0, 0); // offset = 0
+        put_u32(&mut hdr, 4, count as u32); // space = count
+        put_u32(&mut hdr, 16, ids.as_mut_ptr() as u32); // pids pointer (32-bit)
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_CTL_IOCTL_ELEM_LIST,
+            hdr.as_mut_ptr() as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("ELEM_LIST fetch: {e}")))?;
+        let used = get_u32(&hdr, 8) as usize; // field `used`
+        let mut out = Vec::with_capacity(used);
+        for i in 0..used {
+            let base = i * 64;
+            let numid = get_u32(&ids, base);
+            let iface = get_u32(&ids, base + 4);
+            let name_bytes = &ids[base + 16..base + 60];
+            let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(44);
+            let name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
+            out.push((numid, iface, name));
+        }
+        Ok(out)
+    }
 }
 
 /// The mixer controls for a route, in the order the stock HAL applies them.
@@ -257,7 +327,23 @@ pub struct Pcm {
 impl Pcm {
     /// Opens card 0 device 0 for playback, S16_LE / 48 kHz / stereo, and configures it.
     pub fn open() -> io::Result<Pcm> {
-        let fd = open_snd(&format!("pcmC{CARD}D{DEVICE}p"))?;
+        Self::open_inner(&mut |_| {})
+    }
+
+    /// As [`Pcm::open`], but reports each hw_params attempt (which period/count set
+    /// succeeded or the errno/stage of each failure) through `emit` — for the diagnostic.
+    pub fn open_diag(emit: &mut dyn FnMut(&str)) -> io::Result<Pcm> {
+        Self::open_inner(emit)
+    }
+
+    fn open_inner(emit: &mut dyn FnMut(&str)) -> io::Result<Pcm> {
+        let fd = match open_snd(&format!("pcmC{CARD}D{DEVICE}p")) {
+            Ok(fd) => fd,
+            Err(e) => {
+                emit(&format!("pcmC{CARD}D{DEVICE}p open: FAIL: {e}"));
+                return Err(e);
+            }
+        };
         // Try the ABE period from the spec first, then smaller/unconstrained fall-backs.
         let attempts: [(u32, u32); 4] = [(14784, 2), (1920, 4), (1024, 4), (0, 0)];
         let mut last = Error::other("no attempt");
@@ -267,13 +353,22 @@ impl Pcm {
                     set_sw_params(&fd, period_size, buffer_size)?;
                     ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())
                         .map_err(|e| Error::new(e.kind(), format!("PREPARE: {e}")))?;
+                    emit(&format!(
+                        "HW_PARAMS ok: requested period {ps}/{pc} -> period {period_size} buffer {buffer_size} frames @ {RATE} Hz S16_LE stereo"
+                    ));
                     return Ok(Pcm {
                         fd,
                         period_size,
                         buffer_size,
                     });
                 }
-                Err(e) => last = Error::new(e.kind(), format!("HW_PARAMS (period {ps}/{pc}): {e}")),
+                Err(e) => {
+                    emit(&format!(
+                        "HW_PARAMS period {ps}/{pc}: FAIL: {e}{}",
+                        errno_suffix(&e)
+                    ));
+                    last = Error::new(e.kind(), format!("HW_PARAMS (period {ps}/{pc}): {e}"));
+                }
             }
         }
         Err(last)
@@ -413,6 +508,9 @@ fn put_i32(buf: &mut [u8], off: usize, v: i32) {
 fn get_u32(buf: &[u8], off: usize) -> u32 {
     u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
 }
+fn get_i32(buf: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
 
 // ---- sound synthesis ---------------------------------------------------------------
 
@@ -538,6 +636,30 @@ impl Default for Clips {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A clear, sustained single-frequency tone: `freq` Hz for `ms` milliseconds at `peak`
+/// (0..1 of full scale), with short linear attack/release so it is unmistakable but does
+/// not click. Interleaved S16 stereo (same on both channels). For the diagnostic sweep.
+pub fn tone(freq: f32, ms: f32, peak: f32) -> Vec<i16> {
+    let total = (ms * RATE as f32 / 1000.0) as usize;
+    let edge = (RATE as f32 * 0.008) as usize; // 8 ms attack / release
+    let mut out = Vec::with_capacity(total * 2);
+    let mut phase = 0.0f32;
+    for n in 0..total {
+        phase += 2.0 * std::f32::consts::PI * freq / RATE as f32;
+        let env = if n < edge {
+            n as f32 / edge as f32
+        } else if n >= total - edge {
+            (total - n) as f32 / edge as f32
+        } else {
+            1.0
+        };
+        let s = (phase.sin() * env * peak * 32767.0) as i16;
+        out.push(s);
+        out.push(s);
+    }
+    out
 }
 
 /// A clear startup test tone (two notes), for the init's audio self-test.
@@ -682,4 +804,153 @@ pub fn selftest() -> (bool, Vec<String>) {
             (false, log)
         }
     }
+}
+
+// ---- verbose on-screen diagnostic (for the fbcon diag image) -----------------------
+
+fn diag_play(emit: &mut dyn FnMut(&str), pcm: &Pcm, label: &str, buf: &[i16]) {
+    let frames = buf.len() / CHANNELS as usize;
+    match pcm.play(buf) {
+        Ok(()) => emit(&format!(
+            "{label}: wrote {frames} frames ({} bytes), writei+drain ok",
+            frames * CHANNELS as usize * 2
+        )),
+        Err(e) => emit(&format!("{label}: PLAY FAIL: {e}{}", errno_suffix(&e))),
+    }
+}
+
+/// Sets a route's controls and reads each back, reporting written-vs-stuck values.
+fn diag_route(emit: &mut dyn FnMut(&str), mixer: &Mixer, headset: bool) {
+    for (name, val) in route_controls(headset) {
+        let w = mixer.set(name, val);
+        let rb = mixer.get(name);
+        match (w, rb) {
+            (Ok(()), Ok(v)) => emit(&format!("  set {name} = {val}; readback = {v:?}")),
+            (Ok(()), Err(e)) => emit(&format!("  set {name} = {val}; readback FAIL: {e}")),
+            (Err(e), _) => emit(&format!(
+                "  set {name} = {val}: FAIL: {e}{}",
+                errno_suffix(&e)
+            )),
+        }
+    }
+}
+
+/// One full verbose audio diagnostic pass, emitting each line through `emit` as it goes
+/// (so the init can show it on the framebuffer console in real time) and sleeping between
+/// tones so a human can read and listen. Steps a–g from the diagnosis request:
+/// dump cards + /dev/snd + the mixer control list; set the bone-conduction (EP) route and
+/// read it back; open the PCM (ABE period first, then fall-backs); play a clear 1 kHz
+/// tone; sweep the Earphone volume; then repeat on the USB-earbud route; finally a summary.
+pub fn diag(emit: &mut dyn FnMut(&str)) {
+    use std::time::Duration;
+    let sl = |ms: u64| std::thread::sleep(Duration::from_millis(ms));
+
+    emit("================ OMGB AUDIO DIAGNOSTIC ================");
+
+    // a. sound card + PCM node inventory
+    match fs::read_to_string("/proc/asound/cards") {
+        Ok(s) => {
+            for line in s.lines() {
+                emit(&format!("asound: {line}"));
+            }
+        }
+        Err(e) => emit(&format!("/proc/asound/cards: {e}")),
+    }
+    match fs::read_dir("/dev/snd") {
+        Ok(rd) => {
+            let mut names: Vec<String> = rd
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect();
+            names.sort();
+            emit(&format!("/dev/snd nodes: {}", names.join(" ")));
+        }
+        Err(e) => emit(&format!("/dev/snd: {e}")),
+    }
+    emit(&format!(
+        "headset (usb_mux) detected: {}",
+        headset_present()
+    ));
+
+    // open the mixer and dump every control (exact names, for diagnosis)
+    let mixer = match Mixer::open() {
+        Ok(m) => {
+            emit("controlC0 (mixer) open: ok");
+            m
+        }
+        Err(e) => {
+            emit(&format!("controlC0 open: FAIL: {e} -- cannot continue"));
+            return;
+        }
+    };
+    match mixer.list() {
+        Ok(ctls) => {
+            emit(&format!("mixer exposes {} controls:", ctls.len()));
+            for (numid, iface, name) in &ctls {
+                emit(&format!("  ctl#{numid} iface{iface} {name:?}"));
+            }
+        }
+        Err(e) => emit(&format!("mixer control list: FAIL: {e}")),
+    }
+
+    // c. open the playback PCM once (reused for both routes)
+    let pcm = match Pcm::open_diag(emit) {
+        Ok(p) => p,
+        Err(e) => {
+            emit(&format!("PCM open FAILED: {e} -- no tones can play"));
+            return;
+        }
+    };
+
+    // --- ROUTE 1: bone conduction (EP) ---
+    emit("---- ROUTE 1: BONE CONDUCTION (TWL6040 Earphone / EP) ----");
+    diag_route(emit, &mixer, false);
+    emit("playing a clear 1 kHz tone (1.5 s) on BONE CONDUCTION ...");
+    diag_play(emit, &pcm, "EP tone", &tone(1000.0, 1500.0, 0.25));
+    sl(500);
+    emit("-- EP VOLUME SWEEP: Earphone Playback Volume stepping to max (15) --");
+    for v in [6, 9, 12, 14, 15] {
+        let w = mixer.set("Earphone Playback Volume", v);
+        let rb = mixer.get("Earphone Playback Volume");
+        emit(&format!(
+            ">>> EP volume = {v} (set {w:?}, readback {rb:?}) -- ASCOLTA ORA (bone)"
+        ));
+        sl(400);
+        diag_play(
+            emit,
+            &pcm,
+            &format!("EP vol {v} tone"),
+            &tone(1000.0, 1000.0, 0.3),
+        );
+        sl(600);
+    }
+
+    // --- ROUTE 2: USB earbud / headset ---
+    emit("---- ROUTE 2: AURICOLARE/USB -- ATTACCA L'AURICOLARE SE VUOI ----");
+    diag_route(emit, &mixer, true);
+    emit("playing a clear 1 kHz tone (1.5 s) on HEADSET ...");
+    diag_play(emit, &pcm, "HS tone", &tone(1000.0, 1500.0, 0.25));
+    sl(500);
+    emit("-- HEADSET VOLUME SWEEP: Headset Playback Volume stepping to max (15) --");
+    for v in [8, 11, 13, 15] {
+        let w = mixer.set("Headset Playback Volume", v);
+        let rb = mixer.get("Headset Playback Volume");
+        emit(&format!(
+            ">>> HS volume = {v} (set {w:?}, readback {rb:?}) -- ASCOLTA ORA (auricolare)"
+        ));
+        sl(400);
+        diag_play(
+            emit,
+            &pcm,
+            &format!("HS vol {v} tone"),
+            &tone(1000.0, 1000.0, 0.3),
+        );
+        sl(600);
+    }
+
+    // g. summary
+    emit(&format!(
+        "SUMMARY: PCM period {} buffer {} @ {RATE} Hz S16_LE stereo; played EP(sweep 6..15) then HEADSET(sweep 8..15). Any 'FAIL'/'errno' line above marks the stage that broke.",
+        pcm.period_size, pcm.buffer_size
+    ));
+    emit("================ END OF DIAGNOSTIC PASS ================");
 }

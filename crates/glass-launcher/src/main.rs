@@ -51,7 +51,12 @@ usage:
   --audio-selftest
                   set the TWL6040 bone-conduction (Earphone/EP) mixer route and play a
                   startup test tone on ALSA card 0, log each step, then exit (device
-                  builds with the `sound` feature)";
+                  builds with the `sound` feature)
+  --audio-diag    verbose on-screen audio diagnostic: dump /proc/asound/cards, /dev/snd
+                  and the mixer control list; set the bone-conduction (EP) route and read
+                  each control back; open the PCM (ABE period, then fall-backs); play a
+                  1 kHz tone; sweep Earphone volume to max; then repeat on the USB-earbud
+                  route; print a summary. Each line prefixed OMGB-AUDIO:. Exits when done";
 
 #[derive(Default)]
 struct Args {
@@ -72,6 +77,9 @@ struct Args {
     no_sound: bool,
     /// `--audio-selftest`: set the bone-conduction mixer, play a startup tone, log, exit.
     audio_selftest: bool,
+    /// `--audio-diag`: verbose on-screen audio diagnostic (dump cards/mixer, read-back,
+    /// PCM open, 1 kHz tone, EP + headset volume sweeps), log each step, exit.
+    audio_diag: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -101,6 +109,7 @@ fn parse_args() -> Result<Args, String> {
             "--setup" => a.setup = true,
             "--no-sound" => a.no_sound = true,
             "--audio-selftest" => a.audio_selftest = true,
+            "--audio-diag" => a.audio_diag = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -301,6 +310,25 @@ fn run_audio_selftest() -> Result<(), String> {
     }
 }
 
+/// `--audio-diag`: verbose on-screen audio diagnostic. Emits each line to stderr with the
+/// `OMGB-AUDIO:` prefix (the diag image's init tees stderr to /dev/console and /dev/kmsg).
+fn run_audio_diag() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::diag(&mut |line: &str| {
+            let mut err = std::io::stderr();
+            let _ = writeln!(err, "OMGB-AUDIO: {line}");
+            let _ = err.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
 fn run_glassd(args: &Args) -> Result<(), String> {
     let path = glassd::socket(args.glassd.clone().flatten());
     let clock = clock_for(args);
@@ -414,7 +442,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.audio_selftest {
+    let result = if args.audio_diag {
+        run_audio_diag()
+    } else if args.audio_selftest {
         run_audio_selftest()
     } else if args.glassd.is_some() {
         run_glassd(&args)
