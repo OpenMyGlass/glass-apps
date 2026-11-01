@@ -35,9 +35,14 @@ usage:
   --glassd [SOCK] take input and the screen state from glassd (glass-services); SOCKET
                   defaults to $GLASS_SERVICES_SOCKET, else the platform's glassd socket.
                   Frames go to --out DIR as PNG files (every changed frame, without a
-                  limit: for short development runs), to a --window, or nowhere (memory).
+                  limit: for short development runs), to a --window, to the Linux
+                  framebuffer (--display fb), or nowhere (memory).
                   --fps is the frame rate while the timeline moves (default 60).
                   Reconnects when glassd restarts
+  --display fb [DEV]
+                  present frames to the Linux framebuffer DEV (default /dev/fb0): mmap,
+                  dirty-rectangle updates, RGBA->panel-format conversion read from the fb.
+                  Needs the `fb` feature (the on-device software build). With --glassd.
   --renderer R    gles (GPU, the default) or software (debugging aid). On the device a
                   failing EGL is an error; on a host without EGL the default is software
   --setup         start with the first-boot setup flow (mock platform: Bluetooth is
@@ -55,6 +60,8 @@ struct Args {
     renderer: Option<Renderer>,
     /// `--glassd`, with the socket if one was given.
     glassd: Option<Option<PathBuf>>,
+    /// `--display fb [DEV]`: the framebuffer device to present to.
+    fb: Option<PathBuf>,
     setup: bool,
 }
 
@@ -65,6 +72,18 @@ fn parse_args() -> Result<Args, String> {
         if arg == "--glassd" {
             let sock = it.next_if(|v| !v.starts_with("--")).map(PathBuf::from);
             a.glassd = Some(sock);
+            continue;
+        }
+        if arg == "--display" {
+            let kind = it.next().ok_or("--display needs a kind (fb)")?;
+            if kind != "fb" {
+                return Err(format!("--display: unknown kind {kind} (only fb)"));
+            }
+            let dev = it
+                .next_if(|v| !v.starts_with("--"))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/dev/fb0"));
+            a.fb = Some(dev);
             continue;
         }
         let mut value = |name: &str| it.next().ok_or(format!("{name} needs a value"));
@@ -95,6 +114,12 @@ fn parse_args() -> Result<Args, String> {
     }
     if a.glassd.is_some() && a.window && a.out.is_some() {
         return Err("--glassd takes --out or --window, not both".into());
+    }
+    if a.fb.is_some() && a.glassd.is_none() {
+        return Err("--display fb needs --glassd".into());
+    }
+    if a.fb.is_some() && (a.window || a.out.is_some()) {
+        return Err("--display fb excludes --out and --window".into());
     }
     if a.headless && a.window {
         return Err("--headless and --window exclude each other".into());
@@ -235,6 +260,31 @@ fn run_glassd(args: &Args) -> Result<(), String> {
     };
     if args.window {
         return glassd_window(&path, &mut app, clock, options);
+    }
+    if args.fb.is_some() {
+        #[cfg(all(feature = "fb", target_os = "linux"))]
+        {
+            let dev = args.fb.clone().unwrap();
+            let mut display =
+                glass_gfx::FramebufferDisplay::open(&dev).map_err(|e| e.to_string())?;
+            options.max_wait = None;
+            return glassd::run(
+                &path,
+                &mut app,
+                &mut display,
+                || clock(0.0),
+                options,
+                |_: &mut glass_gfx::FramebufferDisplay| true,
+                log,
+            )
+            .map_err(|e| e.to_string());
+        }
+        #[cfg(not(all(feature = "fb", target_os = "linux")))]
+        {
+            return Err(
+                "this build has no framebuffer support: rebuild with --features fb on Linux".into(),
+            );
+        }
     }
     let mut display = HeadlessDisplay::new(glass_gfx::GLASS_WIDTH, glass_gfx::GLASS_HEIGHT);
     if let Some(out) = &args.out {

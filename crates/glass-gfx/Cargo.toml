@@ -11,9 +11,14 @@ rust-version.workspace = true
 default = []
 # Host window back end (development on a desktop).
 window = ["dep:minifb"]
+# Linux framebuffer back end (on-device software renderer sink for Model B).
+fb = ["dep:libc"]
 
 [dependencies]
 tiny-skia.workspace = true
 fontdue.workspace = true
 png.workspace = true
 minifb = { workspace = true, optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }

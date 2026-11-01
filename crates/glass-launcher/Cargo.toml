@@ -13,6 +13,8 @@ default = ["gles"]
 window = ["glass-gfx/window"]
 # The GLES2 renderer (EGL and GLES loaded with dlopen; needs a dynamically linked build).
 gles = ["dep:glass-gfx-gles"]
+# Present software frames to the Linux framebuffer (on-device, no GPU: Model B).
+fb = ["glass-gfx/fb"]
 
 [dependencies]
 glass-gfx.workspace = true
