@@ -15,6 +15,9 @@ use glass_ui::GestureKind;
 
 /// Per-step timeout before it is auto-skipped.
 const STEP_TIMEOUT_S: f32 = 20.0;
+/// Longer timeout for the physical-sensor steps (the owner needs time to raise the head,
+/// wink, and especially to take the glasses off then put them back on).
+const SENSOR_TIMEOUT_S: f32 = 40.0;
 /// Seconds each language is shown in the `language` step.
 const LANG_SHOW_S: f32 = 2.0;
 
@@ -72,6 +75,14 @@ impl Step {
             Step::Airplane => "airplane",
             Step::Language => "language",
             Step::ScreenDim => "screen_dim",
+        }
+    }
+
+    /// How long to wait before auto-skipping this step.
+    fn timeout_s(self) -> f32 {
+        match self {
+            Step::HeadWake | Step::Wink | Step::OnHead => SENSOR_TIMEOUT_S,
+            _ => STEP_TIMEOUT_S,
         }
     }
 
@@ -368,7 +379,7 @@ impl SelfTest {
                     self.finish_step(Res::Pass, "locales_shown=4");
                 }
             }
-            Some(_) if self.elapsed >= STEP_TIMEOUT_S => {
+            Some(step) if self.elapsed >= step.timeout_s() => {
                 let got = self.timeout_got();
                 self.finish_step(Res::Skip, &got);
             }

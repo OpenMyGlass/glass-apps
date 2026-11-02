@@ -282,9 +282,11 @@ pub fn route_controls(headset: bool) -> Vec<(&'static str, i32)> {
         v.push(("Headset Left Playback", 0));
         v.push(("Headset Right Playback", 0));
         v.push(("Earphone Playback Switch", 1));
-        // TWL6040 EP gain at the stock hardware cap: 15 = +6 dB (the stock XE24 maximum),
-        // for maximum audibility on the bone-conduction transducer.
-        v.push(("Earphone Playback Volume", 15));
+        // TWL6040 EP gain 12 = 0 dB: the stock HAL default and the safe level WITHOUT the
+        // stock BCT limiter (libglassalsa). Running at the +6 dB cap (15) with a loud,
+        // unlimited synth clips the earpiece amp — gross distortion ("pessimo"). The
+        // audibility sweep (--audio-sweep) explores higher volumes to find a clean level.
+        v.push(("Earphone Playback Volume", 12));
     }
     v
 }
@@ -830,7 +832,7 @@ pub fn startup_tone() -> Vec<i16> {
     let total_ms = 2500.0f32;
     let total = (total_ms * RATE as f32 / 1000.0) as usize;
     let edge = (RATE as f32 * 0.02) as usize; // 20 ms fade
-    let peak = 0.9f32; // near full scale
+    let peak = 0.45f32; // moderate: clean on the earpiece at 0 dB, without clipping
     let mut out = Vec::with_capacity(total * 2);
     let mut phase = 0.0f32;
     for n in 0..total {
@@ -1378,4 +1380,65 @@ pub fn diag2(emit: &mut dyn FnMut(&str)) {
     emit("DIAG2 SUMMARY: read which VARIANT shows 'PLAY OK' in ~1 s (and you heard a tone).");
     emit("A ~19 s stall + 'PLAY FAIL ... EIO' = that variant's back-end still did not clock.");
     emit("================ END OF DIAG2 PASS ================");
+}
+
+// ---- audibility sweep (amplitude × Earphone volume) --------------------------------
+
+/// A primed EP path for the audibility sweep: the mixer (to set `Earphone Playback
+/// Volume` per step) and the open PCM (to play a tone at a chosen synth amplitude). The
+/// digital path is known-good; this finds a CLEAN, audible analog level — a loud synth at
+/// the +6 dB cap clips ("pessimo"), so we sweep amplitude × EP volume.
+pub struct AudioSweep {
+    mixer: Mixer,
+    pcm: Pcm,
+}
+
+impl AudioSweep {
+    /// The amplitudes and Earphone volumes the sweep walks (outer × inner).
+    pub const AMPS: [f32; 4] = [0.2, 0.4, 0.6, 0.9];
+    pub const VOLUMES: [i32; 3] = [10, 13, 15];
+
+    /// Opens the mixer, applies the bone-conduction priming route, and opens + cold-primes
+    /// the PCM. Returns the sweep handle and a report (mixer read-back incl. EP state).
+    pub fn open() -> (Option<AudioSweep>, Vec<String>) {
+        let mut report = Vec::new();
+        let mixer = match Mixer::open() {
+            Ok(m) => m,
+            Err(e) => {
+                report.push(format!("mixer open failed: {e}"));
+                return (None, report);
+            }
+        };
+        for (name, val, r) in set_prime(&mixer, false) {
+            if let Err(e) = r {
+                report.push(format!("mixer {name} = {val}: {e}"));
+            }
+        }
+        for line in ep_state_report(&mixer) {
+            report.push(line);
+        }
+        let pcm = match Pcm::open_params(UI_PERIOD, UI_PERIODS, 0) {
+            Ok(p) => p,
+            Err(e) => {
+                report.push(format!("pcm open failed: {e}"));
+                return (None, report);
+            }
+        };
+        if let Err(e) = pcm.play_explicit(&tone(1000.0, 200.0, 0.2)) {
+            report.push(format!("prime play failed: {e}"));
+        } else {
+            report.push("codec primed for sweep".into());
+        }
+        (Some(AudioSweep { mixer, pcm }), report)
+    }
+
+    /// Sets the Earphone Playback Volume (0..15).
+    pub fn set_ep_volume(&self, v: i32) -> io::Result<()> {
+        self.mixer.set("Earphone Playback Volume", v)
+    }
+
+    /// Plays a steady tone at `amp` (0..1) for `ms` on the current route.
+    pub fn play(&self, freq: f32, ms: f32, amp: f32) -> io::Result<()> {
+        self.pcm.play_explicit(&tone(freq, ms, amp))
+    }
 }

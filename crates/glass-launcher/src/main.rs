@@ -89,6 +89,8 @@ struct Args {
     audio_diag2: bool,
     /// `--self-test`: run the guided on-screen self-test walkthrough (needs `fb`).
     self_test: bool,
+    /// `--audio-sweep`: play an EP amplitude×volume audibility matrix (needs `fb`+`sound`).
+    audio_sweep: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -121,6 +123,7 @@ fn parse_args() -> Result<Args, String> {
             "--audio-diag" => a.audio_diag = true,
             "--audio-diag2" => a.audio_diag2 = true,
             "--self-test" => a.self_test = true,
+            "--audio-sweep" => a.audio_sweep = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -358,6 +361,102 @@ fn run_audio_diag2() -> Result<(), String> {
     }
 }
 
+/// `--audio-sweep`: play an EP audibility matrix — synth amplitude × Earphone Playback
+/// Volume — each a clearly-labelled ~2 s tone, rendering the combo on the framebuffer and
+/// logging it, so the owner can tell us which combo is clean + audible. The digital path
+/// is known-good; this finds a non-clipping analog level.
+#[cfg(all(feature = "fb", target_os = "linux"))]
+fn run_audio_sweep(args: &Args) -> Result<(), String> {
+    use glass_launcher::panel::Panel;
+    use glass_ui::i18n::Locale;
+    use glass_ui::CardContent;
+    use std::io::Write;
+    use std::time::Duration;
+
+    let dev = args.fb.clone().unwrap_or_else(|| PathBuf::from("/dev/fb0"));
+    let base = clock::now();
+    let ctx = RenderContext {
+        now_s: base.now_s,
+        hour: base.hour,
+        minute: base.minute,
+        locale: Locale::It,
+    };
+    let emit = |line: &str| {
+        let mut e = std::io::stderr();
+        let _ = writeln!(e, "OMGB-AUDIO: {line}");
+        let _ = e.flush();
+    };
+
+    #[cfg(not(feature = "sound"))]
+    {
+        let _ = (dev, ctx, emit);
+        return Err("this build has no sound support: rebuild with --features sound".into());
+    }
+    #[cfg(feature = "sound")]
+    {
+        use glass_launcher::audio::AudioSweep;
+        let mut compositor = compositor_for(Some(Renderer::Software))?;
+        let mut display = glass_gfx::FramebufferDisplay::open(&dev).map_err(|e| e.to_string())?;
+        let mut show = |title: String, body: String| {
+            let mut p = Panel::new(
+                CardContent::Info {
+                    title,
+                    lines: vec![body],
+                },
+                ctx,
+            );
+            let _ = p.render(compositor.as_mut());
+            let _ = compositor.present(&mut display);
+        };
+
+        emit("============ EP AUDIBILITY SWEEP (amplitude × Earphone volume) ============");
+        let (sweep, report) = AudioSweep::open();
+        for l in &report {
+            emit(&format!("sweep: {l}"));
+        }
+        let Some(sweep) = sweep else {
+            show("Audio sweep".into(), "ALSA open FAILED".into());
+            std::thread::sleep(Duration::from_secs(3));
+            return Err("audio sweep: ALSA unavailable".into());
+        };
+        let mut n = 0;
+        let total = AudioSweep::AMPS.len() * AudioSweep::VOLUMES.len();
+        for &vol in &AudioSweep::VOLUMES {
+            for &amp in &AudioSweep::AMPS {
+                n += 1;
+                let set = sweep.set_ep_volume(vol);
+                let label = format!("amp={amp:.1} EPvol={vol}");
+                show(
+                    format!("SWEEP {n}/{total}"),
+                    format!("{label}\nASCOLTA (2s)"),
+                );
+                emit(&format!(
+                    ">>> {n}/{total} {label} (set {}) -- ASCOLTA ORA 2s",
+                    if set.is_ok() { "ok" } else { "FAIL" }
+                ));
+                std::thread::sleep(Duration::from_millis(400));
+                match sweep.play(1000.0, 2000.0, amp) {
+                    Ok(()) => emit(&format!("    {label}: played")),
+                    Err(e) => emit(&format!("    {label}: PLAY FAIL: {e}")),
+                }
+                std::thread::sleep(Duration::from_millis(800));
+            }
+        }
+        show(
+            "Sweep done".into(),
+            "Dimmi quale combo era pulita+udibile".into(),
+        );
+        emit("SWEEP DONE: report which amp/EPvol was clean + audible (clipping = 'pessimo').");
+        std::thread::sleep(Duration::from_secs(4));
+        Ok(())
+    }
+}
+
+#[cfg(not(all(feature = "fb", target_os = "linux")))]
+fn run_audio_sweep(_args: &Args) -> Result<(), String> {
+    Err("this build has no framebuffer support: rebuild with --features fb on Linux".into())
+}
+
 /// `--self-test`: the guided on-screen walkthrough. Renders instruction cards to the
 /// framebuffer, drives the [`selftest::SelfTest`] machine from glassd frames, plays the
 /// audio cues, and logs one `OMGB-SELFTEST:` line per step to stderr (the image's init
@@ -499,9 +598,11 @@ fn run_self_test(args: &Args) -> Result<(), String> {
     let mut keep_awake = true;
 
     loop {
-        // Keep-awake: a periodic UserActivity resets glassd's screen-off timer, so the
-        // display never idles out during the walkthrough (except while released for dim).
-        if keep_awake && last_poke.elapsed() >= Duration::from_secs(2) {
+        // Keep-awake: a frequent UserActivity resets glassd's screen-off timer, so the
+        // display never idles out or dims during the walkthrough (a dim would consume the
+        // owner's taps as wake instead of delivering them — the touch_precision regression).
+        // Except while released for the dim step.
+        if keep_awake && last_poke.elapsed() >= Duration::from_millis(1000) {
             if let Some(c) = client.as_mut() {
                 let _ = c.send(client_frame::Body::Screen(ScreenRequest {
                     action: screen_request::Action::UserActivity as i32,
@@ -767,7 +868,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.self_test {
+    let result = if args.audio_sweep {
+        run_audio_sweep(&args)
+    } else if args.self_test {
         run_self_test(&args)
     } else if args.audio_diag2 {
         run_audio_diag2()
