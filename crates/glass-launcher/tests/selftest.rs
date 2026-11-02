@@ -46,10 +46,25 @@ fn a_full_scripted_run_logs_each_step_and_a_summary() {
     st.on_event(Ev::Wear { on_head: false });
     st.on_event(Ev::Wear { on_head: true });
     drain(&mut st, &mut log);
-    // 10/11/12 radios + airplane: owner taps to confirm
-    g(&mut st, G::Tap, &mut log);
-    g(&mut st, G::Tap, &mut log);
-    g(&mut st, G::Tap, &mut log);
+    // 10/11/12 radios + airplane: glassd echoes the new state (real verification).
+    st.on_event(Ev::Settings {
+        wifi: Some(true),
+        bt: None,
+        airplane: None,
+    });
+    drain(&mut st, &mut log);
+    st.on_event(Ev::Settings {
+        wifi: None,
+        bt: Some(true),
+        airplane: None,
+    });
+    drain(&mut st, &mut log);
+    st.on_event(Ev::Settings {
+        wifi: None,
+        bt: None,
+        airplane: Some(true),
+    });
+    drain(&mut st, &mut log);
     // 13 language: time-driven, 2 s per locale × 4
     for _ in 0..5 {
         st.tick(2.0);
@@ -86,7 +101,13 @@ fn a_full_scripted_run_logs_each_step_and_a_summary() {
         "step=on_head expected=doff_then_don got=doff_then_don result=PASS"
     ));
     assert!(has(
-        "step=wifi_toggle expected=wifi_toggled got=tap_confirmed result=PASS"
+        "step=wifi_toggle expected=wifi_toggled got=wifi=on_verified result=PASS"
+    ));
+    assert!(has(
+        "step=bt_toggle expected=bt_toggled got=bt=on_verified result=PASS"
+    ));
+    assert!(has(
+        "step=airplane expected=airplane_on got=airplane=on_verified result=PASS"
     ));
     assert!(has(
         "step=language expected=4_locales_shown got=locales_shown=4 result=PASS"
