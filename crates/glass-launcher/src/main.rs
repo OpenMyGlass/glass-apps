@@ -94,6 +94,9 @@ struct Args {
     /// `--audio-tone-long`: play one long (~15 s) EP tone so the init can read the
     /// McPDM/ABE/DAPM running state while it plays (needs `sound`).
     audio_tone_long: bool,
+    /// `--audio-analog`: TWL6040 earphone-path variants, dumping the codec registers +
+    /// EP-path DAPM during playback (needs `sound`; debugfs mounted by the init).
+    audio_analog: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -128,6 +131,7 @@ fn parse_args() -> Result<Args, String> {
             "--self-test" => a.self_test = true,
             "--audio-sweep" => a.audio_sweep = true,
             "--audio-tone-long" => a.audio_tone_long = true,
+            "--audio-analog" => a.audio_analog = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -356,6 +360,24 @@ fn run_audio_diag2() -> Result<(), String> {
             let mut err = std::io::stderr();
             let _ = writeln!(err, "OMGB-AUDIO: {line}");
             let _ = err.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-analog`: TWL6040 earphone-path variants with register + DAPM dumps.
+fn run_audio_analog() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::analog_diag(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-AUDIO: {line}");
+            let _ = e.flush();
         });
         Ok(())
     }
@@ -920,7 +942,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.audio_tone_long {
+    let result = if args.audio_analog {
+        run_audio_analog()
+    } else if args.audio_tone_long {
         run_audio_tone_long()
     } else if args.audio_sweep {
         run_audio_sweep(&args)

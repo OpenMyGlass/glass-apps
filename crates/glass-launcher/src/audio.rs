@@ -1442,3 +1442,166 @@ impl AudioSweep {
         self.pcm.play_explicit(&tone(freq, ms, amp))
     }
 }
+
+// ---- TWL6040 analog-path diagnostic (earphone output) ------------------------------
+
+/// Reads the whole TWL6040 register set (regmap debugfs) and the EP-path ASoC DAPM widget
+/// power, emitting each line — so a device readback shows exactly which earphone/HSDAC
+/// enable + power-mode + charge-pump bits are actually set during playback.
+fn dump_codec_state(emit: &mut dyn FnMut(&str)) {
+    // TWL6040 register map: /sys/kernel/debug/regmap/<...twl6040...>/registers
+    match fs::read_dir("/sys/kernel/debug/regmap") {
+        Ok(rd) => {
+            let mut found = false;
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.to_lowercase().contains("twl6040") {
+                    found = true;
+                    match fs::read_to_string(e.path().join("registers")) {
+                        Ok(s) => {
+                            emit(&format!("twl6040 registers ({name}):"));
+                            for l in s.lines() {
+                                emit(&format!("  reg {l}"));
+                            }
+                        }
+                        Err(err) => emit(&format!("twl6040 registers ({name}): FAIL: {err}")),
+                    }
+                }
+            }
+            if !found {
+                emit("no twl6040 regmap dir under /sys/kernel/debug/regmap");
+            }
+        }
+        Err(e) => emit(&format!("/sys/kernel/debug/regmap: {e} (debugfs mounted?)")),
+    }
+    dump_dapm(emit);
+}
+
+/// Emits the power state of the EP-path ASoC DAPM widgets (handles widget names with
+/// spaces correctly, unlike a shell loop).
+fn dump_dapm(emit: &mut dyn FnMut(&str)) {
+    const WIDGETS: &[&str] = &[
+        "HSDAC Left",
+        "HSDAC Right",
+        "HSDAC Power",
+        "Earphone Driver",
+        "Earphone Playback",
+        "EP",
+        "HS Left Driver",
+        "Headset Left Playback",
+        "Headset Right Playback",
+        "PDM_DL1",
+        "DL1",
+    ];
+    fn walk(dir: &std::path::Path, depth: u32, emit: &mut dyn FnMut(&str), widgets: &[&str]) {
+        if depth > 4 {
+            return;
+        }
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth + 1, emit, widgets);
+            } else {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if widgets.iter().any(|w| name == *w) {
+                    if let Ok(s) = fs::read_to_string(&p) {
+                        let first = s.lines().next().unwrap_or("");
+                        emit(&format!("dapm {name}: {first}"));
+                    }
+                }
+            }
+        }
+    }
+    let base = std::path::Path::new("/sys/kernel/debug/asoc");
+    if base.exists() {
+        emit("EP-path DAPM widget power:");
+        walk(base, 0, emit, WIDGETS);
+    } else {
+        emit("no /sys/kernel/debug/asoc (ASoC debugfs absent)");
+    }
+}
+
+/// Earphone analog-path variants: the base is the bone-conduction prime; each variant
+/// overrides a few controls to test the TWL6040 earphone power/routing hypotheses.
+fn analog_variants() -> Vec<(&'static str, Vec<(&'static str, i32)>)> {
+    vec![
+        ("V1 current (PLL=HP, PowerMode=HP, HS-L/R=0)", vec![]),
+        (
+            "V2 stock power modes (PLL=Low-Power, TWL6040 Power Mode=Low-Power)",
+            vec![("PLL Selection", 0), ("TWL6040 Power Mode", 0)],
+        ),
+        (
+            "V3 keep Left HSDAC via Headset-Left on (HS-L=1, HS-R=1)",
+            vec![("Headset Left Playback", 1), ("Headset Right Playback", 1)],
+        ),
+    ]
+}
+
+/// Plays a tone on each earphone variant, dumping the TWL6040 registers + EP-path DAPM
+/// *during* playback (a big buffer keeps the stream RUNNING across the read). The owner
+/// confirms which variant (if any) finally makes sound; the register/DAPM dumps are read
+/// back over adb to compare the analog state.
+pub fn analog_diag(emit: &mut dyn FnMut(&str)) {
+    use std::time::Duration;
+    let mixer = match Mixer::open() {
+        Ok(m) => m,
+        Err(e) => {
+            emit(&format!("mixer open FAILED: {e}"));
+            return;
+        }
+    };
+    let buf = tone(1000.0, 2500.0, 0.4);
+    let ch = CHANNELS as usize;
+    for (label, overrides) in analog_variants() {
+        emit(&format!("######## ANALOG VARIANT {label} ########"));
+        // Base bone-conduction prime, then the variant overrides.
+        for (name, val, r) in set_prime(&mixer, false) {
+            if let Err(e) = r {
+                emit(&format!("  set {name}={val}: {e}"));
+            }
+        }
+        for (name, val) in &overrides {
+            match mixer.set(name, *val) {
+                Ok(()) => emit(&format!(
+                    "  override {name} = {val} (readback {:?})",
+                    mixer.get(name)
+                )),
+                Err(e) => emit(&format!("  override {name} = {val}: FAIL: {e}")),
+            }
+        }
+        // Fresh PCM per variant so the DPCM/codec bring-up re-runs with these power modes.
+        let pcm = match Pcm::open_params(14784, 2, 0) {
+            Ok(p) => p,
+            Err(e) => {
+                emit(&format!("  pcm open FAILED: {e}"));
+                continue;
+            }
+        };
+        let total = buf.len() / ch;
+        let one = (pcm.period_size as usize).min(total);
+        let play = (|| -> io::Result<()> {
+            pcm.prepare()?;
+            pcm.writei(&buf[..one * ch])?;
+            pcm.start()?;
+            Ok(())
+        })();
+        if let Err(e) = play {
+            emit(&format!("  start FAILED: {e}"));
+            continue;
+        }
+        // Stream is RUNNING (playing the first ~300 ms period): read the analog state now.
+        dump_codec_state(emit);
+        // Finish the tone so the owner can listen.
+        if one < total {
+            if let Err(e) = pcm.writei(&buf[one * ch..]) {
+                emit(&format!("  writei rest FAILED: {e}"));
+            }
+        }
+        let _ = pcm.drain();
+        emit(&format!("  {label}: tone played -- ASCOLTA"));
+        drop(pcm);
+        std::thread::sleep(Duration::from_millis(800));
+    }
+    emit("ANALOG DIAG done: report which VARIANT made sound; compare twl6040 registers (EARCTL/HSLCTL/HSRCTL/NCPCTRL/LDOCTL/HPPLLCTL) and dapm HSDAC/Earphone Driver On/Off across variants.");
+}
