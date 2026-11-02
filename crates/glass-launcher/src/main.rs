@@ -365,7 +365,8 @@ fn run_audio_diag2() -> Result<(), String> {
 #[cfg(all(feature = "fb", target_os = "linux"))]
 fn run_self_test(args: &Args) -> Result<(), String> {
     use glass_api::proto::{
-        client_frame, screen_request, service_frame, ScreenRequest, SetSettings, Settings, Topic,
+        client_frame, screen_request, service_frame, HeadRequest, ScreenRequest, SetSettings,
+        Settings, Topic,
     };
     use glass_api::Client;
     #[cfg(feature = "sound")]
@@ -493,11 +494,14 @@ fn run_self_test(args: &Args) -> Result<(), String> {
     let mut panel = Panel::new(card(&st), ctx);
     let mut last = Instant::now();
     let mut last_poke = Instant::now();
+    // The screen_dim step releases this so the display can idle out; every other step
+    // holds it (periodic UserActivity + the KeepOn hold).
+    let mut keep_awake = true;
 
     loop {
-        // Keep-awake: a periodic UserActivity resets glassd's screen-off timer regardless
-        // of the keep-on hold, so the display never idles out during the walkthrough.
-        if last_poke.elapsed() >= Duration::from_secs(2) {
+        // Keep-awake: a periodic UserActivity resets glassd's screen-off timer, so the
+        // display never idles out during the walkthrough (except while released for dim).
+        if keep_awake && last_poke.elapsed() >= Duration::from_secs(2) {
             if let Some(c) = client.as_mut() {
                 let _ = c.send(client_frame::Body::Screen(ScreenRequest {
                     action: screen_request::Action::UserActivity as i32,
@@ -506,26 +510,74 @@ fn run_self_test(args: &Args) -> Result<(), String> {
             }
             last_poke = Instant::now();
         }
-        // Send any settings requests the machine queued (radio toggles for verification).
+        // Send the requests the machine queued: radio/sensor enables (verification) and the
+        // keep-awake release/re-assert for the dim step.
         for req in st.take_reqs() {
-            if let Some(c) = client.as_mut() {
-                let s = match req {
-                    Req::Wifi(v) => Settings {
+            let Some(c) = client.as_mut() else { continue };
+            let setting =
+                |s: Settings| client_frame::Body::SetSettings(SetSettings { settings: Some(s) });
+            match req {
+                Req::Wifi(v) => {
+                    let _ = c.send(setting(Settings {
                         wifi_enabled: Some(v),
                         ..Default::default()
-                    },
-                    Req::Bluetooth(v) => Settings {
+                    }));
+                }
+                Req::Bluetooth(v) => {
+                    let _ = c.send(setting(Settings {
                         bluetooth_enabled: Some(v),
                         ..Default::default()
-                    },
-                    Req::Airplane(v) => Settings {
+                    }));
+                }
+                Req::Airplane(v) => {
+                    let _ = c.send(setting(Settings {
                         airplane_mode: Some(v),
                         ..Default::default()
-                    },
-                };
-                let _ = c.send(client_frame::Body::SetSettings(SetSettings {
-                    settings: Some(s),
-                }));
+                    }));
+                }
+                Req::Wink(v) => {
+                    let _ = c.send(setting(Settings {
+                        wink_enabled: Some(v),
+                        ..Default::default()
+                    }));
+                }
+                Req::OnHead(v) => {
+                    let _ = c.send(setting(Settings {
+                        on_head_detection_enabled: Some(v),
+                        ..Default::default()
+                    }));
+                }
+                Req::HeadRelative => {
+                    let _ = c.send(client_frame::Body::Head(HeadRequest {
+                        relative_look_up: true,
+                        ..Default::default()
+                    }));
+                    emit("requested RELATIVE_LOOK_UP for the head step");
+                }
+                Req::KeepAwake(v) => {
+                    keep_awake = v;
+                    if v {
+                        let _ = c.send(client_frame::Body::Screen(ScreenRequest {
+                            action: screen_request::Action::KeepOn as i32,
+                            duration_ms: 600_000,
+                        }));
+                        let _ = c.send(setting(Settings {
+                            screen_timeout_ms: Some(600_000),
+                            ..Default::default()
+                        }));
+                        emit("keep-awake re-asserted");
+                    } else {
+                        let _ = c.send(client_frame::Body::Screen(ScreenRequest {
+                            action: screen_request::Action::ReleaseKeepOn as i32,
+                            duration_ms: 0,
+                        }));
+                        let _ = c.send(setting(Settings {
+                            screen_timeout_ms: Some(4_000),
+                            ..Default::default()
+                        }));
+                        emit("keep-awake released (screen_dim step): screen will idle out in ~4 s");
+                    }
+                }
             }
         }
 
