@@ -1,7 +1,7 @@
 //! Drives the guided self-test state machine with a scripted sequence of synthetic inputs
 //! and asserts the `OMGB-SELFTEST:` PASS/SKIP/FAIL logging. No glassd or audio needed.
 
-use glass_launcher::selftest::{Ev, SelfTest};
+use glass_launcher::selftest::{Ev, Req, SelfTest};
 use glass_ui::i18n::Locale;
 use glass_ui::GestureKind as G;
 
@@ -79,6 +79,23 @@ fn a_full_scripted_run_logs_each_step_and_a_summary() {
         st.is_done(),
         "the run should finish; log:\n{}",
         log.join("\n")
+    );
+
+    // The machine must have driven the sensor enables (gated off by default), requested
+    // relative look-up for head, and released/re-asserted keep-awake for the dim step.
+    let reqs = st.take_reqs();
+    assert!(reqs.contains(&Req::HeadRelative), "{reqs:?}");
+    assert!(
+        reqs.contains(&Req::Wink(true)) && reqs.contains(&Req::Wink(false)),
+        "{reqs:?}"
+    );
+    assert!(
+        reqs.contains(&Req::OnHead(true)) && reqs.contains(&Req::OnHead(false)),
+        "{reqs:?}"
+    );
+    assert!(
+        reqs.contains(&Req::KeepAwake(false)) && reqs.contains(&Req::KeepAwake(true)),
+        "{reqs:?}"
     );
 
     let has = |needle: &str| log.iter().any(|l| l.contains(needle));
