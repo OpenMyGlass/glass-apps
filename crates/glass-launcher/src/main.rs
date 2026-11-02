@@ -91,6 +91,9 @@ struct Args {
     self_test: bool,
     /// `--audio-sweep`: play an EP amplitude×volume audibility matrix (needs `fb`+`sound`).
     audio_sweep: bool,
+    /// `--audio-tone-long`: play one long (~15 s) EP tone so the init can read the
+    /// McPDM/ABE/DAPM running state while it plays (needs `sound`).
+    audio_tone_long: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -124,6 +127,7 @@ fn parse_args() -> Result<Args, String> {
             "--audio-diag2" => a.audio_diag2 = true,
             "--self-test" => a.self_test = true,
             "--audio-sweep" => a.audio_sweep = true,
+            "--audio-tone-long" => a.audio_tone_long = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -354,6 +358,54 @@ fn run_audio_diag2() -> Result<(), String> {
             let _ = err.flush();
         });
         Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-tone-long`: play one long (~15 s) steady EP tone and report how long the play
+/// took. If McPDM is actually clocking the samples out, the ABE consumes in real time and
+/// the ~15 s of audio drain in ~15 s; if the back-end never clocks, the ABE buffer fills
+/// and the write stalls / fails early (EIO) — so the elapsed time and OK/FAIL are
+/// themselves a McPDM-transfer verdict. The init reads the McPDM/DAPM/PCM state meanwhile.
+fn run_audio_tone_long() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        use std::time::Instant;
+        let emit = |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-MCPDM: {line}");
+            let _ = e.flush();
+        };
+        let (sweep, report) = glass_launcher::audio::AudioSweep::open();
+        for l in &report {
+            emit(&format!("open: {l}"));
+        }
+        let Some(sweep) = sweep else {
+            return Err("audio-tone-long: ALSA unavailable".into());
+        };
+        let _ = sweep.set_ep_volume(12);
+        emit("playing a 15 s 1 kHz tone (amp 0.4, EP vol 12) -- timing the drain ...");
+        let t0 = Instant::now();
+        let r = sweep.play(1000.0, 15000.0, 0.4);
+        let ms = t0.elapsed().as_millis();
+        match r {
+            Ok(()) => {
+                emit(&format!(
+                    "tone drained in {ms} ms (expect ~15000 if McPDM clocks real-time; a few seconds then OK would mean the ABE just buffered)"
+                ));
+                Ok(())
+            }
+            Err(e) => {
+                emit(&format!(
+                    "tone FAILED after {ms} ms: {e} -- back-end likely not clocking (ABE buffer filled, DMA stalled)"
+                ));
+                Err("audio-tone-long: play failed".into())
+            }
+        }
     }
     #[cfg(not(all(feature = "sound", target_os = "linux")))]
     {
@@ -868,7 +920,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.audio_sweep {
+    let result = if args.audio_tone_long {
+        run_audio_tone_long()
+    } else if args.audio_sweep {
         run_audio_sweep(&args)
     } else if args.self_test {
         run_self_test(&args)
