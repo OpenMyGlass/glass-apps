@@ -1,0 +1,1325 @@
+//! On-device UI sound for Model B: a tiny, self-contained ALSA output path.
+//!
+//! No `libasound`, no `tinyalsa`, no external tools (the Alpine image ships none): this
+//! talks to the kernel's sound devices directly with the documented `SNDRV_*` ioctls on
+//! `/dev/snd/controlC0` (mixer) and `/dev/snd/pcmC0D0p` (playback), exactly as a small
+//! tinyalsa would. It keeps the static musl binary small and dependency-free.
+//!
+//! The important output is the Glass **bone-conduction transducer**, driven by the
+//! TWL6040 **Earphone (EP)** output. Before playback we set the same mixer controls the
+//! stock Android audio HAL sets for the EP path (card 0 "Notle"), from
+//! `android_device_glass_glass-1` `docs/specs/audio.md` section 4. A USB earbud/headset
+//! is handled as a secondary path (Headset L/R on, EP off).
+//!
+//! Playback is card 0, device 0 (OMAP ABE Multimedia front-end), S16_LE, 48 kHz, stereo,
+//! plain blocking `writei` (no mmap) — the Model-B path the spec calls out as the one to
+//! confirm. UI sounds are synthesised in-code (see [`synth`]); nothing is read from disk.
+//!
+//! Only built with the `sound` feature on Linux. Errors are reported (for the init's
+//! `/dev/kmsg` log) but never fatal: feedback is best-effort.
+
+#![allow(clippy::unusual_byte_groupings)]
+
+use crate::feedback::{Cue, Feedback};
+use std::ffi::CString;
+use std::fs;
+use std::io::{self, Error, ErrorKind};
+use std::os::unix::io::RawFd;
+use std::sync::mpsc;
+use std::thread;
+
+// ---- kernel ABI (sound/asound.h), 32-bit ARM (OMAP4430, kernel 3.4.x) --------------
+
+const CARD: u32 = 0;
+const DEVICE: u32 = 0;
+
+const RATE: u32 = 48_000;
+const CHANNELS: u32 = 2;
+
+// struct sizes, 32-bit ARM EABI (used in the ioctl numbers, so they must be exact).
+const SIZEOF_HW_PARAMS: usize = 604;
+const SIZEOF_SW_PARAMS: usize = 104;
+const SIZEOF_CTL_ELEM_VALUE: usize = 712;
+
+// _IOC(dir,type,nr,size) = (dir<<30)|(size<<16)|(type<<8)|nr ; READ|WRITE dir = 3.
+const fn ioc(dir: u32, ty: u32, nr: u32, size: usize) -> libc::c_ulong {
+    ((dir << 30) | ((size as u32) << 16) | (ty << 8) | nr) as libc::c_ulong
+}
+const IOC_NONE: u32 = 0;
+const IOC_WRITE: u32 = 1;
+const IOC_READ: u32 = 2;
+const A: u32 = b'A' as u32;
+const U: u32 = b'U' as u32;
+
+const SNDRV_PCM_IOCTL_HW_PARAMS: libc::c_ulong =
+    ioc(IOC_READ | IOC_WRITE, A, 0x11, SIZEOF_HW_PARAMS);
+const SNDRV_PCM_IOCTL_SW_PARAMS: libc::c_ulong =
+    ioc(IOC_READ | IOC_WRITE, A, 0x13, SIZEOF_SW_PARAMS);
+const SNDRV_PCM_IOCTL_PREPARE: libc::c_ulong = ioc(IOC_NONE, A, 0x40, 0);
+const SNDRV_PCM_IOCTL_START: libc::c_ulong = ioc(IOC_NONE, A, 0x42, 0);
+const SNDRV_PCM_IOCTL_DRAIN: libc::c_ulong = ioc(IOC_NONE, A, 0x44, 0);
+const SNDRV_PCM_IOCTL_DROP: libc::c_ulong = ioc(IOC_NONE, A, 0x43, 0);
+const SNDRV_PCM_IOCTL_WRITEI_FRAMES: libc::c_ulong = ioc(IOC_WRITE, A, 0x50, 12);
+const SNDRV_CTL_IOCTL_ELEM_WRITE: libc::c_ulong =
+    ioc(IOC_READ | IOC_WRITE, U, 0x13, SIZEOF_CTL_ELEM_VALUE);
+const SNDRV_CTL_IOCTL_ELEM_READ: libc::c_ulong =
+    ioc(IOC_READ | IOC_WRITE, U, 0x12, SIZEOF_CTL_ELEM_VALUE);
+const SIZEOF_CTL_ELEM_LIST: usize = 72;
+const SNDRV_CTL_IOCTL_ELEM_LIST: libc::c_ulong =
+    ioc(IOC_READ | IOC_WRITE, U, 0x10, SIZEOF_CTL_ELEM_LIST);
+
+// hw_params layout (byte offsets inside the 604-byte struct).
+const HWP_MASK0: usize = 4; // masks[0] (ACCESS); each snd_mask is 32 bytes.
+const HWP_INTERVAL0: usize = 260; // intervals[0] (SAMPLE_BITS); each snd_interval is 12 bytes.
+const HWP_RMASK: usize = 512;
+const HWP_INFO: usize = 520;
+
+// parameter ids
+const P_ACCESS: usize = 0;
+const P_FORMAT: usize = 1;
+const P_CHANNELS: usize = 10;
+const P_RATE: usize = 11;
+const P_PERIOD_SIZE: usize = 13;
+const P_PERIODS: usize = 15;
+const P_BUFFER_SIZE: usize = 17;
+const FIRST_INTERVAL: usize = 8;
+
+const SNDRV_PCM_ACCESS_RW_INTERLEAVED: u32 = 3;
+const SNDRV_PCM_FORMAT_S16_LE: u32 = 2;
+
+const SNDRV_CTL_ELEM_IFACE_MIXER: u32 = 2;
+
+// ---- small ioctl / fd helpers ------------------------------------------------------
+
+struct Fd(RawFd);
+impl Drop for Fd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
+    }
+}
+
+fn errno() -> i32 {
+    Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// " (errno N)" when the error carries an OS errno, else "".
+fn errno_suffix(e: &Error) -> String {
+    match e.raw_os_error() {
+        Some(n) => format!(" (errno {n})"),
+        None => String::new(),
+    }
+}
+
+/// Opens `/dev/snd/<name>`, creating the node from `/sys/class/sound/<name>/dev` if the
+/// device tmpfs has no entry yet (mdev may not have placed it under `snd/`).
+fn open_snd(name: &str) -> io::Result<Fd> {
+    let path = format!("/dev/snd/{name}");
+    if let Some(fd) = try_open(&path) {
+        return Ok(fd);
+    }
+    // Create /dev/snd and the node, then retry.
+    let _ = fs::create_dir_all("/dev/snd");
+    let dev = fs::read_to_string(format!("/sys/class/sound/{name}/dev"))
+        .map_err(|e| Error::new(e.kind(), format!("read dev of {name}: {e}")))?;
+    let dev = dev.trim();
+    let (maj, min) = dev
+        .split_once(':')
+        .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("bad dev {dev:?} for {name}"),
+            )
+        })?;
+    let cpath = CString::new(path.clone()).unwrap();
+    let rc = unsafe {
+        libc::mknod(
+            cpath.as_ptr(),
+            libc::S_IFCHR | 0o600,
+            libc::makedev(maj, min),
+        )
+    };
+    if rc != 0 && errno() != libc::EEXIST {
+        return Err(Error::new(
+            Error::last_os_error().kind(),
+            format!("mknod {path} c {maj} {min}: {}", Error::last_os_error()),
+        ));
+    }
+    try_open(&path).ok_or_else(|| Error::other(format!("open {path}: {}", Error::last_os_error())))
+}
+
+fn try_open(path: &str) -> Option<Fd> {
+    let c = CString::new(path).ok()?;
+    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+    if fd < 0 {
+        None
+    } else {
+        Some(Fd(fd))
+    }
+}
+
+fn ioctl_ptr(fd: RawFd, req: libc::c_ulong, arg: *mut libc::c_void) -> io::Result<()> {
+    let rc = unsafe { libc::ioctl(fd, req as _, arg) };
+    if rc < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+// ---- mixer (control device) --------------------------------------------------------
+
+/// The TWL6040/ABE mixer on card 0.
+pub struct Mixer {
+    fd: Fd,
+}
+
+impl Mixer {
+    pub fn open() -> io::Result<Mixer> {
+        Ok(Mixer {
+            fd: open_snd(&format!("controlC{CARD}"))?,
+        })
+    }
+
+    /// Writes an integer/boolean control by name (numid 0 → kernel resolves by name),
+    /// setting the first two values (covers mono and stereo controls).
+    pub fn set(&self, name: &str, value: i32) -> io::Result<()> {
+        if name.len() >= 44 {
+            return Err(Error::new(ErrorKind::InvalidInput, "control name too long"));
+        }
+        let mut buf = [0u8; SIZEOF_CTL_ELEM_VALUE];
+        // id.numid = 0 (offset 0); id.iface = MIXER (offset 4); id.name (offset 16).
+        put_u32(&mut buf, 4, SNDRV_CTL_ELEM_IFACE_MIXER);
+        buf[16..16 + name.len()].copy_from_slice(name.as_bytes());
+        // value.integer.value[0..2] at offset 72 (union is 8-byte aligned after id+indirect).
+        put_i32(&mut buf, 72, value);
+        put_i32(&mut buf, 76, value);
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_CTL_IOCTL_ELEM_WRITE,
+            buf.as_mut_ptr() as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("set {name:?}={value}: {e}")))
+    }
+
+    /// Reads an integer/boolean control by name; returns its first two values.
+    pub fn get(&self, name: &str) -> io::Result<[i32; 2]> {
+        if name.len() >= 44 {
+            return Err(Error::new(ErrorKind::InvalidInput, "control name too long"));
+        }
+        let mut buf = [0u8; SIZEOF_CTL_ELEM_VALUE];
+        put_u32(&mut buf, 4, SNDRV_CTL_ELEM_IFACE_MIXER);
+        buf[16..16 + name.len()].copy_from_slice(name.as_bytes());
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_CTL_IOCTL_ELEM_READ,
+            buf.as_mut_ptr() as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("get {name:?}: {e}")))?;
+        Ok([get_i32(&buf, 72), get_i32(&buf, 76)])
+    }
+
+    /// Lists every control on the card: (numid, iface, name). For diagnosis — so we see
+    /// the exact control names the driver exposes.
+    pub fn list(&self) -> io::Result<Vec<(u32, u32, String)>> {
+        // First pass: ask for the count (space = 0).
+        let mut hdr = [0u8; SIZEOF_CTL_ELEM_LIST];
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_CTL_IOCTL_ELEM_LIST,
+            hdr.as_mut_ptr() as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("ELEM_LIST count: {e}")))?;
+        let count = get_u32(&hdr, 12) as usize; // field `count`
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        // Second pass: give it an array of `count` snd_ctl_elem_id (64 bytes each).
+        let mut ids = vec![0u8; count * 64];
+        put_u32(&mut hdr, 0, 0); // offset = 0
+        put_u32(&mut hdr, 4, count as u32); // space = count
+        put_u32(&mut hdr, 16, ids.as_mut_ptr() as u32); // pids pointer (32-bit)
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_CTL_IOCTL_ELEM_LIST,
+            hdr.as_mut_ptr() as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("ELEM_LIST fetch: {e}")))?;
+        let used = get_u32(&hdr, 8) as usize; // field `used`
+        let mut out = Vec::with_capacity(used);
+        for i in 0..used {
+            let base = i * 64;
+            let numid = get_u32(&ids, base);
+            let iface = get_u32(&ids, base + 4);
+            let name_bytes = &ids[base + 16..base + 60];
+            let end = name_bytes.iter().position(|&b| b == 0).unwrap_or(44);
+            let name = String::from_utf8_lossy(&name_bytes[..end]).into_owned();
+            out.push((numid, iface, name));
+        }
+        Ok(out)
+    }
+}
+
+/// The mixer controls for a route, in the order the stock HAL applies them.
+/// `headset` selects the USB earbud path (Headset L/R) instead of the bone-conduction EP.
+///
+/// Returns every control it tried with the result, so the caller can log each.
+pub fn route_controls(headset: bool) -> Vec<(&'static str, i32)> {
+    // Common DL1 -> McPDM -> TWL6040 path (ABE), 0 dB.
+    let mut v = vec![
+        ("DL1 Mixer Multimedia", 1),
+        ("DL1 Media Playback Volume", 120), // ABE gain, 0 dB
+        ("DL1 PDM Switch", 1),
+    ];
+    if headset {
+        // USB earbud: HSOL/HSOR on, EP off.
+        v.push(("Earphone Playback Switch", 0));
+        v.push(("Headset Left Playback", 1));
+        v.push(("Headset Right Playback", 1));
+        v.push(("Headset Playback Volume", 12)); // TWL6040 HS gain, -6 dB
+    } else {
+        // Bone-conduction transducer on the TWL6040 earpiece (EP) output.
+        v.push(("Headset Left Playback", 0));
+        v.push(("Headset Right Playback", 0));
+        v.push(("Earphone Playback Switch", 1));
+        // TWL6040 EP gain: 14 ~= +4 dB, nudged up from the 0 dB default for audibility on
+        // the transducer; still one step below the stock hardware cap of 15 (+6 dB).
+        v.push(("Earphone Playback Volume", 14));
+    }
+    v
+}
+
+/// The full cold-start **priming** control set — the "V5" recipe confirmed working on the
+/// real Glass. On a cold boot, neither route-first alone nor route-first + a minimal PLL
+/// tweak made the OMAP4 ABE → McPDM → TWL6040 back-end clock; this full set did. Once it
+/// has clocked the codec **once** (with [`Pcm::play_explicit`], an explicit START), the
+/// path stays primed and every later open drains normally, in any order.
+///
+/// It is: the codec power/PLL in **High-Performance** mode (so the McPDM PDM clock runs
+/// from cold), the stock ABE DL1 mixer settings (spec 4.2), and the output [`route_controls`].
+/// Applied **before** opening the front-end PCM (so DPCM links the McPDM back-end at open).
+///
+/// | Control | Value | Why |
+/// |---|---|---|
+/// | `PLL Selection` | 1 = High-Performance (HPPLL) | McPDM clock from the 38.4 MHz MCLK, cold-reliable |
+/// | `TWL6040 Power Mode` | 1 = High-Performance | codec analog in high-performance mode |
+/// | `Headset Power Mode` | 1 = High-Performance | HSDAC (feeds the Earphone) in high-performance |
+/// | `DL1 Mono Mixer` | 0 | off (stock) |
+/// | `Sidetone Mixer Playback` | 1 | stock DL1 path |
+/// | `DL1 Mixer Voice` | 0 | only Multimedia feeds DL1 |
+/// | …then [`route_controls`] | | DL1 Mixer Multimedia / Media Vol / PDM Switch + EP (or Headset) output |
+pub fn prime_controls(headset: bool) -> Vec<(&'static str, i32)> {
+    let mut v = vec![
+        ("PLL Selection", 1),      // High-Performance (HPPLL)
+        ("TWL6040 Power Mode", 1), // High-Performance
+        ("Headset Power Mode", 1), // High-Performance
+        ("DL1 Mono Mixer", 0),
+        ("Sidetone Mixer Playback", 1),
+        ("DL1 Mixer Voice", 0),
+    ];
+    v.extend(route_controls(headset));
+    v
+}
+
+/// Applies [`prime_controls`] on the mixer, returning the per-control results for logging.
+pub fn set_prime(mixer: &Mixer, headset: bool) -> Vec<(&'static str, i32, io::Result<()>)> {
+    prime_controls(headset)
+        .into_iter()
+        .map(|(name, val)| {
+            let r = mixer.set(name, val);
+            (name, val, r)
+        })
+        .collect()
+}
+
+/// True if a USB earbud/headset is plugged into the Glass USB connector (the HAL reads
+/// this sysfs attribute, which measures the ID-pin resistor).
+pub fn headset_present() -> bool {
+    match fs::read_to_string("/sys/devices/platform/usb_mux.0/headset") {
+        Ok(s) => {
+            let s = s.trim();
+            s.starts_with("Mono") || s.starts_with("Stereo")
+        }
+        Err(_) => false,
+    }
+}
+
+/// Sets the output route on the mixer. Returns the per-control results for logging.
+pub fn set_route(mixer: &Mixer, headset: bool) -> Vec<(&'static str, i32, io::Result<()>)> {
+    route_controls(headset)
+        .into_iter()
+        .map(|(name, val)| {
+            let r = mixer.set(name, val);
+            (name, val, r)
+        })
+        .collect()
+}
+
+// ---- PCM playback ------------------------------------------------------------------
+
+#[repr(C)]
+struct Xferi {
+    result: libc::c_long,
+    buf: *const libc::c_void,
+    frames: libc::c_ulong,
+}
+
+pub struct Pcm {
+    fd: Fd,
+    pub period_size: u32,
+    pub buffer_size: u32,
+}
+
+impl Pcm {
+    /// Opens card 0 device 0 for playback, S16_LE / 48 kHz / stereo, and configures it.
+    pub fn open() -> io::Result<Pcm> {
+        Self::open_inner(&mut |_| {})
+    }
+
+    /// As [`Pcm::open`], but reports each hw_params attempt (which period/count set
+    /// succeeded or the errno/stage of each failure) through `emit` — for the diagnostic.
+    pub fn open_diag(emit: &mut dyn FnMut(&str)) -> io::Result<Pcm> {
+        Self::open_inner(emit)
+    }
+
+    fn open_inner(emit: &mut dyn FnMut(&str)) -> io::Result<Pcm> {
+        let fd = match open_snd(&format!("pcmC{CARD}D{DEVICE}p")) {
+            Ok(fd) => fd,
+            Err(e) => {
+                emit(&format!("pcmC{CARD}D{DEVICE}p open: FAIL: {e}"));
+                return Err(e);
+            }
+        };
+        // Try the ABE period from the spec first, then smaller/unconstrained fall-backs.
+        let attempts: [(u32, u32); 4] = [(14784, 2), (1920, 4), (1024, 4), (0, 0)];
+        let mut last = Error::other("no attempt");
+        for (ps, pc) in attempts {
+            match set_hw_params(&fd, ps, pc) {
+                Ok((period_size, buffer_size)) => {
+                    set_sw_params(&fd, period_size, buffer_size)?;
+                    ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())
+                        .map_err(|e| Error::new(e.kind(), format!("PREPARE: {e}")))?;
+                    emit(&format!(
+                        "HW_PARAMS ok: requested period {ps}/{pc} -> period {period_size} buffer {buffer_size} frames @ {RATE} Hz S16_LE stereo"
+                    ));
+                    return Ok(Pcm {
+                        fd,
+                        period_size,
+                        buffer_size,
+                    });
+                }
+                Err(e) => {
+                    emit(&format!(
+                        "HW_PARAMS period {ps}/{pc}: FAIL: {e}{}",
+                        errno_suffix(&e)
+                    ));
+                    last = Error::new(e.kind(), format!("HW_PARAMS (period {ps}/{pc}): {e}"));
+                }
+            }
+        }
+        Err(last)
+    }
+
+    /// Writes interleaved S16 stereo frames (blocking), then drains so the sound plays
+    /// out fully. Recovers once from an underrun.
+    pub fn play(&self, samples: &[i16]) -> io::Result<()> {
+        let _ = ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut());
+        let frames = (samples.len() / CHANNELS as usize) as libc::c_ulong;
+        let mut x = Xferi {
+            result: 0,
+            buf: samples.as_ptr() as *const libc::c_void,
+            frames,
+        };
+        let w = ioctl_ptr(
+            self.fd.0,
+            SNDRV_PCM_IOCTL_WRITEI_FRAMES,
+            &mut x as *mut _ as *mut _,
+        );
+        if let Err(e) = w {
+            if e.raw_os_error() == Some(libc::EPIPE) {
+                // underrun: prepare and retry once
+                ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())?;
+                x.result = 0;
+                ioctl_ptr(
+                    self.fd.0,
+                    SNDRV_PCM_IOCTL_WRITEI_FRAMES,
+                    &mut x as *mut _ as *mut _,
+                )
+                .map_err(|e| Error::new(e.kind(), format!("WRITEI: {e}")))?;
+            } else {
+                return Err(Error::new(e.kind(), format!("WRITEI: {e}")));
+            }
+        }
+        ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_DRAIN, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("DRAIN: {e}")))?;
+        Ok(())
+    }
+
+    /// Opens device 0 with an explicit period/count and start threshold (frames). Used by
+    /// the diagnostic to compare parameter sets. Leaves the stream PREPARED.
+    pub fn open_params(period: u32, periods: u32, start_threshold: u32) -> io::Result<Pcm> {
+        let fd = open_snd(&format!("pcmC{CARD}D{DEVICE}p"))?;
+        let (period_size, buffer_size) = set_hw_params(&fd, period, periods)?;
+        let st = if start_threshold == 0 {
+            buffer_size
+        } else {
+            start_threshold.min(buffer_size)
+        };
+        set_sw_params_st(&fd, period_size, buffer_size, st)?;
+        ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("PREPARE: {e}")))?;
+        Ok(Pcm {
+            fd,
+            period_size,
+            buffer_size,
+        })
+    }
+
+    pub fn prepare(&self) -> io::Result<()> {
+        ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("PREPARE: {e}")))
+    }
+
+    pub fn start(&self) -> io::Result<()> {
+        ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_START, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("START: {e}")))
+    }
+
+    pub fn drain(&self) -> io::Result<()> {
+        ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_DRAIN, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("DRAIN: {e}")))
+    }
+
+    /// One blocking interleaved write of `samples` (S16 stereo). Returns frames accepted.
+    pub fn writei(&self, samples: &[i16]) -> io::Result<usize> {
+        let frames = (samples.len() / CHANNELS as usize) as libc::c_ulong;
+        let mut x = Xferi {
+            result: 0,
+            buf: samples.as_ptr() as *const libc::c_void,
+            frames,
+        };
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_PCM_IOCTL_WRITEI_FRAMES,
+            &mut x as *mut _ as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("WRITEI: {e}")))?;
+        Ok(x.result as usize)
+    }
+
+    /// Plays `samples` with an **explicit START** after one period is queued: PREPARE,
+    /// write one period, START, write the rest, DRAIN. This is the sequence that makes the
+    /// OMAP4 ABE → McPDM → TWL6040 back-end actually clock from cold (confirmed on
+    /// hardware: variant V5). Writing a full period before START (rather than relying on
+    /// the start threshold) is what gets the DMA running on a cold codec.
+    pub fn play_explicit(&self, samples: &[i16]) -> io::Result<()> {
+        let ch = CHANNELS as usize;
+        let total = samples.len() / ch;
+        if total == 0 {
+            return Ok(());
+        }
+        let one = (self.period_size as usize).min(total);
+        self.prepare()?;
+        self.writei(&samples[..one * ch])?;
+        self.start()?;
+        if one < total {
+            self.writei(&samples[one * ch..])?;
+        }
+        self.drain()
+    }
+}
+
+impl Drop for Pcm {
+    fn drop(&mut self) {
+        let _ = ioctl_ptr(self.fd.0, SNDRV_PCM_IOCTL_DROP, std::ptr::null_mut());
+    }
+}
+
+fn set_hw_params(fd: &Fd, period_size: u32, periods: u32) -> io::Result<(u32, u32)> {
+    let mut p = [0u8; SIZEOF_HW_PARAMS];
+    // param_init: all masks full, all intervals [0, ~0], rmask/info all set.
+    for k in 0..3 {
+        put_u32(&mut p, HWP_MASK0 + k * 32, 0xffff_ffff);
+        put_u32(&mut p, HWP_MASK0 + k * 32 + 4, 0xffff_ffff);
+    }
+    for i in 0..12 {
+        put_u32(&mut p, HWP_INTERVAL0 + i * 12, 0); // min
+        put_u32(&mut p, HWP_INTERVAL0 + i * 12 + 4, 0xffff_ffff); // max
+    }
+    put_u32(&mut p, HWP_RMASK, 0xffff_ffff);
+    put_u32(&mut p, HWP_INFO, 0xffff_ffff);
+
+    set_mask(&mut p, P_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+    set_mask(&mut p, P_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
+    set_interval_exact(&mut p, P_CHANNELS, CHANNELS);
+    set_interval_exact(&mut p, P_RATE, RATE);
+    if period_size > 0 {
+        set_interval_exact(&mut p, P_PERIOD_SIZE, period_size);
+    }
+    if periods > 0 {
+        set_interval_exact(&mut p, P_PERIODS, periods);
+    }
+    ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_HW_PARAMS, p.as_mut_ptr() as *mut _)?;
+
+    // Read back the kernel's chosen period and buffer (interval min field).
+    let got_period = get_u32(&p, HWP_INTERVAL0 + (P_PERIOD_SIZE - FIRST_INTERVAL) * 12);
+    let got_buffer = get_u32(&p, HWP_INTERVAL0 + (P_BUFFER_SIZE - FIRST_INTERVAL) * 12);
+    let period = if got_period == 0 || got_period == 0xffff_ffff {
+        1024
+    } else {
+        got_period
+    };
+    let buffer = if got_buffer == 0 || got_buffer == 0xffff_ffff {
+        period * periods.max(2)
+    } else {
+        got_buffer
+    };
+    Ok((period, buffer))
+}
+
+fn set_sw_params(fd: &Fd, period_size: u32, buffer_size: u32) -> io::Result<()> {
+    set_sw_params_st(fd, period_size, buffer_size, 1)
+}
+
+fn set_sw_params_st(
+    fd: &Fd,
+    period_size: u32,
+    buffer_size: u32,
+    start_threshold: u32,
+) -> io::Result<()> {
+    // 26 u32 words = 104 bytes.
+    let mut w = [0u32; SIZEOF_SW_PARAMS / 4];
+    // boundary: largest multiple of buffer_size below 2^31.
+    let mut boundary = buffer_size.max(1);
+    while boundary <= 0x4000_0000 {
+        boundary = boundary.wrapping_mul(2);
+    }
+    boundary /= 2;
+    w[0] = 0; // tstamp_mode = NONE
+    w[1] = 1; // period_step
+    w[2] = 0; // sleep_min
+    w[3] = period_size; // avail_min
+    w[4] = 1; // xfer_align (obsolete)
+    w[5] = start_threshold.max(1); // start_threshold
+    w[6] = buffer_size; // stop_threshold
+    w[7] = 0; // silence_threshold
+    w[8] = 0; // silence_size
+    w[9] = boundary; // boundary
+                     // w[10] proto, w[11] tstamp_type, rest reserved: 0
+    ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_SW_PARAMS, w.as_mut_ptr() as *mut _)
+        .map_err(|e| Error::new(e.kind(), format!("SW_PARAMS: {e}")))
+}
+
+fn set_mask(p: &mut [u8], param: usize, value: u32) {
+    let off = HWP_MASK0 + param * 32;
+    for b in p[off..off + 32].iter_mut() {
+        *b = 0;
+    }
+    let word = (value / 32) as usize;
+    let bit = value % 32;
+    put_u32(p, off + word * 4, 1u32 << bit);
+}
+
+fn set_interval_exact(p: &mut [u8], param: usize, value: u32) {
+    let off = HWP_INTERVAL0 + (param - FIRST_INTERVAL) * 12;
+    put_u32(p, off, value); // min
+    put_u32(p, off + 4, value); // max
+    put_u32(p, off + 8, 0x4); // flags: integer = 1 (bit 2)
+}
+
+fn put_u32(buf: &mut [u8], off: usize, v: u32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn put_i32(buf: &mut [u8], off: usize, v: i32) {
+    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
+}
+fn get_u32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+fn get_i32(buf: &[u8], off: usize) -> i32 {
+    i32::from_le_bytes(buf[off..off + 4].try_into().unwrap())
+}
+
+// ---- sound synthesis ---------------------------------------------------------------
+
+/// A short tone segment: a frequency held for `ms` milliseconds.
+struct Seg {
+    freq: f32,
+    ms: f32,
+}
+
+/// Renders a sequence of tone segments to interleaved S16 stereo (same signal on both
+/// channels: the EP output is mono, and a mono earbud gets a correct down-mix). A short
+/// attack and an exponential decay on the whole sound avoid onset/offset clicks.
+fn render(segs: &[Seg], peak: f32) -> Vec<i16> {
+    let total_ms: f32 = segs.iter().map(|s| s.ms).sum();
+    let total = (total_ms * RATE as f32 / 1000.0) as usize;
+    let attack = (RATE as f32 * 0.0015) as usize; // 1.5 ms
+    let mut out = Vec::with_capacity(total * 2);
+    let mut phase = 0.0f32;
+    let mut seg_i = 0usize;
+    let mut seg_end = (segs[0].ms * RATE as f32 / 1000.0) as usize;
+    let mut freq = segs[0].freq;
+    for n in 0..total {
+        while n >= seg_end && seg_i + 1 < segs.len() {
+            seg_i += 1;
+            seg_end += (segs[seg_i].ms * RATE as f32 / 1000.0) as usize;
+            freq = segs[seg_i].freq;
+        }
+        phase += 2.0 * std::f32::consts::PI * freq / RATE as f32;
+        // Envelope: linear attack, then exponential decay over the whole sound.
+        let a = if n < attack {
+            n as f32 / attack as f32
+        } else {
+            1.0
+        };
+        let decay = (-3.0 * n as f32 / total as f32).exp();
+        let s = (phase.sin() * a * decay * peak * 32767.0) as i16;
+        out.push(s);
+        out.push(s);
+    }
+    out
+}
+
+/// The pre-rendered buffer for each UI cue.
+pub struct Clips {
+    card_change: Vec<i16>,
+    select: Vec<i16>,
+    menu_move: Vec<i16>,
+    toggle_on: Vec<i16>,
+    toggle_off: Vec<i16>,
+}
+
+impl Clips {
+    pub fn new() -> Clips {
+        Clips {
+            card_change: render(
+                &[Seg {
+                    freq: 1800.0,
+                    ms: 18.0,
+                }],
+                0.22,
+            ),
+            select: render(
+                &[
+                    Seg {
+                        freq: 1200.0,
+                        ms: 18.0,
+                    },
+                    Seg {
+                        freq: 1600.0,
+                        ms: 30.0,
+                    },
+                ],
+                0.28,
+            ),
+            menu_move: render(
+                &[Seg {
+                    freq: 2300.0,
+                    ms: 14.0,
+                }],
+                0.20,
+            ),
+            toggle_on: render(
+                &[
+                    Seg {
+                        freq: 900.0,
+                        ms: 20.0,
+                    },
+                    Seg {
+                        freq: 1400.0,
+                        ms: 28.0,
+                    },
+                ],
+                0.26,
+            ),
+            toggle_off: render(
+                &[
+                    Seg {
+                        freq: 1400.0,
+                        ms: 20.0,
+                    },
+                    Seg {
+                        freq: 900.0,
+                        ms: 28.0,
+                    },
+                ],
+                0.26,
+            ),
+        }
+    }
+
+    fn for_cue(&self, cue: Cue) -> &[i16] {
+        match cue {
+            Cue::CardChange => &self.card_change,
+            Cue::Select => &self.select,
+            Cue::MenuMove => &self.menu_move,
+            Cue::ToggleOn => &self.toggle_on,
+            Cue::ToggleOff => &self.toggle_off,
+        }
+    }
+}
+
+impl Default for Clips {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A clear, sustained single-frequency tone: `freq` Hz for `ms` milliseconds at `peak`
+/// (0..1 of full scale), with short linear attack/release so it is unmistakable but does
+/// not click. Interleaved S16 stereo (same on both channels). For the diagnostic sweep.
+pub fn tone(freq: f32, ms: f32, peak: f32) -> Vec<i16> {
+    let total = (ms * RATE as f32 / 1000.0) as usize;
+    let edge = (RATE as f32 * 0.008) as usize; // 8 ms attack / release
+    let mut out = Vec::with_capacity(total * 2);
+    let mut phase = 0.0f32;
+    for n in 0..total {
+        phase += 2.0 * std::f32::consts::PI * freq / RATE as f32;
+        let env = if n < edge {
+            n as f32 / edge as f32
+        } else if n >= total - edge {
+            (total - n) as f32 / edge as f32
+        } else {
+            1.0
+        };
+        let s = (phase.sin() * env * peak * 32767.0) as i16;
+        out.push(s);
+        out.push(s);
+    }
+    out
+}
+
+/// A clear, unmistakable startup chime: three ascending sustained notes, each long and
+/// loud with a short fade. Deliberately well above the cue level so it is obvious on the
+/// bone-conduction transducer (the earlier short/quiet two-note tone was inaudible).
+pub fn startup_tone() -> Vec<i16> {
+    let mut v = Vec::new();
+    for &freq in &[660.0f32, 880.0, 1320.0] {
+        v.extend_from_slice(&tone(freq, 230.0, 0.5));
+    }
+    v
+}
+
+// ---- the installed Feedback player -------------------------------------------------
+
+/// The on-device feedback player: a background audio thread owns the PCM and mixer, so
+/// [`Feedback::play`] only sends a cue and returns at once (never blocks the input loop).
+pub struct AlsaFeedback {
+    tx: mpsc::Sender<Snd>,
+}
+
+/// Playback period/count for the UI player: 1056 frames × 4 = low latency (~22 ms period,
+/// ~88 ms buffer) for snappy cues. Confirmed working on hardware once primed.
+const UI_PERIOD: u32 = 1056;
+const UI_PERIODS: u32 = 4;
+
+impl AlsaFeedback {
+    /// Opens the mixer, applies the cold-start priming set ([`prime_controls`], the "V5"
+    /// recipe), opens the PCM (1056×4), and **primes the codec once** by playing a short
+    /// startup tone with an explicit START (the step that makes the bone-conduction path
+    /// clock from cold). Then starts the audio thread, which plays each cue on the primed
+    /// path. Returns the player and a human-readable report (for the log).
+    pub fn start() -> (Option<AlsaFeedback>, Vec<String>) {
+        let mut report = Vec::new();
+        let mixer = match Mixer::open() {
+            Ok(m) => m,
+            Err(e) => {
+                report.push(format!("mixer open failed: {e}"));
+                return (None, report);
+            }
+        };
+        let headset = headset_present();
+        report.push(format!(
+            "route: {}",
+            if headset {
+                "USB earbud (Headset L/R)"
+            } else {
+                "bone conduction (Earphone/EP)"
+            }
+        ));
+        // Apply the full priming controls BEFORE opening the front-end (route-first), so
+        // DPCM links the McPDM back-end at open.
+        for (name, val, r) in set_prime(&mixer, headset) {
+            match r {
+                Ok(()) => report.push(format!("mixer {name} = {val}: ok")),
+                Err(e) => report.push(format!("mixer {name} = {val}: {e}")),
+            }
+        }
+        let pcm = match Pcm::open_params(UI_PERIOD, UI_PERIODS, 0) {
+            Ok(p) => {
+                report.push(format!(
+                    "pcm card{CARD} dev{DEVICE}: open ok (period {} buffer {} frames @ {RATE} Hz)",
+                    p.period_size, p.buffer_size
+                ));
+                p
+            }
+            Err(e) => {
+                report.push(format!("pcm open failed: {e}"));
+                return (None, report);
+            }
+        };
+        // Cold-prime + startup tone: one explicit-START play clocks the codec. After this,
+        // every per-cue play drains normally.
+        match pcm.play_explicit(&startup_tone()) {
+            Ok(()) => report.push("codec primed (startup tone played, explicit START)".into()),
+            Err(e) => report.push(format!("prime/startup tone FAILED: {e}")),
+        }
+
+        let (tx, rx) = mpsc::channel::<Snd>();
+        thread::Builder::new()
+            .name("ui-audio".into())
+            .spawn(move || {
+                use std::time::{Duration, Instant};
+                // Minimum gap between repeatable ticks (CardChange/MenuMove), so a fast
+                // scroll or any rapid repeat collapses to at most one tick per interval
+                // instead of stacking into a buzz. Discrete cues (Select/Toggle) and the
+                // chime always play. Each play is prepare->write->START->drain, so the PCM
+                // is drained (silent) between cues; nothing is emitted while idle.
+                const MIN_GAP: Duration = Duration::from_millis(70);
+                let clips = Clips::new();
+                let chime = startup_tone();
+                // keep the mixer handle alive for the session
+                let _mixer = mixer;
+                let mut last = Instant::now() - Duration::from_secs(1);
+                while let Ok(mut snd) = rx.recv() {
+                    // Coalesce a backlog (fast swipes) down to the latest sound.
+                    while let Ok(newer) = rx.try_recv() {
+                        snd = newer;
+                    }
+                    let repeatable =
+                        matches!(snd, Snd::Cue(Cue::CardChange) | Snd::Cue(Cue::MenuMove));
+                    if repeatable && last.elapsed() < MIN_GAP {
+                        continue;
+                    }
+                    last = Instant::now();
+                    let buf: &[i16] = match snd {
+                        Snd::Cue(cue) => clips.for_cue(cue),
+                        Snd::Chime => &chime,
+                    };
+                    let _ = pcm.play_explicit(buf);
+                }
+            })
+            .ok();
+        report.push("audio thread started".into());
+        (Some(AlsaFeedback { tx }), report)
+    }
+
+    /// Plays the startup chime (for the self-test audibility check).
+    pub fn play_chime(&mut self) {
+        let _ = self.tx.send(Snd::Chime);
+    }
+}
+
+/// A queued sound for the audio thread.
+enum Snd {
+    Cue(Cue),
+    Chime,
+}
+
+impl Feedback for AlsaFeedback {
+    fn play(&mut self, cue: Cue) {
+        let _ = self.tx.send(Snd::Cue(cue));
+    }
+}
+
+// ---- audio self-test (for the init's startup tone) ---------------------------------
+
+/// Applies the cold-start priming set ([`prime_controls`]) and plays a startup tone with
+/// an explicit START (the "V5" recipe), returning a log of each step. Used by
+/// `glass-launcher --audio-selftest` from the init. `true` if a tone was played.
+pub fn selftest() -> (bool, Vec<String>) {
+    let mut log = Vec::new();
+    let mixer = match Mixer::open() {
+        Ok(m) => {
+            log.push("controlC0 (mixer) open: ok".into());
+            m
+        }
+        Err(e) => {
+            log.push(format!("controlC0 open: FAIL: {e}"));
+            return (false, log);
+        }
+    };
+    let headset = headset_present();
+    log.push(format!("headset detected: {headset}"));
+    for (name, val, r) in set_prime(&mixer, headset) {
+        match r {
+            Ok(()) => log.push(format!("mixer {name} = {val}: ok")),
+            Err(e) => log.push(format!("mixer {name} = {val}: FAIL: {e}")),
+        }
+    }
+    let pcm = match Pcm::open_params(UI_PERIOD, UI_PERIODS, 0) {
+        Ok(p) => {
+            log.push(format!(
+                "pcmC0D0p open: ok (period {} buffer {} frames @ {RATE} Hz S16_LE stereo)",
+                p.period_size, p.buffer_size
+            ));
+            p
+        }
+        Err(e) => {
+            log.push(format!("pcmC0D0p open: FAIL: {e}"));
+            return (false, log);
+        }
+    };
+    match pcm.play_explicit(&startup_tone()) {
+        Ok(()) => {
+            log.push("startup tone: played (prime + explicit START + drain ok)".into());
+            (true, log)
+        }
+        Err(e) => {
+            log.push(format!("startup tone: FAIL: {e}"));
+            (false, log)
+        }
+    }
+}
+
+// ---- verbose on-screen diagnostic (for the fbcon diag image) -----------------------
+
+fn diag_play(emit: &mut dyn FnMut(&str), pcm: &Pcm, label: &str, buf: &[i16]) {
+    let frames = buf.len() / CHANNELS as usize;
+    match pcm.play_explicit(buf) {
+        Ok(()) => emit(&format!(
+            "{label}: wrote {frames} frames ({} bytes), explicit-START+drain ok",
+            frames * CHANNELS as usize * 2
+        )),
+        Err(e) => emit(&format!("{label}: PLAY FAIL: {e}{}", errno_suffix(&e))),
+    }
+}
+
+/// Applies `controls` on the mixer and reads each back, reporting written-vs-stuck values.
+fn diag_apply(emit: &mut dyn FnMut(&str), mixer: &Mixer, controls: &[(&'static str, i32)]) {
+    for &(name, val) in controls {
+        let w = mixer.set(name, val);
+        let rb = mixer.get(name);
+        match (w, rb) {
+            (Ok(()), Ok(v)) => emit(&format!("  set {name} = {val}; readback = {v:?}")),
+            (Ok(()), Err(e)) => emit(&format!("  set {name} = {val}; readback FAIL: {e}")),
+            (Err(e), _) => emit(&format!(
+                "  set {name} = {val}: FAIL: {e}{}",
+                errno_suffix(&e)
+            )),
+        }
+    }
+}
+
+/// One full verbose audio diagnostic pass, emitting each line through `emit` as it goes
+/// (so the init can show it on the framebuffer console in real time) and sleeping between
+/// tones so a human can read and listen. Steps a–g from the diagnosis request:
+/// dump cards + /dev/snd + the mixer control list; set the bone-conduction (EP) route and
+/// read it back; open the PCM (ABE period first, then fall-backs); play a clear 1 kHz
+/// tone; sweep the Earphone volume; then repeat on the USB-earbud route; finally a summary.
+pub fn diag(emit: &mut dyn FnMut(&str)) {
+    use std::time::Duration;
+    let sl = |ms: u64| std::thread::sleep(Duration::from_millis(ms));
+
+    emit("================ OMGB AUDIO DIAGNOSTIC ================");
+
+    // a. sound card + PCM node inventory
+    match fs::read_to_string("/proc/asound/cards") {
+        Ok(s) => {
+            for line in s.lines() {
+                emit(&format!("asound: {line}"));
+            }
+        }
+        Err(e) => emit(&format!("/proc/asound/cards: {e}")),
+    }
+    match fs::read_dir("/dev/snd") {
+        Ok(rd) => {
+            let mut names: Vec<String> = rd
+                .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+                .collect();
+            names.sort();
+            emit(&format!("/dev/snd nodes: {}", names.join(" ")));
+        }
+        Err(e) => emit(&format!("/dev/snd: {e}")),
+    }
+    emit(&format!(
+        "headset (usb_mux) detected: {}",
+        headset_present()
+    ));
+
+    // open the mixer and dump every control (exact names, for diagnosis)
+    let mixer = match Mixer::open() {
+        Ok(m) => {
+            emit("controlC0 (mixer) open: ok");
+            m
+        }
+        Err(e) => {
+            emit(&format!("controlC0 open: FAIL: {e} -- cannot continue"));
+            return;
+        }
+    };
+    match mixer.list() {
+        Ok(ctls) => {
+            emit(&format!("mixer exposes {} controls:", ctls.len()));
+            for (numid, iface, name) in &ctls {
+                emit(&format!("  ctl#{numid} iface{iface} {name:?}"));
+            }
+        }
+        Err(e) => emit(&format!("mixer control list: FAIL: {e}")),
+    }
+
+    // --- ROUTE 1: bone conduction (EP) ---
+    // Prime the route BEFORE opening the front-end (route-first) so the McPDM back-end is
+    // linked at open and the codec clocks from cold (the hardware-confirmed order).
+    emit("---- ROUTE 1: BONE CONDUCTION (TWL6040 Earphone / EP) ----");
+    diag_apply(emit, &mixer, &prime_controls(false));
+    // c. open the playback PCM once (reused for both routes)
+    let pcm = match Pcm::open_diag(emit) {
+        Ok(p) => p,
+        Err(e) => {
+            emit(&format!("PCM open FAILED: {e} -- no tones can play"));
+            return;
+        }
+    };
+    emit("playing a clear 1 kHz tone (1.5 s) on BONE CONDUCTION ...");
+    diag_play(emit, &pcm, "EP tone", &tone(1000.0, 1500.0, 0.25));
+    sl(500);
+    emit("-- EP VOLUME SWEEP: Earphone Playback Volume stepping to max (15) --");
+    for v in [6, 9, 12, 14, 15] {
+        let w = mixer.set("Earphone Playback Volume", v);
+        let rb = mixer.get("Earphone Playback Volume");
+        emit(&format!(
+            ">>> EP volume = {v} (set {w:?}, readback {rb:?}) -- ASCOLTA ORA (bone)"
+        ));
+        sl(400);
+        diag_play(
+            emit,
+            &pcm,
+            &format!("EP vol {v} tone"),
+            &tone(1000.0, 1000.0, 0.3),
+        );
+        sl(600);
+    }
+
+    // --- ROUTE 2: USB earbud / headset ---
+    emit("---- ROUTE 2: AURICOLARE/USB -- ATTACCA L'AURICOLARE SE VUOI ----");
+    diag_apply(emit, &mixer, &prime_controls(true));
+    emit("playing a clear 1 kHz tone (1.5 s) on HEADSET ...");
+    diag_play(emit, &pcm, "HS tone", &tone(1000.0, 1500.0, 0.25));
+    sl(500);
+    emit("-- HEADSET VOLUME SWEEP: Headset Playback Volume stepping to max (15) --");
+    for v in [8, 11, 13, 15] {
+        let w = mixer.set("Headset Playback Volume", v);
+        let rb = mixer.get("Headset Playback Volume");
+        emit(&format!(
+            ">>> HS volume = {v} (set {w:?}, readback {rb:?}) -- ASCOLTA ORA (auricolare)"
+        ));
+        sl(400);
+        diag_play(
+            emit,
+            &pcm,
+            &format!("HS vol {v} tone"),
+            &tone(1000.0, 1000.0, 0.3),
+        );
+        sl(600);
+    }
+
+    // g. summary
+    emit(&format!(
+        "SUMMARY: PCM period {} buffer {} @ {RATE} Hz S16_LE stereo; played EP(sweep 6..15) then HEADSET(sweep 8..15). Any 'FAIL'/'errno' line above marks the stage that broke.",
+        pcm.period_size, pcm.buffer_size
+    ));
+    emit("================ END OF DIAGNOSTIC PASS ================");
+}
+
+// ---- diag2: find the missing back-end (McPDM/TWL6040) bring-up ----------------------
+
+/// How a variant orders mixer-route vs PCM-open, and how it starts the stream.
+struct Variant {
+    label: &'static str,
+    /// Set the DAPM route/mixers BEFORE opening the PCM (true) or AFTER (false, the old
+    /// broken order).
+    route_first: bool,
+    /// Extra controls to apply before opening (codec power / PLL), name→value.
+    extra: &'static [(&'static str, i32)],
+    period: u32,
+    periods: u32,
+    /// Fill one period, issue SNDRV_PCM_IOCTL_START, then write the rest (true); else rely
+    /// on the start threshold to auto-start on the first write (false).
+    explicit_start: bool,
+}
+
+/// Runs one playback variant on the bone-conduction (EP) route and reports the result +
+/// elapsed time (a fast ~1 s = the DMA drained = SOUND; a ~19 s stall + EIO = back-end
+/// never clocked). Each variant is fully self-contained (own mixer route + PCM open).
+fn run_variant(emit: &mut dyn FnMut(&str), mixer: &Mixer, v: &Variant) {
+    use std::time::Instant;
+    emit(&format!("######## VARIANT {} ########", v.label));
+
+    let apply_controls = |emit: &mut dyn FnMut(&str)| {
+        for (name, val) in v.extra {
+            match mixer.set(name, *val) {
+                Ok(()) => {
+                    let rb = mixer.get(name).ok();
+                    emit(&format!("  pre: {name} = {val} (readback {rb:?})"));
+                }
+                Err(e) => emit(&format!("  pre: {name} = {val}: FAIL: {e}")),
+            }
+        }
+        diag_apply(emit, mixer, &route_controls(false)); // EP / bone-conduction route
+    };
+
+    if v.route_first {
+        apply_controls(emit);
+    }
+    let pcm = match Pcm::open_params(v.period, v.periods, if v.explicit_start { 0 } else { 1 }) {
+        Ok(p) => {
+            emit(&format!(
+                "  open ok: period {} buffer {} (requested {}/{})",
+                p.period_size, p.buffer_size, v.period, v.periods
+            ));
+            p
+        }
+        Err(e) => {
+            emit(&format!("  open FAIL: {e}{}", errno_suffix(&e)));
+            return;
+        }
+    };
+    if !v.route_first {
+        apply_controls(emit);
+    }
+
+    // ~0.8 s 1 kHz tone, interleaved stereo.
+    let buf = tone(1000.0, 800.0, 0.3);
+    let total = buf.len() / CHANNELS as usize;
+    let t0 = Instant::now();
+    let result: io::Result<()> = (|| {
+        if v.explicit_start {
+            // Fill one period, start, then write the remainder.
+            let one = (pcm.period_size as usize).min(total);
+            pcm.prepare()?;
+            pcm.writei(&buf[..one * CHANNELS as usize])?;
+            pcm.start()?;
+            if one < total {
+                pcm.writei(&buf[one * CHANNELS as usize..])?;
+            }
+        } else {
+            pcm.prepare()?;
+            pcm.writei(&buf)?; // auto-starts at the threshold
+        }
+        pcm.drain()
+    })();
+    let ms = t0.elapsed().as_millis();
+    match result {
+        Ok(()) => emit(&format!(
+            "  >>> PLAY OK in {ms} ms ({total} frames) -- SE SENTI UN TONO, QUESTA VARIANTE FUNZIONA ({})",
+            v.label
+        )),
+        Err(e) => emit(&format!(
+            "  >>> PLAY FAIL in {ms} ms: {e}{}",
+            errno_suffix(&e)
+        )),
+    }
+    // pcm dropped here (DROP ioctl) before the next variant.
+}
+
+/// Back-end bring-up experiment: try several orderings / periods / start methods / codec
+/// power-mode presets on the bone-conduction (EP) path, one per boot pass, so the log (and
+/// the ear) tell us which makes the DMA actually drain. Steps between variants with a gap.
+pub fn diag2(emit: &mut dyn FnMut(&str)) {
+    use std::time::Duration;
+    let sl = |ms: u64| std::thread::sleep(Duration::from_millis(ms));
+
+    emit("============ OMGB AUDIO DIAG2 (back-end bring-up) ============");
+    match fs::read_to_string("/proc/asound/cards") {
+        Ok(s) => {
+            for line in s.lines() {
+                emit(&format!("asound: {line}"));
+            }
+        }
+        Err(e) => emit(&format!("/proc/asound/cards: {e}")),
+    }
+    let mixer = match Mixer::open() {
+        Ok(m) => {
+            emit("controlC0 open: ok");
+            m
+        }
+        Err(e) => {
+            emit(&format!("controlC0 open FAIL: {e} -- abort"));
+            return;
+        }
+    };
+
+    // Codec power/PLL presets to try (enum item indices: 0=Low-Power, 1=High-Performance).
+    const HP: &[(&str, i32)] = &[
+        ("PLL Selection", 1),
+        ("TWL6040 Power Mode", 1),
+        ("Headset Power Mode", 1),
+    ];
+    // Full stock mixer table extras (spec 4.2), in case a widget is missing from the path.
+    const STOCK: &[(&str, i32)] = &[
+        ("PLL Selection", 1),
+        ("TWL6040 Power Mode", 1),
+        ("Headset Power Mode", 1),
+        ("DL1 Mono Mixer", 0),
+        ("Sidetone Mixer Playback", 1),
+        ("DL1 Mixer Voice", 0),
+    ];
+
+    let variants = [
+        // V0: the OLD (broken) order — route set AFTER opening the FE. Control case.
+        Variant {
+            label: "V0 old-order (route AFTER open), 14784/2, autostart",
+            route_first: false,
+            extra: &[],
+            period: 14784,
+            periods: 2,
+            explicit_start: false,
+        },
+        // V1: route FIRST, small non-mmap period (spec 7 recommendation), autostart.
+        Variant {
+            label: "V1 route-FIRST, 1056/4, autostart",
+            route_first: true,
+            extra: &[],
+            period: 1056,
+            periods: 4,
+            explicit_start: false,
+        },
+        // V2: route FIRST, small period, explicit PREPARE+START after one period.
+        Variant {
+            label: "V2 route-FIRST, 1056/4, explicit START",
+            route_first: true,
+            extra: &[],
+            period: 1056,
+            periods: 4,
+            explicit_start: true,
+        },
+        // V3: route FIRST, ABE period, explicit START.
+        Variant {
+            label: "V3 route-FIRST, 14784/2, explicit START",
+            route_first: true,
+            extra: &[],
+            period: 14784,
+            periods: 2,
+            explicit_start: true,
+        },
+        // V4: route FIRST + codec HP power/PLL preset, small period, explicit START.
+        Variant {
+            label: "V4 route-FIRST + PLL/PowerMode HP, 1056/4, explicit START",
+            route_first: true,
+            extra: HP,
+            period: 1056,
+            periods: 4,
+            explicit_start: true,
+        },
+        // V5: route FIRST + full stock mixer table + HP, small period, explicit START.
+        Variant {
+            label: "V5 route-FIRST + stock table + HP, 1056/4, explicit START",
+            route_first: true,
+            extra: STOCK,
+            period: 1056,
+            periods: 4,
+            explicit_start: true,
+        },
+    ];
+
+    for v in &variants {
+        run_variant(emit, &mixer, v);
+        sl(1200); // gap so a working tone is clearly separated from the next
+    }
+
+    emit("DIAG2 SUMMARY: read which VARIANT shows 'PLAY OK' in ~1 s (and you heard a tone).");
+    emit("A ~19 s stall + 'PLAY FAIL ... EIO' = that variant's back-end still did not clock.");
+    emit("================ END OF DIAG2 PASS ================");
+}

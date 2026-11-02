@@ -215,6 +215,13 @@ impl Timeline {
         self.drag.is_none() && self.anim.is_none()
     }
 
+    /// True while a touch is dragging the timeline (a finger is down and moving/resting on
+    /// it). Used to edge-trigger UI feedback on the committed destination only, never on
+    /// the live drag position.
+    pub fn is_dragging(&self) -> bool {
+        self.drag.is_some()
+    }
+
     /// True when the next [`Timeline::render`] would draw a different frame.
     pub fn needs_redraw(&self) -> bool {
         self.dirty
