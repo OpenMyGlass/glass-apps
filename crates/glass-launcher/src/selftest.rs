@@ -127,6 +127,16 @@ pub enum Req {
     Wifi(bool),
     Bluetooth(bool),
     Airplane(bool),
+    /// Enable/disable the glasshub wink interrupt (`wink_enabled` setting).
+    Wink(bool),
+    /// Enable/disable glasshub on-head detection (`on_head_detection_enabled` setting).
+    OnHead(bool),
+    /// Ask glassd for RELATIVE_LOOK_UP (a HeadRequest), so a head-up fires regardless of
+    /// screen state (plain look-up only fires with the screen off).
+    HeadRelative,
+    /// Hold the display awake (true) or release it so it can idle out (false, for the
+    /// screen_dim step).
+    KeepAwake(bool),
 }
 
 /// A sound the runner should play.
@@ -278,6 +288,13 @@ impl SelfTest {
             Some(Step::WifiToggle) => self.reqs.push(Req::Wifi(true)),
             Some(Step::BtToggle) => self.reqs.push(Req::Bluetooth(true)),
             Some(Step::Airplane) => self.reqs.push(Req::Airplane(true)),
+            // Sensors are gated off by default: enable them for their step (restored after).
+            // Head look-up only fires with the screen off, so request relative look-up.
+            Some(Step::HeadWake) => self.reqs.push(Req::HeadRelative),
+            Some(Step::Wink) => self.reqs.push(Req::Wink(true)),
+            Some(Step::OnHead) => self.reqs.push(Req::OnHead(true)),
+            // The dim step needs the screen to actually idle out: release the keep-awake.
+            Some(Step::ScreenDim) => self.reqs.push(Req::KeepAwake(false)),
             _ => {}
         }
     }
@@ -304,6 +321,14 @@ impl SelfTest {
                 self.skip += 1;
                 self.sounds.push(Sound::Cue(Cue::MenuMove));
             }
+        }
+        // Undo the per-step sensor enables / keep-awake release so later steps are not
+        // affected (restore defaults: wink + on-head off, keep the display awake again).
+        match step {
+            Step::Wink => self.reqs.push(Req::Wink(false)),
+            Step::OnHead => self.reqs.push(Req::OnHead(false)),
+            Step::ScreenDim => self.reqs.push(Req::KeepAwake(true)),
+            _ => {}
         }
         // Reset per-step scratch and advance.
         self.tp = (0, 0, 0, 0, false);

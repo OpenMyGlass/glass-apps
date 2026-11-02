@@ -282,9 +282,9 @@ pub fn route_controls(headset: bool) -> Vec<(&'static str, i32)> {
         v.push(("Headset Left Playback", 0));
         v.push(("Headset Right Playback", 0));
         v.push(("Earphone Playback Switch", 1));
-        // TWL6040 EP gain: 14 ~= +4 dB, nudged up from the 0 dB default for audibility on
-        // the transducer; still one step below the stock hardware cap of 15 (+6 dB).
-        v.push(("Earphone Playback Volume", 14));
+        // TWL6040 EP gain at the stock hardware cap: 15 = +6 dB (the stock XE24 maximum),
+        // for maximum audibility on the bone-conduction transducer.
+        v.push(("Earphone Playback Volume", 15));
     }
     v
 }
@@ -319,6 +319,35 @@ pub fn prime_controls(headset: bool) -> Vec<(&'static str, i32)> {
     ];
     v.extend(route_controls(headset));
     v
+}
+
+/// Reads back the full earpiece/codec path state for diagnosis (logged after priming): if
+/// a tone is still inaudible at max volume this shows the actual analog state to check next
+/// (HP power modes, PDM routing, DL1/EP gains, headset-vs-EP selection).
+pub fn ep_state_report(mixer: &Mixer) -> Vec<String> {
+    const EP_CONTROLS: &[&str] = &[
+        "DL1 Mixer Multimedia",
+        "DL1 Media Playback Volume",
+        "DL1 PDM Switch",
+        "Earphone Playback Switch",
+        "Earphone Playback Volume",
+        "Headset Left Playback",
+        "Headset Right Playback",
+        "Headset Playback Volume",
+        "Headset Power Mode",
+        "TWL6040 Power Mode",
+        "PLL Selection",
+        "Sidetone Mixer Playback",
+        "DL1 Mono Mixer",
+    ];
+    let mut out = vec!["EP mixer read-back:".to_string()];
+    for name in EP_CONTROLS {
+        match mixer.get(name) {
+            Ok(v) => out.push(format!("  {name} = {v:?}")),
+            Err(e) => out.push(format!("  {name}: read FAIL: {e}")),
+        }
+    }
+    out
 }
 
 /// Applies [`prime_controls`] on the mixer, returning the per-control results for logging.
@@ -794,11 +823,33 @@ pub fn tone(freq: f32, ms: f32, peak: f32) -> Vec<i16> {
 /// loud with a short fade. Deliberately well above the cue level so it is obvious on the
 /// bone-conduction transducer (the earlier short/quiet two-note tone was inaudible).
 pub fn startup_tone() -> Vec<i16> {
-    let mut v = Vec::new();
-    for &freq in &[660.0f32, 880.0, 1320.0] {
-        v.extend_from_slice(&tone(freq, 230.0, 0.5));
+    // A long (~2.5 s), loud (near full-scale), unmistakable tone for the audibility test:
+    // a slow siren sweeping 800↔1200 Hz, which is harder to miss than a steady tone and
+    // definitively answers "does any sound come out of the bone-conduction stack". With a
+    // short fade in/out so it does not click.
+    let total_ms = 2500.0f32;
+    let total = (total_ms * RATE as f32 / 1000.0) as usize;
+    let edge = (RATE as f32 * 0.02) as usize; // 20 ms fade
+    let peak = 0.9f32; // near full scale
+    let mut out = Vec::with_capacity(total * 2);
+    let mut phase = 0.0f32;
+    for n in 0..total {
+        // Siren: 800..1200 Hz, ~1.4 Hz sweep.
+        let sweep = (2.0 * std::f32::consts::PI * 1.4 * n as f32 / RATE as f32).sin();
+        let freq = 1000.0 + 200.0 * sweep;
+        phase += 2.0 * std::f32::consts::PI * freq / RATE as f32;
+        let env = if n < edge {
+            n as f32 / edge as f32
+        } else if n >= total - edge {
+            (total - n) as f32 / edge as f32
+        } else {
+            1.0
+        };
+        let s = (phase.sin() * env * peak * 32767.0) as i16;
+        out.push(s);
+        out.push(s);
     }
-    v
+    out
 }
 
 // ---- the installed Feedback player -------------------------------------------------
@@ -845,6 +896,11 @@ impl AlsaFeedback {
                 Ok(()) => report.push(format!("mixer {name} = {val}: ok")),
                 Err(e) => report.push(format!("mixer {name} = {val}: {e}")),
             }
+        }
+        // Full EP/codec mixer read-back, so if the tone is still inaudible we can see the
+        // actual analog path state (what to check next: HP mode, gains, PDM routing).
+        for line in ep_state_report(&mixer) {
+            report.push(line);
         }
         let pcm = match Pcm::open_params(UI_PERIOD, UI_PERIODS, 0) {
             Ok(p) => {
