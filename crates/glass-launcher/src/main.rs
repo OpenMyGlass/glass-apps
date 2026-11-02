@@ -149,8 +149,8 @@ fn parse_args() -> Result<Args, String> {
     if a.glassd.is_some() && a.window && a.out.is_some() {
         return Err("--glassd takes --out or --window, not both".into());
     }
-    if a.fb.is_some() && a.glassd.is_none() {
-        return Err("--display fb needs --glassd".into());
+    if a.fb.is_some() && a.glassd.is_none() && !a.self_test && !a.audio_sweep {
+        return Err("--display fb needs --glassd (or --self-test / --audio-sweep)".into());
     }
     if a.fb.is_some() && (a.window || a.out.is_some()) {
         return Err("--display fb excludes --out and --window".into());
