@@ -172,7 +172,9 @@ impl FramebufferDisplay {
 
         let bpp = vinfo.bits_per_pixel;
         if bpp == 0 || bpp % 8 != 0 {
-            return Err(DisplayError::Io(format!("unsupported bits_per_pixel {bpp}")));
+            return Err(DisplayError::Io(format!(
+                "unsupported bits_per_pixel {bpp}"
+            )));
         }
         let bytes_pp = (bpp / 8) as usize;
         let line_length = if finfo.line_length != 0 {
@@ -286,7 +288,6 @@ impl FramebufferDisplay {
             }
         }
     }
-
 }
 
 impl Convert {
@@ -408,7 +409,11 @@ impl Display for FramebufferDisplay {
                 if !first && srow == lrow {
                     continue;
                 }
-                let (lo, hi) = if first { (0, w) } else { changed_span(srow, lrow) };
+                let (lo, hi) = if first {
+                    (0, w)
+                } else {
+                    changed_span(srow, lrow)
+                };
                 if lo >= hi {
                     continue;
                 }

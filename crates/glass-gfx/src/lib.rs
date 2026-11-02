@@ -12,10 +12,10 @@
 
 mod color;
 mod display;
-#[cfg(all(feature = "fb", target_os = "linux"))]
-pub mod framebuffer;
 pub mod fonts;
 mod frame;
+#[cfg(all(feature = "fb", target_os = "linux"))]
+pub mod framebuffer;
 pub mod golden;
 mod render;
 pub mod text;
@@ -24,11 +24,11 @@ pub mod window;
 
 pub use color::Color;
 pub use display::{Display, DisplayError, HeadlessDisplay};
-#[cfg(all(feature = "fb", target_os = "linux"))]
-pub use framebuffer::FramebufferDisplay;
 pub use fontdue::Font;
 pub use fonts::Weight;
 pub use frame::{Frame, ImageError, Rect};
+#[cfg(all(feature = "fb", target_os = "linux"))]
+pub use framebuffer::FramebufferDisplay;
 pub use render::{
     Compositor, GfxError, LayerId, Painter, Placement, SkiaPainter, SoftwareCompositor,
     WindowTarget,
