@@ -52,6 +52,10 @@ usage:
                   set the TWL6040 bone-conduction (Earphone/EP) mixer route and play a
                   startup test tone on ALSA card 0, log each step, then exit (device
                   builds with the `sound` feature)
+  --self-test     guided on-screen self-test walkthrough (needs `fb`): exercises nav,
+                  touch precision, audio, head/wink/wear, radios, i18n and the screen
+                  policy, logging one OMGB-SELFTEST: line per step. With --glassd SOCKET
+                  and --display fb /dev/fb0.
   --audio-diag    verbose on-screen audio diagnostic: dump /proc/asound/cards, /dev/snd
                   and the mixer control list; set the bone-conduction (EP) route and read
                   each control back; open the PCM (ABE period, then fall-backs); play a
@@ -83,6 +87,8 @@ struct Args {
     /// `--audio-diag2`: back-end bring-up experiment (several ordering/period/start/power
     /// variants on the EP path), log each with timing, exit.
     audio_diag2: bool,
+    /// `--self-test`: run the guided on-screen self-test walkthrough (needs `fb`).
+    self_test: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -114,6 +120,7 @@ fn parse_args() -> Result<Args, String> {
             "--audio-selftest" => a.audio_selftest = true,
             "--audio-diag" => a.audio_diag = true,
             "--audio-diag2" => a.audio_diag2 = true,
+            "--self-test" => a.self_test = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -351,6 +358,191 @@ fn run_audio_diag2() -> Result<(), String> {
     }
 }
 
+/// `--self-test`: the guided on-screen walkthrough. Renders instruction cards to the
+/// framebuffer, drives the [`selftest::SelfTest`] machine from glassd frames, plays the
+/// audio cues, and logs one `OMGB-SELFTEST:` line per step to stderr (the image's init
+/// tees that to /dev/console and /dev/kmsg).
+#[cfg(all(feature = "fb", target_os = "linux"))]
+fn run_self_test(args: &Args) -> Result<(), String> {
+    use glass_api::proto::{client_frame, screen_request, service_frame, ScreenRequest, Topic};
+    use glass_api::Client;
+    #[cfg(feature = "sound")]
+    use glass_launcher::feedback::Feedback;
+    use glass_launcher::panel::Panel;
+    use glass_launcher::selftest::{Ev, SelfTest, Sound};
+    use glass_ui::i18n::Locale;
+    use glass_ui::{CardContent, InputEvent};
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+
+    let path = glassd::socket(args.glassd.clone().flatten());
+    let dev = args.fb.clone().unwrap_or_else(|| PathBuf::from("/dev/fb0"));
+    // Italian owner; the self-test runs in Italian (English for the untranslated bits).
+    let locale = Locale::It;
+    let base = clock::now();
+    let ctx = RenderContext {
+        now_s: base.now_s,
+        hour: base.hour,
+        minute: base.minute,
+        locale,
+    };
+
+    let emit = |line: &str| {
+        let mut e = std::io::stderr();
+        let _ = writeln!(e, "OMGB-SELFTEST: {line}");
+        let _ = e.flush();
+    };
+
+    let mut compositor = compositor_for(Some(Renderer::Software))?;
+    let mut display = glass_gfx::FramebufferDisplay::open(&dev).map_err(|e| e.to_string())?;
+
+    // Audio player (primes the codec + plays the startup chime). Optional.
+    #[cfg(feature = "sound")]
+    let mut audio = {
+        let (player, report) = glass_launcher::audio::AlsaFeedback::start();
+        for l in &report {
+            emit(&format!("audio: {l}"));
+        }
+        player
+    };
+
+    // Connect to glassd (best effort: without it, every step simply times out → SKIP).
+    let mut client = match Client::connect_as(&path, glassd::CLIENT_NAME) {
+        Ok(mut c) => {
+            let _ = c.subscribe(&[
+                Topic::Gesture,
+                Topic::Head,
+                Topic::Wear,
+                Topic::Screen,
+                Topic::Settings,
+            ]);
+            let _ = c.acquire_focus();
+            // Keep the screen on for the walkthrough (except the screen_dim step is fine
+            // to observe within its own window).
+            let _ = c.send(client_frame::Body::Screen(ScreenRequest {
+                action: screen_request::Action::KeepOn as i32,
+                duration_ms: 600_000,
+            }));
+            emit(&format!(
+                "connected to glassd (capabilities: {})",
+                c.welcome().capabilities.join(", ")
+            ));
+            Some(c)
+        }
+        Err(e) => {
+            emit(&format!(
+                "glassd unavailable ({e}); steps will time out to SKIP"
+            ));
+            None
+        }
+    };
+
+    let frame_to_ev = |body: &service_frame::Body| -> Option<Ev> {
+        match body {
+            service_frame::Body::HeadGesture(_) => Some(Ev::Head),
+            service_frame::Body::Wink(_) => Some(Ev::Wink),
+            service_frame::Body::WearState(w) => Some(Ev::Wear {
+                on_head: w.wear == glass_api::proto::Wear::OnHead as i32,
+            }),
+            service_frame::Body::ScreenState(s) => Some(Ev::Screen {
+                lit: s.screen == glass_api::proto::Screen::On as i32,
+            }),
+            other => match glassd::to_input(other) {
+                Some(InputEvent::Gesture { kind, .. }) => Some(Ev::Gesture(kind)),
+                _ => None,
+            },
+        }
+    };
+
+    let card = |st: &SelfTest| -> CardContent {
+        let (title, body) = st.card();
+        CardContent::Info {
+            title,
+            lines: vec![body],
+        }
+    };
+
+    let mut st = SelfTest::new(locale);
+    for l in st.take_log() {
+        emit(&l);
+    }
+    let mut panel = Panel::new(card(&st), ctx);
+    let mut last = Instant::now();
+
+    loop {
+        panel.set(card(&st));
+        panel
+            .render(compositor.as_mut())
+            .map_err(|e| e.to_string())?;
+        compositor
+            .present(&mut display)
+            .map_err(|e| e.to_string())?;
+
+        if let Some(c) = client.as_mut() {
+            match c.recv(Some(Duration::from_millis(60))) {
+                Ok(Some(frame)) => {
+                    if let Some(ev) = frame.body.as_ref().and_then(frame_to_ev) {
+                        st.on_event(ev);
+                    }
+                    while let Ok(Some(f)) = c.try_recv() {
+                        if let Some(ev) = f.body.as_ref().and_then(frame_to_ev) {
+                            st.on_event(ev);
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    emit(&format!("glassd connection lost ({e}); steps will SKIP"));
+                    client = None;
+                }
+            }
+        } else {
+            std::thread::sleep(Duration::from_millis(60));
+        }
+
+        let now = Instant::now();
+        st.tick((now - last).as_secs_f32());
+        last = now;
+
+        for s in st.take_sounds() {
+            match s {
+                #[cfg(feature = "sound")]
+                Sound::Cue(cue) => {
+                    if let Some(a) = audio.as_mut() {
+                        a.play(cue);
+                    }
+                }
+                #[cfg(feature = "sound")]
+                Sound::Chime => {
+                    if let Some(a) = audio.as_mut() {
+                        a.play_chime();
+                    }
+                }
+                #[cfg(not(feature = "sound"))]
+                _ => {}
+            }
+        }
+        for l in st.take_log() {
+            emit(&l);
+        }
+        if st.is_done() {
+            break;
+        }
+    }
+
+    // Leave the summary card up for a few seconds before returning (init reboots after).
+    panel.set(card(&st));
+    let _ = panel.render(compositor.as_mut());
+    let _ = compositor.present(&mut display);
+    std::thread::sleep(Duration::from_secs(6));
+    Ok(())
+}
+
+#[cfg(not(all(feature = "fb", target_os = "linux")))]
+fn run_self_test(_args: &Args) -> Result<(), String> {
+    Err("this build has no framebuffer support: rebuild with --features fb on Linux".into())
+}
+
 fn run_glassd(args: &Args) -> Result<(), String> {
     let path = glassd::socket(args.glassd.clone().flatten());
     let clock = clock_for(args);
@@ -464,7 +656,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.audio_diag2 {
+    let result = if args.self_test {
+        run_self_test(&args)
+    } else if args.audio_diag2 {
         run_audio_diag2()
     } else if args.audio_diag {
         run_audio_diag()

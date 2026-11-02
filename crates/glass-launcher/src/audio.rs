@@ -806,7 +806,7 @@ pub fn startup_tone() -> Vec<i16> {
 /// The on-device feedback player: a background audio thread owns the PCM and mixer, so
 /// [`Feedback::play`] only sends a cue and returns at once (never blocks the input loop).
 pub struct AlsaFeedback {
-    tx: mpsc::Sender<Cue>,
+    tx: mpsc::Sender<Snd>,
 }
 
 /// Playback period/count for the UI player: 1056 frames × 4 = low latency (~22 ms period,
@@ -866,43 +866,60 @@ impl AlsaFeedback {
             Err(e) => report.push(format!("prime/startup tone FAILED: {e}")),
         }
 
-        let (tx, rx) = mpsc::channel::<Cue>();
+        let (tx, rx) = mpsc::channel::<Snd>();
         thread::Builder::new()
             .name("ui-audio".into())
             .spawn(move || {
                 use std::time::{Duration, Instant};
                 // Minimum gap between repeatable ticks (CardChange/MenuMove), so a fast
                 // scroll or any rapid repeat collapses to at most one tick per interval
-                // instead of stacking into a buzz. Discrete cues (Select/Toggle) always
-                // play. Each play is prepare->write->START->drain, so the PCM is drained
-                // (silent) between cues; nothing is emitted while idle.
+                // instead of stacking into a buzz. Discrete cues (Select/Toggle) and the
+                // chime always play. Each play is prepare->write->START->drain, so the PCM
+                // is drained (silent) between cues; nothing is emitted while idle.
                 const MIN_GAP: Duration = Duration::from_millis(70);
                 let clips = Clips::new();
+                let chime = startup_tone();
                 // keep the mixer handle alive for the session
                 let _mixer = mixer;
                 let mut last = Instant::now() - Duration::from_secs(1);
-                while let Ok(mut cue) = rx.recv() {
-                    // Coalesce a backlog (fast swipes) down to the latest cue.
+                while let Ok(mut snd) = rx.recv() {
+                    // Coalesce a backlog (fast swipes) down to the latest sound.
                     while let Ok(newer) = rx.try_recv() {
-                        cue = newer;
+                        snd = newer;
                     }
-                    let repeatable = matches!(cue, Cue::CardChange | Cue::MenuMove);
+                    let repeatable =
+                        matches!(snd, Snd::Cue(Cue::CardChange) | Snd::Cue(Cue::MenuMove));
                     if repeatable && last.elapsed() < MIN_GAP {
                         continue;
                     }
                     last = Instant::now();
-                    let _ = pcm.play_explicit(clips.for_cue(cue));
+                    let buf: &[i16] = match snd {
+                        Snd::Cue(cue) => clips.for_cue(cue),
+                        Snd::Chime => &chime,
+                    };
+                    let _ = pcm.play_explicit(buf);
                 }
             })
             .ok();
         report.push("audio thread started".into());
         (Some(AlsaFeedback { tx }), report)
     }
+
+    /// Plays the startup chime (for the self-test audibility check).
+    pub fn play_chime(&mut self) {
+        let _ = self.tx.send(Snd::Chime);
+    }
+}
+
+/// A queued sound for the audio thread.
+enum Snd {
+    Cue(Cue),
+    Chime,
 }
 
 impl Feedback for AlsaFeedback {
     fn play(&mut self, cue: Cue) {
-        let _ = self.tx.send(cue);
+        let _ = self.tx.send(Snd::Cue(cue));
     }
 }
 

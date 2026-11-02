@@ -14,6 +14,7 @@ pub mod feedback;
 pub mod glassd;
 pub mod panel;
 pub mod script;
+pub mod selftest;
 pub mod setup;
 
 /// The on-device ALSA sound player (bone-conduction UI feedback). Only on Linux with the
