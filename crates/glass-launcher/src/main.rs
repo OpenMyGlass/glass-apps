@@ -364,12 +364,14 @@ fn run_audio_diag2() -> Result<(), String> {
 /// tees that to /dev/console and /dev/kmsg).
 #[cfg(all(feature = "fb", target_os = "linux"))]
 fn run_self_test(args: &Args) -> Result<(), String> {
-    use glass_api::proto::{client_frame, screen_request, service_frame, ScreenRequest, Topic};
+    use glass_api::proto::{
+        client_frame, screen_request, service_frame, ScreenRequest, SetSettings, Settings, Topic,
+    };
     use glass_api::Client;
     #[cfg(feature = "sound")]
     use glass_launcher::feedback::Feedback;
     use glass_launcher::panel::Panel;
-    use glass_launcher::selftest::{Ev, SelfTest, Sound};
+    use glass_launcher::selftest::{Ev, Req, SelfTest, Sound};
     use glass_ui::i18n::Locale;
     use glass_ui::{CardContent, InputEvent};
     use std::io::Write;
@@ -406,36 +408,53 @@ fn run_self_test(args: &Args) -> Result<(), String> {
         player
     };
 
-    // Connect to glassd (best effort: without it, every step simply times out → SKIP).
-    let mut client = match Client::connect_as(&path, glassd::CLIENT_NAME) {
-        Ok(mut c) => {
-            let _ = c.subscribe(&[
-                Topic::Gesture,
-                Topic::Head,
-                Topic::Wear,
-                Topic::Screen,
-                Topic::Settings,
-            ]);
-            let _ = c.acquire_focus();
-            // Keep the screen on for the walkthrough (except the screen_dim step is fine
-            // to observe within its own window).
-            let _ = c.send(client_frame::Body::Screen(ScreenRequest {
-                action: screen_request::Action::KeepOn as i32,
-                duration_ms: 600_000,
-            }));
-            emit(&format!(
-                "connected to glassd (capabilities: {})",
-                c.welcome().capabilities.join(", ")
-            ));
-            Some(c)
+    // Connect to glassd, retrying: the socket can exist before glassd is ready to finish
+    // the handshake (a slow startup would otherwise fail with "no Welcome"). Logs when the
+    // socket appears vs when the handshake succeeds, so the connection is verifiable.
+    let mut client: Option<Client> = None;
+    for attempt in 1..=20u32 {
+        let sock = std::fs::metadata(&path).is_ok();
+        match Client::connect_as(&path, glassd::CLIENT_NAME) {
+            Ok(mut c) => {
+                let _ = c.subscribe(&[
+                    Topic::Gesture,
+                    Topic::Head,
+                    Topic::Wear,
+                    Topic::Screen,
+                    Topic::Settings,
+                ]);
+                let _ = c.acquire_focus();
+                // Keep the screen on and bright for the whole walkthrough.
+                let _ = c.send(client_frame::Body::Screen(ScreenRequest {
+                    action: screen_request::Action::KeepOn as i32,
+                    duration_ms: 600_000,
+                }));
+                let _ = c.send(client_frame::Body::SetSettings(SetSettings {
+                    settings: Some(Settings {
+                        screen_timeout_ms: Some(600_000),
+                        ..Default::default()
+                    }),
+                }));
+                emit(&format!(
+                    "connected to glassd on attempt {attempt} (socket {}): Welcome caps=[{}]",
+                    if sock { "present" } else { "absent" },
+                    c.welcome().capabilities.join(", ")
+                ));
+                client = Some(c);
+                break;
+            }
+            Err(e) => {
+                emit(&format!(
+                    "connect attempt {attempt}: socket {}, no handshake yet ({e})",
+                    if sock { "present" } else { "absent" }
+                ));
+                std::thread::sleep(Duration::from_millis(500));
+            }
         }
-        Err(e) => {
-            emit(&format!(
-                "glassd unavailable ({e}); steps will time out to SKIP"
-            ));
-            None
-        }
-    };
+    }
+    if client.is_none() {
+        emit("glassd unavailable after 20 attempts; steps will time out to SKIP");
+    }
 
     let frame_to_ev = |body: &service_frame::Body| -> Option<Ev> {
         match body {
@@ -446,6 +465,11 @@ fn run_self_test(args: &Args) -> Result<(), String> {
             }),
             service_frame::Body::ScreenState(s) => Some(Ev::Screen {
                 lit: s.screen == glass_api::proto::Screen::On as i32,
+            }),
+            service_frame::Body::Settings(s) => Some(Ev::Settings {
+                wifi: s.wifi_enabled,
+                bt: s.bluetooth_enabled,
+                airplane: s.airplane_mode,
             }),
             other => match glassd::to_input(other) {
                 Some(InputEvent::Gesture { kind, .. }) => Some(Ev::Gesture(kind)),
@@ -468,8 +492,43 @@ fn run_self_test(args: &Args) -> Result<(), String> {
     }
     let mut panel = Panel::new(card(&st), ctx);
     let mut last = Instant::now();
+    let mut last_poke = Instant::now();
 
     loop {
+        // Keep-awake: a periodic UserActivity resets glassd's screen-off timer regardless
+        // of the keep-on hold, so the display never idles out during the walkthrough.
+        if last_poke.elapsed() >= Duration::from_secs(2) {
+            if let Some(c) = client.as_mut() {
+                let _ = c.send(client_frame::Body::Screen(ScreenRequest {
+                    action: screen_request::Action::UserActivity as i32,
+                    duration_ms: 0,
+                }));
+            }
+            last_poke = Instant::now();
+        }
+        // Send any settings requests the machine queued (radio toggles for verification).
+        for req in st.take_reqs() {
+            if let Some(c) = client.as_mut() {
+                let s = match req {
+                    Req::Wifi(v) => Settings {
+                        wifi_enabled: Some(v),
+                        ..Default::default()
+                    },
+                    Req::Bluetooth(v) => Settings {
+                        bluetooth_enabled: Some(v),
+                        ..Default::default()
+                    },
+                    Req::Airplane(v) => Settings {
+                        airplane_mode: Some(v),
+                        ..Default::default()
+                    },
+                };
+                let _ = c.send(client_frame::Body::SetSettings(SetSettings {
+                    settings: Some(s),
+                }));
+            }
+        }
+
         panel.set(card(&st));
         panel
             .render(compositor.as_mut())

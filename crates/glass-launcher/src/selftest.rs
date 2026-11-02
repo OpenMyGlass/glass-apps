@@ -112,6 +112,21 @@ pub enum Ev {
     Screen {
         lit: bool,
     },
+    /// A `Settings` snapshot/update from glassd (radio state for the toggle steps).
+    Settings {
+        wifi: Option<bool>,
+        bt: Option<bool>,
+        airplane: Option<bool>,
+    },
+}
+
+/// A settings request the runner should send to glassd (`SetSettings`), to drive the
+/// radio/airplane steps and verify the state actually changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Req {
+    Wifi(bool),
+    Bluetooth(bool),
+    Airplane(bool),
 }
 
 /// A sound the runner should play.
@@ -151,6 +166,7 @@ pub struct SelfTest {
     skip: u32,
     log: Vec<String>,
     sounds: Vec<Sound>,
+    reqs: Vec<Req>,
     /// `touch_precision`: (taps_ok, taps_seen, swipes_ok, swipes_seen, in_swipe_phase).
     tp: (u32, u32, u32, u32, bool),
     /// `on_head`: whether a doff has been seen (waiting for the following don).
@@ -176,6 +192,7 @@ impl SelfTest {
             skip: 0,
             log: Vec::new(),
             sounds: Vec::new(),
+            reqs: Vec::new(),
             tp: (0, 0, 0, 0, false),
             doffed: false,
             lang_shown: 0,
@@ -214,6 +231,11 @@ impl SelfTest {
         std::mem::take(&mut self.sounds)
     }
 
+    /// Settings requests (`SetSettings`) the runner should send since the last call.
+    pub fn take_reqs(&mut self) -> Vec<Req> {
+        std::mem::take(&mut self.reqs)
+    }
+
     /// The instruction card for the current step: (title, body).
     pub fn card(&self) -> (String, String) {
         let Some(step) = self.step() else {
@@ -245,10 +267,18 @@ impl SelfTest {
         }
         self.entered = true;
         self.elapsed = 0.0;
-        if let Some(Step::AudioTone) = self.step() {
-            // Play the startup chime + a tick for the audibility check.
-            self.sounds.push(Sound::Chime);
-            self.sounds.push(Sound::Cue(Cue::Select));
+        match self.step() {
+            Some(Step::AudioTone) => {
+                // Play the startup chime + a tick for the audibility check.
+                self.sounds.push(Sound::Chime);
+                self.sounds.push(Sound::Cue(Cue::Select));
+            }
+            // Radio steps drive themselves: ask glassd to turn the radio on, then verify
+            // the state actually changes (via the Settings echo) and restore it.
+            Some(Step::WifiToggle) => self.reqs.push(Req::Wifi(true)),
+            Some(Step::BtToggle) => self.reqs.push(Req::Bluetooth(true)),
+            Some(Step::Airplane) => self.reqs.push(Req::Airplane(true)),
+            _ => {}
         }
     }
 
@@ -378,11 +408,32 @@ impl SelfTest {
                 }
                 _ => {}
             },
-            // Radio/airplane: the launcher's pinned glass-api Settings carries no radio
-            // state, so these are owner-confirmed: toggle it, then tap to confirm.
-            Step::WifiToggle | Step::BtToggle | Step::Airplane => {
-                if let Ev::Gesture(GestureKind::Tap) = ev {
-                    self.finish_step(Res::Pass, "tap_confirmed");
+            // Radio/airplane: real state verification. On entering the step the machine
+            // asked glassd (SetSettings) to turn the radio on; here we confirm glassd
+            // echoed the new state, then restore it off.
+            Step::WifiToggle => {
+                if let Ev::Settings {
+                    wifi: Some(true), ..
+                } = ev
+                {
+                    self.reqs.push(Req::Wifi(false));
+                    self.finish_step(Res::Pass, "wifi=on_verified");
+                }
+            }
+            Step::BtToggle => {
+                if let Ev::Settings { bt: Some(true), .. } = ev {
+                    self.reqs.push(Req::Bluetooth(false));
+                    self.finish_step(Res::Pass, "bt=on_verified");
+                }
+            }
+            Step::Airplane => {
+                if let Ev::Settings {
+                    airplane: Some(true),
+                    ..
+                } = ev
+                {
+                    self.reqs.push(Req::Airplane(false));
+                    self.finish_step(Res::Pass, "airplane=on_verified");
                 }
             }
             Step::Language => {} // time-driven only
@@ -554,23 +605,23 @@ fn instruction(step: Step, locale: Locale) -> &'static str {
         }
         Step::WifiToggle => {
             if it {
-                "Attiva il WiFi, poi fai tap"
+                "Verifico il WiFi (automatico)..."
             } else {
-                "Turn Wi-Fi on, then tap"
+                "Verifying Wi-Fi (automatic)..."
             }
         }
         Step::BtToggle => {
             if it {
-                "Attiva il Bluetooth, poi fai tap"
+                "Verifico il Bluetooth (automatico)..."
             } else {
-                "Turn Bluetooth on, then tap"
+                "Verifying Bluetooth (automatic)..."
             }
         }
         Step::Airplane => {
             if it {
-                "Attiva modalità aereo, poi fai tap"
+                "Verifico modalità aereo (automatico)..."
             } else {
-                "Turn on airplane mode, then tap"
+                "Verifying airplane mode (automatic)..."
             }
         }
         Step::Language => "", // body built in card() (cycles locales)
