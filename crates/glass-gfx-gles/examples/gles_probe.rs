@@ -68,7 +68,9 @@ fn log(msg: &str) {
 }
 
 fn render_home(c: &mut GlesCompositor) -> Result<(), String> {
-    timeline().render(c).map_err(|e| format!("timeline render: {e}"))?;
+    timeline()
+        .render(c)
+        .map_err(|e| format!("timeline render: {e}"))?;
     Ok(())
 }
 
@@ -122,8 +124,12 @@ fn window(provider: Option<String>) -> Result<(), String> {
     let provider = provider
         .or_else(|| std::env::var("GLASS_NATIVE_WINDOW_LIB").ok())
         .ok_or("window: no native-window provider (argv[2] or $GLASS_NATIVE_WINDOW_LIB)")?;
-    let visual = c.native_visual_id().map_err(|e| format!("native_visual_id: {e}"))?;
-    log(&format!("window: loading provider {provider}, visual id {visual}"));
+    let visual = c
+        .native_visual_id()
+        .map_err(|e| format!("native_visual_id: {e}"))?;
+    log(&format!(
+        "window: loading provider {provider}, visual id {visual}"
+    ));
     // SAFETY: the provider library is supplied by the operator and follows the documented ABI.
     let lib = unsafe { libloading::Library::new(&provider) }
         .map_err(|e| format!("load provider {provider}: {e}"))?;
@@ -143,12 +149,14 @@ fn window(provider: Option<String>) -> Result<(), String> {
     render_home(&mut c)?;
     // present() on a window compositor calls eglSwapBuffers; the display argument is unused.
     let mut sink = HeadlessDisplay::new(W, H);
-    c.present(&mut sink).map_err(|e| format!("present/swap: {e}"))?;
+    c.present(&mut sink)
+        .map_err(|e| format!("present/swap: {e}"))?;
     log("window: presented one frame (eglSwapBuffers) to the native window");
     // A second frame so a tear/!swap is visible, then detach cleanly.
     c.compose(Color::BLACK, &[] as &[Placement])
         .map_err(|e| format!("compose: {e}"))?;
-    c.present(&mut sink).map_err(|e| format!("present/swap 2: {e}"))?;
+    c.present(&mut sink)
+        .map_err(|e| format!("present/swap 2: {e}"))?;
     c.detach_window();
     log("window: done");
     Ok(())
