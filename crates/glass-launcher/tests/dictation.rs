@@ -51,6 +51,7 @@ fn provider(m: &MockService, caps: &[&str]) -> Client {
         phone_connected: true,
         phone_capabilities: caps.iter().map(|s| s.to_string()).collect(),
         phone_name: "Pixel".into(),
+        ..Default::default()
     }))
     .unwrap();
     p
