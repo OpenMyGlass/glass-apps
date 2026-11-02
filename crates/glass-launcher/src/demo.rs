@@ -2,6 +2,7 @@
 
 use crate::platform::{MockPlatform, Platform};
 use crate::settings::{self, SettingsView};
+use glass_ui::i18n::{Locale, Msg};
 use glass_ui::{Card, CardContent, Timeline};
 
 /// A fixed "now" for reproducible demo frames: 2026-10-21 10:42:00 UTC.
@@ -34,6 +35,7 @@ pub fn timeline_at(now_s: i64) -> Timeline {
         service: None,
         platform: "mock",
         renderer: "software",
+        locale: Locale::DEFAULT,
     };
     let mut backward = vec![text(2, "Partly cloudy, 14°", "Weather", 20 * 60)];
     backward.extend(settings::cards(&view));
@@ -58,7 +60,7 @@ pub fn timeline_at(now_s: i64) -> Timeline {
             ),
             text(
                 14,
-                "Welcome. Swipe forward for older cards, backward for settings, down to go back.",
+                Msg::WelcomeCard.get(Locale::DEFAULT),
                 "OpenMyGlass",
                 3 * 86_400,
             ),
@@ -76,6 +78,7 @@ pub fn device_timeline(now_s: i64, platform: &'static str, renderer: &'static st
         service: None,
         platform,
         renderer,
+        locale: Locale::DEFAULT,
     };
     Timeline::new(
         settings::cards(&view),
@@ -83,8 +86,7 @@ pub fn device_timeline(now_s: i64, platform: &'static str, renderer: &'static st
         vec![Card::new(
             14,
             CardContent::Text {
-                body: "Welcome. Swipe forward for older cards, backward for settings, down to go back."
-                    .into(),
+                body: Msg::WelcomeCard.get(Locale::DEFAULT).into(),
                 source: "OpenMyGlass".into(),
                 timestamp_s: now_s,
             },

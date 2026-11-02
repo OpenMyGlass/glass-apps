@@ -7,6 +7,7 @@ fn ctx(now_s: i64) -> RenderContext {
         now_s,
         hour: 22,
         minute: 7,
+        locale: glass_ui::Locale::En,
     }
 }
 
@@ -21,16 +22,27 @@ fn clock_is_twelve_hour_without_leading_zero() {
 
 #[test]
 fn relative_times() {
+    use glass_ui::Locale::{En, It};
     let now = 1_000_000;
-    assert_eq!(relative_time(now, now), "just now");
-    assert_eq!(relative_time(now, now + 30), "just now", "future clamps");
-    assert_eq!(relative_time(now, now - 59), "just now");
-    assert_eq!(relative_time(now, now - 60), "1 minute ago");
-    assert_eq!(relative_time(now, now - 600), "10 minutes ago");
-    assert_eq!(relative_time(now, now - 3_600), "1 hour ago");
-    assert_eq!(relative_time(now, now - 5 * 3_600), "5 hours ago");
-    assert_eq!(relative_time(now, now - 30 * 3_600), "yesterday");
-    assert_eq!(relative_time(now, now - 3 * 86_400), "3 days ago");
+    assert_eq!(relative_time(En, now, now), "just now");
+    assert_eq!(
+        relative_time(En, now, now + 30),
+        "just now",
+        "future clamps"
+    );
+    assert_eq!(relative_time(En, now, now - 59), "just now");
+    assert_eq!(relative_time(En, now, now - 60), "1 minute ago");
+    assert_eq!(relative_time(En, now, now - 600), "10 minutes ago");
+    assert_eq!(relative_time(En, now, now - 3_600), "1 hour ago");
+    assert_eq!(relative_time(En, now, now - 5 * 3_600), "5 hours ago");
+    assert_eq!(relative_time(En, now, now - 30 * 3_600), "yesterday");
+    assert_eq!(relative_time(En, now, now - 3 * 86_400), "3 days ago");
+    // The same ages in Italian.
+    assert_eq!(relative_time(It, now, now), "ora");
+    assert_eq!(relative_time(It, now, now - 60), "1 minuto fa");
+    assert_eq!(relative_time(It, now, now - 600), "10 minuti fa");
+    assert_eq!(relative_time(It, now, now - 30 * 3_600), "ieri");
+    assert_eq!(relative_time(It, now, now - 3 * 86_400), "3 giorni fa");
 }
 
 #[test]
@@ -154,6 +166,7 @@ fn image_render_key_follows_the_image_id_not_its_address() {
 
 #[test]
 fn relative_time_survives_extreme_timestamps() {
-    assert_eq!(relative_time(i64::MIN, i64::MAX), "just now");
-    assert!(relative_time(i64::MAX, i64::MIN).ends_with("days ago"));
+    use glass_ui::Locale::En;
+    assert_eq!(relative_time(En, i64::MIN, i64::MAX), "just now");
+    assert!(relative_time(En, i64::MAX, i64::MIN).ends_with("days ago"));
 }

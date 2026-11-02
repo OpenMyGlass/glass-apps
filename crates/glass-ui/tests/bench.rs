@@ -11,6 +11,7 @@ fn ctx() -> RenderContext {
         now_s: 10_000,
         hour: 10,
         minute: 42,
+        locale: glass_ui::Locale::En,
     }
 }
 

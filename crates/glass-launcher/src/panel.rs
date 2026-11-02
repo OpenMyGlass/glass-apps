@@ -3,6 +3,7 @@
 //! and renderer.
 
 use glass_gfx::{Compositor, GfxError};
+use glass_ui::i18n::Locale;
 use glass_ui::{Card, CardContent, RenderContext, Timeline};
 
 pub struct Panel {
@@ -19,10 +20,13 @@ impl Panel {
     /// Shows `content` instead (re-rendered only if it differs).
     pub fn set(&mut self, content: CardContent) {
         // Compared without the clock: only the content matters here.
+        // The locale does not matter here: the compared card text is already built in the
+        // current language, and a Panel holds no relative-time footer that would use it.
         const FIXED: RenderContext = RenderContext {
             now_s: 0,
             hour: 0,
             minute: 0,
+            locale: Locale::DEFAULT,
         };
         let same = glass_ui::card::render_key(self.screen.current_card(), &FIXED)
             == glass_ui::card::render_key(&Card::new(0, content.clone()), &FIXED);

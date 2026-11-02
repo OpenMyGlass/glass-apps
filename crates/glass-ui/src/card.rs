@@ -1,5 +1,6 @@
 //! Cards and their rendering.
 
+use crate::i18n::{fmt1, Locale, Msg};
 use crate::style;
 use glass_gfx::text::{self, Align};
 use glass_gfx::{fonts, Frame, Painter, Rect, SkiaPainter, Weight};
@@ -84,7 +85,7 @@ impl Card {
     }
 }
 
-/// What cards need from the outside world to render: the time.
+/// What cards need from the outside world to render: the time and the UI language.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RenderContext {
     /// Now, Unix seconds (for relative times in footers).
@@ -92,6 +93,20 @@ pub struct RenderContext {
     /// Local wall-clock hour (0..24) and minute, for the home clock.
     pub hour: u8,
     pub minute: u8,
+    /// The language the footer's relative times render in. Other card text is built in the
+    /// current language by the launcher; only the renderer-side strings use this.
+    pub locale: Locale,
+}
+
+impl Default for RenderContext {
+    fn default() -> RenderContext {
+        RenderContext {
+            now_s: 0,
+            hour: 0,
+            minute: 0,
+            locale: Locale::DEFAULT,
+        }
+    }
 }
 
 /// The home clock text: 12-hour, no leading zero, no AM/PM ("10:42").
@@ -103,22 +118,24 @@ pub fn clock_text(hour: u8, minute: u8) -> String {
     format!("{h}:{minute:02}")
 }
 
-/// Footer time: "just now", "5 minutes ago", "1 hour ago", "yesterday", "3 days ago".
-pub fn relative_time(now_s: i64, then_s: i64) -> String {
+/// Footer time in `locale`: "just now", "5 minutes ago", "1 hour ago", "yesterday",
+/// "3 days ago" (and their Italian, French and Spanish forms).
+pub fn relative_time(locale: Locale, now_s: i64, then_s: i64) -> String {
     let age = now_s.saturating_sub(then_s).max(0);
-    let plural = |n: i64, unit: &str| {
-        if n == 1 {
-            format!("1 {unit} ago")
+    let t = |m: Msg| m.get(locale).to_string();
+    let n = |one: Msg, many: Msg, count: i64| {
+        if count == 1 {
+            t(one)
         } else {
-            format!("{n} {unit}s ago")
+            fmt1(many.get(locale), &count.to_string())
         }
     };
     match age {
-        0..=59 => "just now".into(),
-        60..=3_599 => plural(age / 60, "minute"),
-        3_600..=86_399 => plural(age / 3_600, "hour"),
-        86_400..=172_799 => "yesterday".into(),
-        _ => plural(age / 86_400, "day"),
+        0..=59 => t(Msg::JustNow),
+        60..=3_599 => n(Msg::MinuteAgo, Msg::MinutesAgo, age / 60),
+        3_600..=86_399 => n(Msg::HourAgo, Msg::HoursAgo, age / 3_600),
+        86_400..=172_799 => t(Msg::Yesterday),
+        _ => fmt1(Msg::DaysAgo.get(locale), &(age / 86_400).to_string()),
     }
 }
 
@@ -140,7 +157,7 @@ pub fn render_key(card: &Card, ctx: &RenderContext) -> u64 {
             1u8.hash(&mut h);
             body.hash(&mut h);
             source.hash(&mut h);
-            relative_time(ctx.now_s, *timestamp_s).hash(&mut h);
+            relative_time(ctx.locale, ctx.now_s, *timestamp_s).hash(&mut h);
         }
         CardContent::Settings { title, subtitle } => {
             2u8.hash(&mut h);
@@ -155,7 +172,7 @@ pub fn render_key(card: &Card, ctx: &RenderContext) -> u64 {
             3u8.hash(&mut h);
             image.as_ref().map(|i| i.id).hash(&mut h);
             caption.hash(&mut h);
-            relative_time(ctx.now_s, *timestamp_s).hash(&mut h);
+            relative_time(ctx.locale, ctx.now_s, *timestamp_s).hash(&mut h);
         }
         CardContent::MenuItem {
             label,
@@ -221,7 +238,7 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
             footer(
                 f,
                 source,
-                &relative_time(ctx.now_s, *timestamp_s),
+                &relative_time(ctx.locale, ctx.now_s, *timestamp_s),
                 style::SECONDARY,
             );
         }
@@ -274,7 +291,7 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
             footer(
                 f,
                 caption,
-                &relative_time(ctx.now_s, *timestamp_s),
+                &relative_time(ctx.locale, ctx.now_s, *timestamp_s),
                 style::TEXT,
             );
         }

@@ -14,15 +14,18 @@ pub fn now() -> RenderContext {
         now_s,
         hour,
         minute,
+        ..RenderContext::default()
     }
 }
 
-/// A fixed clock: `now_s` and the given wall-clock time.
+/// A fixed clock: `now_s` and the given wall-clock time. The locale is left at the default;
+/// the app overrides it (see [`crate::App::step`]).
 pub fn fixed(now_s: i64, hour: u8, minute: u8) -> RenderContext {
     RenderContext {
         now_s,
         hour,
         minute,
+        ..RenderContext::default()
     }
 }
 

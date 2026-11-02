@@ -22,6 +22,7 @@ fn ctx() -> RenderContext {
         now_s: 1_792_579_320,
         hour: 10,
         minute: 42,
+        locale: glass_ui::Locale::En,
     }
 }
 
@@ -41,6 +42,7 @@ fn view() -> SettingsView {
         }),
         platform: "mock",
         renderer: "software",
+        locale: glass_ui::Locale::En,
     }
 }
 
@@ -68,6 +70,7 @@ fn scenes() -> Vec<(String, Card, Tolerance)> {
                 ids::WINK => "wink",
                 ids::ON_HEAD => "on-head",
                 ids::NUDGE => "nudge",
+                ids::LANGUAGE => "language",
                 ids::DEVICE => "device",
                 _ => unreachable!(),
             };
