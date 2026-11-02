@@ -12,6 +12,7 @@ fn ctx() -> RenderContext {
         now_s: demo::DEMO_NOW_S,
         hour: 10,
         minute: 42,
+        locale: glass_ui::Locale::En,
     }
 }
 
@@ -227,4 +228,27 @@ fn the_screen_turning_off_closes_a_menu() {
     assert_eq!(a.overlay(), None);
     a.render_if_changed().unwrap();
     assert_eq!(a.read_frame().unwrap().pixel(320, 180), Color::BLACK);
+}
+
+#[test]
+fn language_card_menu_switches_the_whole_ui() {
+    let mut a = app();
+    // Open the language card's menu: four languages, English current.
+    goto(&mut a, ids::LANGUAGE);
+    assert_eq!(subtitle(&a, ids::LANGUAGE), "English");
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 1 }));
+    assert_eq!(
+        a.menu_labels(),
+        vec!["Italiano", "English", "Français", "Español"]
+    );
+    // Scroll back to Italiano and choose it.
+    g(&mut a, GestureKind::SwipeBackward);
+    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 0 }));
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.overlay(), None);
+    assert_eq!(a.locale(), glass_ui::Locale::It);
+    // Every settings card now reads Italian.
+    assert_eq!(subtitle(&a, ids::LANGUAGE), "Italiano");
+    assert_eq!(subtitle(&a, ids::SCREEN_TIMEOUT), "15 secondi");
 }

@@ -6,14 +6,18 @@
 //!   per-card layers.
 //! - [`menu`]: card menus and adjustment sub-screens, overlays over the timeline.
 //! - [`input`]: the input events, mirroring the glass-services interface 1:1.
+//! - [`i18n`]: the four supported locales (it/en/fr/es) and the message catalogue every
+//!   user-facing string is drawn from.
 
 pub mod card;
+pub mod i18n;
 pub mod input;
 pub mod menu;
 pub mod style;
 pub mod timeline;
 
 pub use card::{Card, CardContent, CardId, CardImage, RenderContext};
+pub use i18n::{Locale, Msg};
 pub use input::{GestureKind, InputEvent};
 pub use menu::{Adjuster, Menu, MenuItem, Outcome};
 pub use timeline::{Action, Timeline, CARDS_PER_PAD_WIDTH};

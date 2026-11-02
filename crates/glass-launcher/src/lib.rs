@@ -19,9 +19,10 @@ pub mod platform;
 pub mod renderer;
 pub mod settings;
 
-use dictation::{Dictation, DictationOut, NOTE_CARD, NOTE_SOURCE};
+use dictation::{Dictation, DictationOut, NOTE_CARD};
 use glass_api::proto::{DictationState, ErrorCode, Settings, Transcript};
 use glass_gfx::{Color, Compositor, Display, Frame, GfxError, SoftwareCompositor};
+use glass_ui::i18n::{Locale, Msg};
 use glass_ui::{
     Action, Adjuster, CardId, GestureKind, InputEvent, Menu, Outcome, RenderContext, Timeline,
 };
@@ -99,6 +100,11 @@ pub struct App {
     /// A file whose presence means the setup flow was done.
     setup_marker: Option<PathBuf>,
     companion: Companion,
+    /// The UI language every string is built in.
+    locale: Locale,
+    /// Whether a locale was ever chosen (glassd/companion push or the setup picker). While
+    /// false, [`App::start_setup`] opens with the language picker.
+    locale_set: bool,
     next_request: u32,
     next_note: CardId,
 }
@@ -112,9 +118,10 @@ impl App {
     /// An app rendering through `compositor` (of the Glass display size).
     pub fn with_compositor(
         mut timeline: Timeline,
-        ctx: RenderContext,
+        mut ctx: RenderContext,
         compositor: Box<dyn Compositor>,
     ) -> App {
+        ctx.locale = Locale::DEFAULT;
         timeline.set_context(ctx);
         let mut app = App {
             timeline,
@@ -132,11 +139,57 @@ impl App {
             setup: None,
             setup_marker: None,
             companion: Companion::default(),
+            locale: Locale::DEFAULT,
+            locale_set: false,
             next_request: 1,
             next_note: FIRST_NOTE_ID,
         };
         app.refresh_settings_cards();
         app
+    }
+
+    /// The current UI language.
+    pub fn locale(&self) -> Locale {
+        self.locale
+    }
+
+    /// Whether a locale has been chosen (so setup skips the language picker).
+    pub fn locale_chosen(&self) -> bool {
+        self.locale_set
+    }
+
+    /// Applies `locale` to the whole UI and re-renders in the new language: the settings and
+    /// note cards, the timeline's footer times, the open setup flow and overlay. Marks the
+    /// locale as chosen. Returns whether the visible language changed.
+    ///
+    /// This is the one entry point the glassd/companion push ([`App::settings_changed`]),
+    /// the setup picker and the language settings card all go through.
+    pub fn set_locale(&mut self, locale: Locale) -> bool {
+        let changed = locale != self.locale || !self.locale_set;
+        self.locale = locale;
+        self.locale_set = true;
+        self.ctx.locale = locale;
+        self.timeline.set_context(self.ctx);
+        if let Some((s, _)) = self.setup.as_mut() {
+            s.set_locale(locale);
+        }
+        self.refresh_settings_cards();
+        self.refresh_note_card();
+        self.refresh_setup_card();
+        self.refresh_open_dictation();
+        if changed {
+            self.shown = false;
+        }
+        changed
+    }
+
+    /// Rebuilds an open dictation card after a locale change (its strings are built eagerly).
+    fn refresh_open_dictation(&mut self) {
+        let now = self.ctx.now_s;
+        let locale = self.locale;
+        if let Some(Overlay::Dictation(d, panel)) = self.overlay.as_mut() {
+            panel.set(d.card(locale, now));
+        }
     }
 
     /// Starts the setup flow, unless `marker` exists (it is created when the flow ends).
@@ -146,7 +199,14 @@ impl App {
             return false;
         }
         self.setup_marker = marker;
-        let mut s = Setup::new();
+        // When no locale is set, the language picker is the natural first step; otherwise
+        // (glassd or the companion already set one) setup opens at the welcome step.
+        let mut s = if self.locale_set {
+            Setup::new()
+        } else {
+            Setup::with_language_picker(self.locale)
+        };
+        s.set_locale(self.locale);
         s.set_bluetooth_name(self.platform.bluetooth_name());
         s.set_companion(self.companion.clone());
         let panel = Panel::new(s.card(), self.ctx);
@@ -165,6 +225,10 @@ impl App {
     fn apply_setup(&mut self, fx: Vec<SetupEffect>) {
         for e in fx {
             match e {
+                SetupEffect::SetLocale(loc) => {
+                    self.set_locale(loc);
+                    self.persist_locale(loc);
+                }
                 SetupEffect::Platform(r) => {
                     use platform::PlatformRequest as R;
                     let res = match &r {
@@ -250,12 +314,16 @@ impl App {
             return;
         }
         let content = CardContent::Settings {
-            title: "Take a note".into(),
-            subtitle: Some(if self.companion.connected {
-                "Tap to speak".into()
-            } else {
-                "Phone not connected".into()
-            }),
+            title: Msg::TakeANote.get(self.locale).into(),
+            subtitle: Some(
+                if self.companion.connected {
+                    Msg::TapToSpeak
+                } else {
+                    Msg::PhoneNotConnected
+                }
+                .get(self.locale)
+                .into(),
+            ),
         };
         if exists {
             self.timeline.update_card(NOTE_CARD, content);
@@ -270,16 +338,17 @@ impl App {
         self.requests.push(Request::DictationStart(id));
         self.requests.push(Request::KeepScreenOn(true));
         let d = Dictation::new(id);
-        let panel = Panel::new(d.card(self.ctx.now_s), self.ctx);
+        let panel = Panel::new(d.card(self.locale, self.ctx.now_s), self.ctx);
         self.show_overlay(Overlay::Dictation(d, panel));
     }
 
     fn with_dictation(&mut self, f: impl FnOnce(&mut Dictation) -> Option<DictationOut>) {
         let now = self.ctx.now_s;
+        let locale = self.locale;
         let out = match self.overlay.as_mut() {
             Some(Overlay::Dictation(d, panel)) => {
                 let out = f(d);
-                panel.set(d.card(now));
+                panel.set(d.card(locale, now));
                 out
             }
             _ => return,
@@ -303,7 +372,7 @@ impl App {
                     id,
                     CardContent::Text {
                         body: text,
-                        source: NOTE_SOURCE.into(),
+                        source: Msg::NoteSource.get(self.locale).into(),
                         timestamp_s: self.ctx.now_s,
                     },
                 ));
@@ -351,6 +420,7 @@ impl App {
             service: self.service.clone(),
             platform: self.platform.name(),
             renderer: self.compositor.name(),
+            locale: self.locale,
         }
     }
 
@@ -360,9 +430,31 @@ impl App {
     }
 
     /// glassd sent the applied settings (a snapshot, an answer, or a change by someone).
+    ///
+    /// The locale travels with glassd's settings: if they carry one, it is applied here, so
+    /// a locale pushed by the companion (`SetLocale`) or changed on another client
+    /// (`LocaleChanged`) re-renders the UI. See [`settings::locale_from_settings`].
     pub fn settings_changed(&mut self, s: Settings) {
+        if let Some(loc) = settings::locale_from_settings(&s) {
+            self.set_locale(loc);
+        }
         self.settings = Some(s);
         self.refresh_settings_cards();
+    }
+
+    /// Persists `locale` through glassd's settings (no separate store). glassd carries the
+    /// locale in its `Settings`; once glass-api's `Settings` gains the field (see
+    /// [`settings::locale_from_settings`]) this sends
+    /// `SetSettings{settings.locale = loc.tag()}`, which glassd stores and echoes back as a
+    /// `Settings` broadcast. Without glassd (host/mock runs) the locale is session-only.
+    fn persist_locale(&mut self, loc: Locale) {
+        if self.owner == ScreenOwner::Glassd {
+            // TODO(glass-services locale field): once Settings has `locale`, replace this
+            // log with `self.requests.push(Request::SetSettings(Settings {
+            //     locale: Some(loc.tag().into()), ..Default::default() }));`
+            self.log
+                .push(format!("locale: {} (persist via glassd)", loc.tag()));
+        }
     }
 
     /// The menus offer what is true now (also after a radio or settings change).
@@ -536,6 +628,11 @@ impl App {
             Choice::WakeAngle => {
                 let a = settings::wake_angle_adjuster(&self.settings_view());
                 self.show_overlay(Overlay::Adjust(a));
+            }
+            Choice::SetLocale(loc) => {
+                self.log.push(format!("locale: {}", loc.tag()));
+                self.set_locale(loc);
+                self.persist_locale(loc);
             }
             Choice::Delete(id) => {
                 self.log.push(format!("delete: card {id}"));
@@ -722,8 +819,10 @@ impl App {
         action
     }
 
-    /// Advances time by `dt` seconds with the wall clock `ctx`.
-    pub fn step(&mut self, dt: f32, ctx: RenderContext) {
+    /// Advances time by `dt` seconds with the wall clock `ctx`. The app owns the locale, so
+    /// it overrides whatever the clock's context carries.
+    pub fn step(&mut self, dt: f32, mut ctx: RenderContext) {
+        ctx.locale = self.locale;
         self.ctx = ctx;
         self.timeline.set_context(ctx);
         self.timeline.tick(dt);

@@ -10,6 +10,7 @@
 use crate::platform::RadioStatus;
 use glass_api::hub::settings_rules;
 use glass_api::proto::Settings;
+use glass_ui::i18n::{fmt1, fmt2, Locale, Msg};
 use glass_ui::{Adjuster, Card, CardContent, CardId, MenuItem};
 
 /// Card ids of the settings cards (fixed, so updates find them).
@@ -22,11 +23,12 @@ pub mod ids {
     pub const WINK: CardId = 105;
     pub const ON_HEAD: CardId = 106;
     pub const NUDGE: CardId = 107;
-    pub const DEVICE: CardId = 108;
+    pub const LANGUAGE: CardId = 108;
+    pub const DEVICE: CardId = 109;
 }
 
 /// The settings cards from the one next to the "now" cards to the farthest.
-pub const ORDER: [CardId; 8] = [
+pub const ORDER: [CardId; 9] = [
     ids::WIFI,
     ids::BLUETOOTH,
     ids::SCREEN_TIMEOUT,
@@ -34,6 +36,7 @@ pub const ORDER: [CardId; 8] = [
     ids::WINK,
     ids::ON_HEAD,
     ids::NUDGE,
+    ids::LANGUAGE,
     ids::DEVICE,
 ];
 
@@ -63,6 +66,8 @@ pub struct SettingsView {
     pub service: Option<ServiceInfo>,
     pub platform: &'static str,
     pub renderer: &'static str,
+    /// The language every card text is built in.
+    pub locale: Locale,
 }
 
 /// What a menu item does.
@@ -74,110 +79,121 @@ pub enum Choice {
     Bluetooth(bool),
     /// Open the wake-angle sub-screen.
     WakeAngle,
+    /// Change the UI language (persisted through glassd's settings).
+    SetLocale(Locale),
     /// Remove the card from the timeline.
     Delete(CardId),
 }
 
-/// "15 seconds", "1 minute", "10 minutes".
-pub fn timeout_text(ms: u32) -> String {
+/// "15 seconds", "1 minute", "10 minutes" (in `locale`).
+pub fn timeout_text(locale: Locale, ms: u32) -> String {
     if ms >= 60_000 && ms % 60_000 == 0 {
         let m = ms / 60_000;
         return if m == 1 {
-            "1 minute".into()
+            Msg::MinuteOne.get(locale).to_string()
         } else {
-            format!("{m} minutes")
+            fmt1(Msg::MinutesN.get(locale), &m.to_string())
         };
     }
     let s = ms as f32 / 1000.0;
-    if ms % 1000 == 0 {
-        format!("{s:.0} seconds")
+    // The number keeps ASCII digits (a decimal only for a value off the fixed list); the
+    // unit word is localised.
+    let n = if ms % 1000 == 0 {
+        format!("{s:.0}")
     } else {
-        format!("{s:.1} seconds")
-    }
+        format!("{s:.1}")
+    };
+    fmt1(Msg::SecondsN.get(locale), &n)
 }
 
-/// "30°" (whole degrees; glassd may store a fraction).
+/// "30°" (whole degrees; glassd may store a fraction). Language-neutral.
 pub fn angle_text(deg: f32) -> String {
     format!("{deg:.0}°")
 }
 
-fn on_off(v: bool) -> &'static str {
+fn on_off(locale: Locale, v: bool) -> &'static str {
     if v {
-        "On"
+        Msg::On.get(locale)
     } else {
-        "Off"
+        Msg::Off.get(locale)
     }
 }
 
-fn radio_text(r: &RadioStatus) -> String {
+fn radio_text(locale: Locale, r: &RadioStatus) -> String {
     match (r.enabled, r.connected.as_slice()) {
-        (false, _) => "Off".into(),
-        (true, []) => "On, not connected".into(),
-        (true, [one]) => format!("Connected to {one}"),
-        (true, [first, rest @ ..]) => format!("Connected to {first} and {} more", rest.len()),
+        (false, _) => Msg::Off.get(locale).to_string(),
+        (true, []) => Msg::RadioOnNotConnected.get(locale).to_string(),
+        (true, [one]) => fmt1(Msg::ConnectedTo.get(locale), one),
+        (true, [first, rest @ ..]) => fmt2(
+            Msg::ConnectedToMore.get(locale),
+            first,
+            &rest.len().to_string(),
+        ),
     }
 }
-
-const WAITING: &str = "Waiting for glassd";
 
 fn setting_text(v: &SettingsView, f: impl Fn(&Settings) -> Option<String>) -> String {
     v.settings
         .as_ref()
         .and_then(f)
-        .unwrap_or_else(|| WAITING.into())
+        .unwrap_or_else(|| Msg::WaitingGlassd.get(v.locale).to_string())
 }
 
 /// What a settings card shows; `None` for an id that is not a settings card.
 pub fn card_content(id: CardId, v: &SettingsView) -> Option<CardContent> {
-    let entry = |title: &str, subtitle: String| CardContent::Settings {
-        title: title.into(),
+    let loc = v.locale;
+    let entry = |title: Msg, subtitle: String| CardContent::Settings {
+        title: title.get(loc).into(),
         subtitle: Some(subtitle),
     };
     Some(match id {
-        ids::WIFI => entry("Wi-Fi", radio_text(&v.wifi)),
-        ids::BLUETOOTH => entry("Bluetooth", radio_text(&v.bluetooth)),
+        ids::WIFI => entry(Msg::SettingsWifi, radio_text(loc, &v.wifi)),
+        ids::BLUETOOTH => entry(Msg::SettingsBluetooth, radio_text(loc, &v.bluetooth)),
         ids::SCREEN_TIMEOUT => entry(
-            "Screen timeout",
-            setting_text(v, |s| s.screen_timeout_ms.map(timeout_text)),
+            Msg::SettingsScreenTimeout,
+            setting_text(v, |s| s.screen_timeout_ms.map(|ms| timeout_text(loc, ms))),
         ),
         ids::HEAD_WAKE => entry(
-            "Head wake",
+            Msg::SettingsHeadWake,
             setting_text(v, |s| {
                 s.head_wake_enabled
                     .map(|on| match (on, s.head_wake_angle_deg) {
-                        (true, Some(a)) => format!("On, at {}", angle_text(a)),
-                        (on, _) => on_off(on).into(),
+                        (true, Some(a)) => fmt1(Msg::HeadWakeOnAt.get(loc), &angle_text(a)),
+                        (on, _) => on_off(loc, on).into(),
                     })
             }),
         ),
         ids::WINK => entry(
-            "Wink",
-            setting_text(v, |s| s.wink_enabled.map(|b| on_off(b).into())),
+            Msg::SettingsWink,
+            setting_text(v, |s| s.wink_enabled.map(|b| on_off(loc, b).into())),
         ),
         ids::ON_HEAD => entry(
-            "On-head detection",
-            setting_text(v, |s| s.on_head_detection_enabled.map(|b| on_off(b).into())),
+            Msg::SettingsOnHead,
+            setting_text(v, |s| {
+                s.on_head_detection_enabled.map(|b| on_off(loc, b).into())
+            }),
         ),
         ids::NUDGE => entry(
-            "Nudge to sleep",
-            setting_text(v, |s| s.nudge_sleep_enabled.map(|b| on_off(b).into())),
+            Msg::SettingsNudge,
+            setting_text(v, |s| s.nudge_sleep_enabled.map(|b| on_off(loc, b).into())),
         ),
+        ids::LANGUAGE => entry(Msg::SettingsLanguage, loc.endonym().into()),
         ids::DEVICE => {
-            let mut lines = vec![format!(
-                "glass-launcher {}, renderer {}",
+            let mut lines = vec![fmt2(
+                Msg::DeviceLauncherLine.get(loc),
                 env!("CARGO_PKG_VERSION"),
-                v.renderer
+                v.renderer,
             )];
             match &v.service {
                 Some(s) => {
-                    lines.push(format!("glassd {}", s.version));
+                    lines.push(fmt1(Msg::DeviceGlassdLine.get(loc), &s.version));
                     lines.push(s.capabilities.join(", "));
                 }
-                None => lines.push("glassd not connected".into()),
+                None => lines.push(Msg::DeviceGlassdNotConnected.get(loc).into()),
             }
-            lines.push(format!("Platform: {}", v.platform));
+            lines.push(fmt1(Msg::DevicePlatform.get(loc), v.platform));
             CardContent::Info {
-                title: "Device".into(),
+                title: Msg::SettingsDevice.get(loc).into(),
                 lines,
             }
         }
@@ -199,15 +215,20 @@ fn patch(f: impl FnOnce(&mut Settings)) -> Choice {
     Choice::Patch(s)
 }
 
-fn toggle_item(enabled: Option<bool>, set: fn(&mut Settings, bool)) -> MenuItem<Choice> {
+fn toggle_item(
+    loc: Locale,
+    enabled: Option<bool>,
+    set: fn(&mut Settings, bool),
+) -> MenuItem<Choice> {
     // Called only with known settings; a field glassd left out counts as off.
     let on = enabled.unwrap_or(false);
-    let label = if on { "Turn off" } else { "Turn on" };
-    MenuItem::new(patch(|s| set(s, !on)), label)
+    let label = if on { Msg::TurnOff } else { Msg::TurnOn };
+    MenuItem::new(patch(|s| set(s, !on)), label.get(loc))
 }
 
 /// The menu of `card`, with the item to show first; `None` when it has no menu.
 pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>, usize)> {
+    let loc = v.locale;
     let owned_by_glassd = matches!(
         card.id,
         ids::SCREEN_TIMEOUT | ids::HEAD_WAKE | ids::WINK | ids::ON_HEAD | ids::NUDGE
@@ -218,8 +239,8 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
     }
     let s = v.settings.unwrap_or_default();
     let items = match card.id {
-        ids::WIFI => vec![radio_item(&v.wifi, Choice::Wifi)],
-        ids::BLUETOOTH => vec![radio_item(&v.bluetooth, Choice::Bluetooth)],
+        ids::WIFI => vec![radio_item(loc, &v.wifi, Choice::Wifi)],
+        ids::BLUETOOTH => vec![radio_item(loc, &v.bluetooth, Choice::Bluetooth)],
         ids::SCREEN_TIMEOUT => {
             // The fixed choices, plus the current value when it is none of them (set by
             // another client), in order.
@@ -233,10 +254,12 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
             let items: Vec<MenuItem<Choice>> = choices
                 .iter()
                 .map(|&ms| {
-                    let it =
-                        MenuItem::new(patch(|p| p.screen_timeout_ms = Some(ms)), timeout_text(ms));
+                    let it = MenuItem::new(
+                        patch(|p| p.screen_timeout_ms = Some(ms)),
+                        timeout_text(loc, ms),
+                    );
                     if s.screen_timeout_ms == Some(ms) {
-                        it.with_detail("Current")
+                        it.with_detail(Msg::Current.get(loc))
                     } else {
                         it
                     }
@@ -253,21 +276,42 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
                 .head_wake_angle_deg
                 .unwrap_or(settings_defaults().head_wake_angle_deg.unwrap_or(30.0));
             vec![
-                toggle_item(s.head_wake_enabled, |p, b| p.head_wake_enabled = Some(b)),
-                MenuItem::new(Choice::WakeAngle, "Wake angle").with_detail(angle_text(angle)),
+                toggle_item(loc, s.head_wake_enabled, |p, b| {
+                    p.head_wake_enabled = Some(b)
+                }),
+                MenuItem::new(Choice::WakeAngle, Msg::WakeAngle.get(loc))
+                    .with_detail(angle_text(angle)),
             ]
         }
-        ids::WINK => vec![toggle_item(s.wink_enabled, |p, b| p.wink_enabled = Some(b))],
-        ids::ON_HEAD => vec![toggle_item(s.on_head_detection_enabled, |p, b| {
+        ids::WINK => vec![toggle_item(loc, s.wink_enabled, |p, b| {
+            p.wink_enabled = Some(b)
+        })],
+        ids::ON_HEAD => vec![toggle_item(loc, s.on_head_detection_enabled, |p, b| {
             p.on_head_detection_enabled = Some(b)
         })],
-        ids::NUDGE => vec![toggle_item(s.nudge_sleep_enabled, |p, b| {
+        ids::NUDGE => vec![toggle_item(loc, s.nudge_sleep_enabled, |p, b| {
             p.nudge_sleep_enabled = Some(b)
         })],
+        ids::LANGUAGE => {
+            // One item per language, in the picker's order; the active one shows "Current".
+            let items: Vec<MenuItem<Choice>> = Locale::ALL
+                .into_iter()
+                .map(|l| {
+                    let it = MenuItem::new(Choice::SetLocale(l), l.endonym());
+                    if l == loc {
+                        it.with_detail(Msg::Current.get(loc))
+                    } else {
+                        it
+                    }
+                })
+                .collect();
+            let first = Locale::ALL.iter().position(|&l| l == loc).unwrap_or(0);
+            return Some((items, first));
+        }
         ids::DEVICE => return None,
         _ => match card.content {
             CardContent::Text { .. } | CardContent::Image { .. } => {
-                vec![MenuItem::new(Choice::Delete(card.id), "Delete")]
+                vec![MenuItem::new(Choice::Delete(card.id), Msg::Delete.get(loc))]
             }
             _ => return None,
         },
@@ -275,11 +319,11 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
     Some((items, 0))
 }
 
-fn radio_item(r: &RadioStatus, choice: fn(bool) -> Choice) -> MenuItem<Choice> {
+fn radio_item(loc: Locale, r: &RadioStatus, choice: fn(bool) -> Choice) -> MenuItem<Choice> {
     if r.enabled {
-        MenuItem::new(choice(false), "Turn off")
+        MenuItem::new(choice(false), Msg::TurnOff.get(loc))
     } else {
-        MenuItem::new(choice(true), "Turn on")
+        MenuItem::new(choice(true), Msg::TurnOn.get(loc))
     }
 }
 
@@ -300,7 +344,7 @@ pub fn wake_angle_adjuster(v: &SettingsView) -> Adjuster {
         .and_then(|s| s.head_wake_angle_deg)
         .unwrap_or(30.0);
     Adjuster::new(
-        "Wake angle",
+        Msg::WakeAngle.get(v.locale),
         settings_rules::HEAD_WAKE_ANGLE_MIN,
         settings_rules::HEAD_WAKE_ANGLE_MAX,
         WAKE_ANGLE_STEP,
@@ -309,11 +353,29 @@ pub fn wake_angle_adjuster(v: &SettingsView) -> Adjuster {
     )
 }
 
+/// The locale glassd carries in its settings, if any — the launcher's single read point for
+/// the locale glassd and the companion push (see [`crate::App::settings_changed`]).
+///
+/// The persisted locale lives in glassd's settings (no separate store). The pinned glass-api
+/// `Settings` message does not yet carry the field; the glass-services companion work adds
+/// it as `optional string locale = 7;` (so `SetLocale` is a `SetSettings{locale}` and
+/// `LocaleChanged` is the `Settings` broadcast the launcher already handles). When it lands,
+/// this becomes `s.locale.as_deref().and_then(Locale::from_tag)` — the only change needed to
+/// light up the glassd/companion path.
+pub fn locale_from_settings(_s: &Settings) -> Option<Locale> {
+    // glass-api rev 9bb1988 has no Settings.locale field yet; see the doc comment above.
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn view(settings: Option<Settings>) -> SettingsView {
+        view_in(settings, Locale::En)
+    }
+
+    fn view_in(settings: Option<Settings>, locale: Locale) -> SettingsView {
         SettingsView {
             settings,
             wifi: RadioStatus::on(&["HomeNet"]),
@@ -321,6 +383,7 @@ mod tests {
             service: None,
             platform: "mock",
             renderer: "software",
+            locale,
         }
     }
 
@@ -335,16 +398,25 @@ mod tests {
 
     #[test]
     fn texts() {
-        assert_eq!(timeout_text(15_000), "15 seconds");
-        assert_eq!(timeout_text(3_000), "3 seconds");
-        assert_eq!(timeout_text(2_500), "2.5 seconds");
-        assert_eq!(timeout_text(60_000), "1 minute");
-        assert_eq!(timeout_text(90_000), "90 seconds");
-        assert_eq!(timeout_text(600_000), "10 minutes");
+        use Locale::{En, It};
+        assert_eq!(timeout_text(En, 15_000), "15 seconds");
+        assert_eq!(timeout_text(En, 3_000), "3 seconds");
+        assert_eq!(timeout_text(En, 2_500), "2.5 seconds");
+        assert_eq!(timeout_text(En, 60_000), "1 minute");
+        assert_eq!(timeout_text(En, 90_000), "90 seconds");
+        assert_eq!(timeout_text(En, 600_000), "10 minutes");
         assert_eq!(angle_text(29.6), "30°");
         assert_eq!(
-            radio_text(&RadioStatus::on(&["a", "b", "c"])),
+            radio_text(En, &RadioStatus::on(&["a", "b", "c"])),
             "Connected to a and 2 more"
+        );
+        // The same durations and radio status in Italian.
+        assert_eq!(timeout_text(It, 15_000), "15 secondi");
+        assert_eq!(timeout_text(It, 60_000), "1 minuto");
+        assert_eq!(timeout_text(It, 600_000), "10 minuti");
+        assert_eq!(
+            radio_text(It, &RadioStatus::on(&["a", "b", "c"])),
+            "Connesso a a e altri 2"
         );
     }
 
@@ -366,9 +438,34 @@ mod tests {
         );
         assert_eq!(subtitle(card_content(ids::BLUETOOTH, &v).unwrap()), "Off");
         let w = view(None);
-        assert_eq!(subtitle(card_content(ids::NUDGE, &w).unwrap()), WAITING);
+        assert_eq!(
+            subtitle(card_content(ids::NUDGE, &w).unwrap()),
+            Msg::WaitingGlassd.get(Locale::En)
+        );
         assert!(card_content(10, &w).is_none());
         assert_eq!(cards(&w).len(), ORDER.len());
+        // The language card shows the current language's own name.
+        assert_eq!(
+            subtitle(card_content(ids::LANGUAGE, &view_in(None, Locale::Fr)).unwrap()),
+            "Français"
+        );
+    }
+
+    #[test]
+    fn cards_follow_the_locale() {
+        let v = view_in(Some(settings_defaults()), Locale::It);
+        assert_eq!(
+            subtitle(card_content(ids::SCREEN_TIMEOUT, &v).unwrap()),
+            "15 secondi"
+        );
+        assert_eq!(subtitle(card_content(ids::WINK, &v).unwrap()), "Disattivo");
+        // The language menu offers every language and marks the current one.
+        let card = Card::new(ids::LANGUAGE, card_content(ids::LANGUAGE, &v).unwrap());
+        let (items, first) = menu_for(&card, &v).unwrap();
+        assert_eq!(items.len(), 4);
+        assert_eq!(items[first].label, "Italiano");
+        assert_eq!(items[first].value, Choice::SetLocale(Locale::It));
+        assert_eq!(items[first].detail.as_deref(), Some("Attuale"));
     }
 
     #[test]

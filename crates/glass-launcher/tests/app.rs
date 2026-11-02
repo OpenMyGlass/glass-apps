@@ -6,6 +6,7 @@ fn ctx() -> RenderContext {
         now_s: demo::DEMO_NOW_S,
         hour: 10,
         minute: 42,
+        locale: glass_ui::Locale::En,
     }
 }
 
@@ -79,4 +80,45 @@ fn a_waking_swipe_with_scroll_frames_moves_nothing() {
     }
     let t = app.timeline();
     assert_eq!(t.current_index(), t.home_index() + 1);
+}
+
+fn settings_subtitle(app: &App, id: glass_ui::CardId) -> String {
+    use glass_ui::CardContent;
+    let card = app
+        .timeline()
+        .cards()
+        .iter()
+        .find(|c| c.id == id)
+        .unwrap_or_else(|| panic!("no card {id}"));
+    match &card.content {
+        CardContent::Settings {
+            subtitle: Some(s), ..
+        } => s.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn changing_the_locale_rerenders_the_cards() {
+    use glass_launcher::settings::ids;
+    use glass_ui::Locale;
+
+    let mut app = App::new(demo::timeline(), ctx());
+    // Default language before any choice is English.
+    assert_eq!(app.locale(), Locale::En);
+    assert!(!app.locale_chosen());
+    assert_eq!(settings_subtitle(&app, ids::SCREEN_TIMEOUT), "15 seconds");
+
+    // Switching to Italian re-renders every settings card in Italian.
+    assert!(app.set_locale(Locale::It));
+    assert!(app.locale_chosen());
+    assert_eq!(settings_subtitle(&app, ids::SCREEN_TIMEOUT), "15 secondi");
+    assert_eq!(settings_subtitle(&app, ids::LANGUAGE), "Italiano");
+
+    // Then to French.
+    assert!(app.set_locale(Locale::Fr));
+    assert_eq!(settings_subtitle(&app, ids::SCREEN_TIMEOUT), "15 secondes");
+
+    // Re-selecting the same language reports no visible change.
+    assert!(!app.set_locale(Locale::Fr));
 }

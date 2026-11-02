@@ -3,13 +3,18 @@
 use glass_launcher::platform::PlatformEvent;
 use glass_launcher::setup::{Companion, Step};
 use glass_launcher::{demo, App};
-use glass_ui::{GestureKind, InputEvent, RenderContext};
+use glass_ui::{GestureKind, InputEvent, Locale, RenderContext};
+
+fn swipe(a: &mut App, kind: GestureKind) {
+    a.input(&InputEvent::gesture(kind));
+}
 
 fn ctx() -> RenderContext {
     RenderContext {
         now_s: demo::DEMO_NOW_S,
         hour: 10,
         minute: 42,
+        locale: glass_ui::Locale::En,
     }
 }
 
@@ -28,9 +33,20 @@ fn setup_runs_once_and_shows_the_timeline_after() {
     let m = marker("once");
     let mut a = App::new(demo::timeline(), ctx());
     assert!(a.start_setup(Some(m.clone())));
+    // No locale set yet: setup opens with the language picker.
+    assert!(matches!(a.setup().unwrap().step(), Step::Language { .. }));
+    assert!(!a.locale_chosen());
     assert!(a.render_if_changed().unwrap());
     assert!(!a.render_if_changed().unwrap(), "nothing changed");
+    // The picker starts on the default (English, index 1 of it/en/fr/es). Scroll forward
+    // twice to Spanish and tap to choose it; the UI language is now Spanish.
+    swipe(&mut a, GestureKind::SwipeForward); // English -> Français
+    swipe(&mut a, GestureKind::SwipeForward); // Français -> Español
     tap(&mut a);
+    assert!(a.locale_chosen());
+    assert_eq!(a.locale(), Locale::Es);
+    assert_eq!(a.setup().unwrap().step(), &Step::Welcome);
+    tap(&mut a); // Welcome -> Pair
     assert_eq!(a.setup().unwrap().step(), &Step::Pair);
     a.platform_event(&PlatformEvent::PairingRequest {
         device: "Pixel".into(),

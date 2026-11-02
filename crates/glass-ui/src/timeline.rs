@@ -151,11 +151,7 @@ impl Timeline {
             anim: None,
             drag: None,
             release: None,
-            ctx: RenderContext {
-                now_s: 0,
-                hour: 0,
-                minute: 0,
-            },
+            ctx: RenderContext::default(),
             layers: HashMap::new(),
             dropped: Vec::new(),
             renders: 0,

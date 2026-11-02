@@ -8,13 +8,57 @@
 //! short card that `TAP` or `SWIPE_DOWN` closes.
 
 use glass_api::proto::{dictation_state, DictationState, ErrorCode, Transcript};
+use glass_ui::i18n::{Locale, Msg};
 use glass_ui::{CardContent, GestureKind, InputEvent};
 
 /// The card that opens dictation.
 pub const NOTE_CARD: glass_ui::CardId = 120;
 
-/// The source shown in a note card's footer.
-pub const NOTE_SOURCE: &str = "Note";
+/// Why dictation ended without a note. Carried (not resolved to text) so the card follows a
+/// locale change; `Other` passes a phone-provided message through untranslated.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Failure {
+    NothingHeard,
+    LinkLost,
+    Expired,
+    Replaced,
+    PhoneNotConnected,
+    PhoneCannotNotes,
+    NotAvailable,
+    Failed,
+    /// A message from glassd or the phone with no known mapping.
+    Other(String),
+}
+
+impl Failure {
+    /// Maps a `STATE_FAILED` error string to a reason.
+    pub fn from_error(error: &str) -> Failure {
+        match error {
+            "no-speech" => Failure::NothingHeard,
+            "link-lost" => Failure::LinkLost,
+            "expired" => Failure::Expired,
+            "replaced" => Failure::Replaced,
+            "" => Failure::Failed,
+            e => Failure::Other(e.to_string()),
+        }
+    }
+
+    /// The short message to show, in `locale`.
+    pub fn text(&self, locale: Locale) -> String {
+        let m = match self {
+            Failure::NothingHeard => Msg::DictNothingHeard,
+            Failure::LinkLost => Msg::DictLinkLost,
+            Failure::Expired => Msg::DictExpired,
+            Failure::Replaced => Msg::DictReplaced,
+            Failure::PhoneNotConnected => Msg::DictPhoneNotConnected,
+            Failure::PhoneCannotNotes => Msg::DictPhoneCannotNotes,
+            Failure::NotAvailable => Msg::DictNotAvailable,
+            Failure::Failed => Msg::DictFailed,
+            Failure::Other(text) => return text.clone(),
+        };
+        m.get(locale).to_string()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -22,7 +66,7 @@ pub enum Phase {
     Starting,
     Listening,
     Processing,
-    Failed(String),
+    Failed(Failure),
 }
 
 /// What the app must do.
@@ -41,18 +85,6 @@ pub struct Dictation {
     request_id: u32,
     phase: Phase,
     text: String,
-}
-
-/// A short message for a failure text from glassd or the phone.
-pub fn failure_text(error: &str) -> String {
-    match error {
-        "no-speech" => "Nothing was heard".into(),
-        "link-lost" => "The phone link was lost".into(),
-        "expired" => "That took too long".into(),
-        "replaced" => "Another note was started".into(),
-        "" => "Dictation failed".into(),
-        e => e.to_string(),
-    }
 }
 
 impl Dictation {
@@ -80,9 +112,9 @@ impl Dictation {
     /// glassd refused the `DictationStart`.
     pub fn refused(&mut self, code: ErrorCode) {
         self.phase = Phase::Failed(match code {
-            ErrorCode::NoCompanion => "The phone is not connected".into(),
-            ErrorCode::Unsupported => "The phone app cannot take notes".into(),
-            _ => "Dictation is not available".into(),
+            ErrorCode::NoCompanion => Failure::PhoneNotConnected,
+            ErrorCode::Unsupported => Failure::PhoneCannotNotes,
+            _ => Failure::NotAvailable,
         });
     }
 
@@ -95,14 +127,15 @@ impl Dictation {
         match St::try_from(s.state).unwrap_or(St::Unspecified) {
             St::Listening => self.phase = Phase::Listening,
             St::Processing => self.phase = Phase::Processing,
-            St::Failed => self.phase = Phase::Failed(failure_text(&s.error)),
+            St::Failed => self.phase = Phase::Failed(Failure::from_error(&s.error)),
             St::Done => {
                 let text = self.text.trim().to_string();
                 if text.is_empty() {
-                    self.phase = Phase::Failed(failure_text("no-speech"));
+                    self.phase = Phase::Failed(Failure::NothingHeard);
                 } else {
-                    // The request ended at glassd: nothing to cancel.
-                    self.phase = Phase::Failed(String::new());
+                    // The request ended at glassd: nothing to cancel. (This closed state is
+                    // never shown; the note is added and the screen closes at once.)
+                    self.phase = Phase::Failed(Failure::Failed);
                     return Some(DictationOut::Note(text));
                 }
             }
@@ -130,12 +163,12 @@ impl Dictation {
         }
     }
 
-    /// The card shown.
-    pub fn card(&self, now_s: i64) -> CardContent {
+    /// The card shown, built in `locale`.
+    pub fn card(&self, locale: Locale, now_s: i64) -> CardContent {
         match &self.phase {
-            Phase::Failed(msg) => CardContent::Info {
-                title: "Note not taken".into(),
-                lines: vec![msg.clone(), "Tap to close".into()],
+            Phase::Failed(failure) => CardContent::Info {
+                title: Msg::NoteNotTaken.get(locale).into(),
+                lines: vec![failure.text(locale), Msg::TapToClose.get(locale).into()],
             },
             p => {
                 let body = if !self.text.is_empty() {
@@ -143,15 +176,16 @@ impl Dictation {
                 } else if *p == Phase::Processing {
                     "…".into()
                 } else {
-                    "Speak now".into()
+                    Msg::SpeakNow.get(locale).to_string()
                 };
                 CardContent::Text {
                     body,
                     source: match p {
-                        Phase::Starting => "Connecting",
-                        Phase::Listening => "Listening",
-                        _ => "Processing",
+                        Phase::Starting => Msg::SourceConnecting,
+                        Phase::Listening => Msg::SourceListening,
+                        _ => Msg::SourceProcessing,
                     }
+                    .get(locale)
                     .into(),
                     timestamp_s: now_s,
                 }
@@ -189,11 +223,16 @@ mod tests {
         d.on_state(&st(7, S::Listening, ""));
         assert_eq!(d.phase(), &Phase::Listening);
         d.on_transcript(&tr(7, "buy", false));
-        match d.card(0) {
+        match d.card(Locale::En, 0) {
             CardContent::Text { body, source, .. } => {
                 assert_eq!(body, "buy");
                 assert_eq!(source, "Listening");
             }
+            c => panic!("{c:?}"),
+        }
+        // The same listening card in Italian.
+        match d.card(Locale::It, 0) {
+            CardContent::Text { source, .. } => assert_eq!(source, "In ascolto"),
             c => panic!("{c:?}"),
         }
         d.on_transcript(&tr(7, "buy milk", true));
@@ -213,7 +252,15 @@ mod tests {
             Some(DictationOut::Cancel(1))
         );
         d.on_state(&st(1, S::Failed, "no-speech"));
-        assert_eq!(d.phase(), &Phase::Failed("Nothing was heard".into()));
+        assert_eq!(d.phase(), &Phase::Failed(Failure::NothingHeard));
+        // The failure card reads the reason in the current locale.
+        match d.card(Locale::Fr, 0) {
+            CardContent::Info { title, lines } => {
+                assert_eq!(title, "Note non prise");
+                assert_eq!(lines[0], "Rien n'a été entendu");
+            }
+            c => panic!("{c:?}"),
+        }
         assert_eq!(
             d.input(&InputEvent::gesture(GestureKind::Tap)),
             Some(DictationOut::Close)

@@ -16,6 +16,7 @@
 //! phone app can finish): `TAP` skips, `SWIPE_DOWN` goes back.
 
 use crate::platform::{PlatformEvent, PlatformRequest};
+use glass_ui::i18n::{fmt1, Locale, Msg};
 use glass_ui::{CardContent, GestureKind, InputEvent};
 
 /// How long the Glass stays visible to phones when the pairing step starts.
@@ -23,6 +24,11 @@ pub const DISCOVERABLE_S: u32 = 300;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
+    /// Scroll-to-pick the UI language (the first step when no locale is set): swipe moves
+    /// through the languages, tap chooses. `index` is into [`Locale::ALL`].
+    Language {
+        index: usize,
+    },
     Welcome,
     Pair,
     /// A phone asks to pair.
@@ -39,6 +45,8 @@ pub enum Step {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SetupEffect {
     Platform(PlatformRequest),
+    /// Apply (and persist through glassd) a language picked in the setup flow.
+    SetLocale(Locale),
     /// The flow ended (`skipped`: without a phone); the timeline is shown.
     Done {
         skipped: bool,
@@ -58,6 +66,8 @@ pub struct Setup {
     step: Step,
     bt_name: String,
     companion: Companion,
+    /// The language the cards render in (and the picker's live preview).
+    locale: Locale,
     done: bool,
 }
 
@@ -68,17 +78,34 @@ impl Default for Setup {
 }
 
 impl Setup {
+    /// A flow that starts at the welcome step (a locale is already set).
     pub fn new() -> Setup {
         Setup {
             step: Step::Welcome,
             bt_name: String::new(),
             companion: Companion::default(),
+            locale: Locale::DEFAULT,
             done: false,
+        }
+    }
+
+    /// A flow that opens with the language picker, highlighting `current` — the first-boot
+    /// path when no locale is set yet.
+    pub fn with_language_picker(current: Locale) -> Setup {
+        let index = Locale::ALL.iter().position(|&l| l == current).unwrap_or(0);
+        Setup {
+            step: Step::Language { index },
+            locale: current,
+            ..Setup::new()
         }
     }
 
     pub fn step(&self) -> &Step {
         &self.step
+    }
+
+    pub fn locale(&self) -> Locale {
+        self.locale
     }
 
     pub fn is_done(&self) -> bool {
@@ -87,6 +114,12 @@ impl Setup {
 
     pub fn set_bluetooth_name(&mut self, name: String) {
         self.bt_name = name;
+    }
+
+    /// Keeps the cards' language in step with the app (e.g. the companion pushed a locale
+    /// mid-setup).
+    pub fn set_locale(&mut self, locale: Locale) {
+        self.locale = locale;
     }
 
     pub fn set_companion(&mut self, c: Companion) {
@@ -121,6 +154,24 @@ impl Setup {
         }
         use GestureKind as G;
         match (self.step.clone(), kind) {
+            (Step::Language { index }, G::SwipeForward | G::SwipeBackward) => {
+                let next = if kind == G::SwipeForward {
+                    (index + 1).min(Locale::ALL.len() - 1)
+                } else {
+                    index.saturating_sub(1)
+                };
+                if next != index {
+                    self.step = Step::Language { index: next };
+                    // Preview the highlighted language at once (live re-render).
+                    self.locale = Locale::ALL[next];
+                    fx.push(SetupEffect::SetLocale(self.locale));
+                }
+            }
+            (Step::Language { index }, G::Tap) => {
+                self.locale = Locale::ALL[index];
+                fx.push(SetupEffect::SetLocale(self.locale));
+                self.step = Step::Welcome;
+            }
             (Step::Welcome, G::Tap) => self.enter_pair(&mut fx),
             (Step::Pair, G::SwipeForward) => self.step = Step::Phone,
             (Step::Pairing { .. }, G::Tap) => {
@@ -183,64 +234,79 @@ impl Setup {
         fx
     }
 
-    /// The card for the current step.
+    /// The card for the current step, in the flow's current language.
     pub fn card(&self) -> CardContent {
-        let info = |title: &str, lines: &[&str]| CardContent::Info {
-            title: title.into(),
-            lines: lines.iter().map(|s| s.to_string()).collect(),
+        let loc = self.locale;
+        let t = |m: Msg| m.get(loc).to_string();
+        let info = |title: Msg, lines: Vec<String>| CardContent::Info {
+            title: t(title),
+            lines,
         };
         let name = if self.bt_name.is_empty() {
-            "this Glass".to_string()
+            t(Msg::SetupThisGlass)
         } else {
             self.bt_name.clone()
         };
         match &self.step {
-            Step::Welcome => info("Welcome", &["Let's connect your phone.", "Tap to start"]),
+            Step::Language { index } => {
+                let picked = Locale::ALL[*index];
+                CardContent::MenuItem {
+                    // The endonym is the same in any language; the hint previews the pick.
+                    label: picked.endonym().to_string(),
+                    detail: Some(Msg::ChooseLanguage.get(picked).to_string()),
+                    index: *index,
+                    count: Locale::ALL.len(),
+                }
+            }
+            Step::Welcome => info(
+                Msg::WelcomeTitle,
+                vec![t(Msg::WelcomeConnectPhone), t(Msg::TapToStart)],
+            ),
             Step::Pair => info(
-                "Pair your phone",
-                &[
-                    "In your phone's Bluetooth",
-                    &format!("settings, pair with {name}"),
-                    "Swipe down to skip",
+                Msg::PairTitle,
+                vec![
+                    t(Msg::PairLine1),
+                    fmt1(Msg::PairLine2.get(loc), &name),
+                    t(Msg::SwipeDownToSkip),
                 ],
             ),
             Step::Pairing { device, passkey } => {
                 let code = if passkey.is_empty() {
-                    "Pair with this phone?".to_string()
+                    t(Msg::PairWithThisPhone)
                 } else {
-                    format!("Code {passkey}")
+                    fmt1(Msg::Code.get(loc), passkey)
                 };
                 info(
-                    "Pairing",
-                    &[device, &code, "Tap to pair, swipe down to refuse"],
+                    Msg::PairingTitle,
+                    vec![device.clone(), code, t(Msg::TapPairSwipeRefuse)],
                 )
             }
             Step::Phone if self.companion.connected => {
                 let phone = if self.companion.phone_name.is_empty() {
-                    "your phone"
+                    t(Msg::YourPhone)
                 } else {
-                    &self.companion.phone_name
+                    self.companion.phone_name.clone()
                 };
-                info("Connected", &[&format!("to {phone}"), "Tap to finish"])
+                info(
+                    Msg::ConnectedTitle,
+                    vec![fmt1(Msg::ToTarget.get(loc), &phone), t(Msg::TapToFinish)],
+                )
             }
             Step::Phone if !self.companion.provider => info(
-                "Open OpenMyGlass",
-                &[
-                    "on your phone and connect.",
-                    "Waiting for the Glass app",
-                    "Swipe down to skip",
+                Msg::OpenCompanionTitle,
+                vec![
+                    t(Msg::OpenCompanionLine),
+                    t(Msg::WaitingGlassApp),
+                    t(Msg::SwipeDownToSkip),
                 ],
             ),
             Step::Phone => info(
-                "Open OpenMyGlass",
-                &["on your phone and connect.", "Swipe down to skip"],
+                Msg::OpenCompanionTitle,
+                vec![t(Msg::OpenCompanionLine), t(Msg::SwipeDownToSkip)],
             ),
             Step::Skip(_) => info(
-                "Skip setup?",
-                &[
-                    "You can pair later in Bluetooth.",
-                    "Tap to skip, swipe down to go back",
-                ],
+                Msg::SkipSetupTitle,
+                vec![t(Msg::SkipSetupLine), t(Msg::TapSkipSwipeBack)],
             ),
         }
     }
@@ -261,6 +327,38 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn language_picker_scrolls_previews_and_chooses() {
+        let mut s = Setup::with_language_picker(Locale::En);
+        assert_eq!(s.step(), &Step::Language { index: 1 });
+        // The card shows the highlighted language's own name.
+        match s.card() {
+            CardContent::MenuItem { label, count, .. } => {
+                assert_eq!(label, "English");
+                assert_eq!(count, 4);
+            }
+            c => panic!("{c:?}"),
+        }
+        // Swiping backward highlights Italian and previews it at once.
+        let fx = s.input(&g(GestureKind::SwipeBackward));
+        assert_eq!(fx, vec![SetupEffect::SetLocale(Locale::It)]);
+        assert_eq!(s.locale(), Locale::It);
+        match s.card() {
+            CardContent::MenuItem { label, .. } => assert_eq!(label, "Italiano"),
+            c => panic!("{c:?}"),
+        }
+        // Already at the first language: another backward swipe does nothing.
+        assert!(s.input(&g(GestureKind::SwipeBackward)).is_empty());
+        // Tap chooses the highlighted language and moves to Welcome.
+        let fx = s.input(&g(GestureKind::Tap));
+        assert_eq!(fx, vec![SetupEffect::SetLocale(Locale::It)]);
+        assert_eq!(s.step(), &Step::Welcome);
+        match s.card() {
+            CardContent::Info { title, .. } => assert_eq!(title, "Benvenuto"),
+            c => panic!("{c:?}"),
+        }
     }
 
     #[test]
