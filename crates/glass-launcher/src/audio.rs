@@ -1445,36 +1445,196 @@ impl AudioSweep {
 
 // ---- TWL6040 analog-path diagnostic (earphone output) ------------------------------
 
-/// Reads the whole TWL6040 register set (regmap debugfs) and the EP-path ASoC DAPM widget
-/// power, emitting each line — so a device readback shows exactly which earphone/HSDAC
-/// enable + power-mode + charge-pump bits are actually set during playback.
+/// Reads the REAL TWL6040 hardware registers over I2C (the regmap debugfs does not exist
+/// on this build), decodes the earphone/HSDAC/charge-pump bits, and dumps the EP-path ASoC
+/// DAPM widget power — so a device readback shows exactly what the analog stage is doing
+/// during playback (and whether the DAPM "On" cache matches the real register).
 fn dump_codec_state(emit: &mut dyn FnMut(&str)) {
-    // TWL6040 register map: /sys/kernel/debug/regmap/<...twl6040...>/registers
-    match fs::read_dir("/sys/kernel/debug/regmap") {
-        Ok(rd) => {
-            let mut found = false;
-            for e in rd.flatten() {
-                let name = e.file_name().to_string_lossy().into_owned();
-                if name.to_lowercase().contains("twl6040") {
-                    found = true;
-                    match fs::read_to_string(e.path().join("registers")) {
-                        Ok(s) => {
-                            emit(&format!("twl6040 registers ({name}):"));
-                            for l in s.lines() {
-                                emit(&format!("  reg {l}"));
-                            }
-                        }
-                        Err(err) => emit(&format!("twl6040 registers ({name}): FAIL: {err}")),
-                    }
-                }
-            }
-            if !found {
-                emit("no twl6040 regmap dir under /sys/kernel/debug/regmap");
+    dump_twl6040_i2c(emit);
+    dump_codec_reg_debugfs(emit);
+    dump_dapm(emit);
+}
+
+const I2C_SLAVE: libc::c_ulong = 0x0703;
+const I2C_SMBUS: libc::c_ulong = 0x0720;
+const I2C_SMBUS_READ: u8 = 1;
+const I2C_SMBUS_BYTE_DATA: u32 = 2;
+
+#[repr(C)]
+union I2cSmbusData {
+    byte: u8,
+    word: u16,
+    block: [u8; 34],
+}
+
+#[repr(C)]
+struct I2cSmbusIoctlData {
+    read_write: u8,
+    command: u8,
+    size: u32,
+    data: *mut I2cSmbusData,
+}
+
+/// Finds the TWL6040's I2C bus and address from sysfs (`/sys/bus/i2c/devices/<bus>-<addr>`
+/// whose `name` is `twl6040`).
+fn find_twl6040_i2c() -> Option<(u32, u16)> {
+    for e in fs::read_dir("/sys/bus/i2c/devices").ok()?.flatten() {
+        let name = fs::read_to_string(e.path().join("name")).unwrap_or_default();
+        if name.trim() == "twl6040" {
+            let base = e.file_name().to_string_lossy().into_owned();
+            let (bus, addr) = base.split_once('-')?;
+            return Some((bus.parse().ok()?, u16::from_str_radix(addr, 16).ok()?));
+        }
+    }
+    None
+}
+
+fn i2c_read_reg(fd: RawFd, reg: u8) -> io::Result<u8> {
+    let mut data = I2cSmbusData { block: [0; 34] };
+    let mut args = I2cSmbusIoctlData {
+        read_write: I2C_SMBUS_READ,
+        command: reg,
+        size: I2C_SMBUS_BYTE_DATA,
+        data: &mut data,
+    };
+    let rc = unsafe { libc::ioctl(fd, I2C_SMBUS as _, &mut args as *mut _) };
+    if rc < 0 {
+        Err(Error::last_os_error())
+    } else {
+        Ok(unsafe { data.byte })
+    }
+}
+
+/// Dumps the key TWL6040 registers read directly over I2C, with per-bit decode.
+fn dump_twl6040_i2c(emit: &mut dyn FnMut(&str)) {
+    let Some((bus, addr)) = find_twl6040_i2c() else {
+        emit("twl6040: not found under /sys/bus/i2c/devices (cannot read registers over I2C)");
+        return;
+    };
+    emit(&format!(
+        "twl6040 on i2c-{bus} addr 0x{addr:02x}: reading registers directly"
+    ));
+    let path = format!("/dev/i2c-{bus}");
+    let fd = match open_snd_like(&path, bus) {
+        Ok(fd) => fd,
+        Err(e) => {
+            emit(&format!("  open {path}: {e}"));
+            return;
+        }
+    };
+    if unsafe { libc::ioctl(fd.0, I2C_SLAVE as _, addr as libc::c_ulong) } < 0 {
+        emit(&format!(
+            "  I2C_SLAVE 0x{addr:02x}: {}",
+            Error::last_os_error()
+        ));
+        return;
+    }
+    // (addr, name) of the registers that matter for the earphone analog path.
+    let regs: &[(u8, &str)] = &[
+        (0x02, "ASICREV"),
+        (0x05, "NCPCTL"),
+        (0x06, "LDOCTL"),
+        (0x07, "HPPLLCTL"),
+        (0x08, "LPPLLCTL"),
+        (0x09, "LPPLLDIV"),
+        (0x0F, "LINEGAIN"),
+        (0x10, "HSLCTL"),
+        (0x11, "HSRCTL"),
+        (0x12, "HSGAIN"),
+        (0x13, "EARCTL"),
+        (0x2E, "STATUS"),
+    ];
+    for &(reg, name) in regs {
+        match i2c_read_reg(fd.0, reg) {
+            Ok(v) => emit(&format!(
+                "  R{reg:#04x} {name:<9} = 0x{v:02x} {}",
+                decode_reg(reg, v)
+            )),
+            Err(e) => emit(&format!("  R{reg:#04x} {name:<9} = read FAIL: {e}")),
+        }
+    }
+}
+
+/// Human decode of the earphone-relevant registers (per twl6040.h).
+fn decode_reg(reg: u8, v: u8) -> String {
+    match reg {
+        // NCPCTL: bit0 NCPENA (negative charge pump), bit1 NCPOPEN.
+        0x05 => format!("[NCPENA={} NCPOPEN={}]", v & 1, (v >> 1) & 1),
+        // LDOCTL: bit0 LSLDOENA, bit1 HSLDOENA, bit2 REFENA, bit4 LSLDO...
+        0x06 => format!(
+            "[LSLDOENA={} HSLDOENA={} REFENA={}]",
+            v & 1,
+            (v >> 1) & 1,
+            (v >> 2) & 1
+        ),
+        // HSLCTL/HSRCTL: bit0 HSDACENA, bit1 HSDACMODE, bit2 HSDRVENA, bit3 HSDRVMODE.
+        0x10 | 0x11 => format!(
+            "[HSDACENA={} HSDACMODE={} HSDRVENA={} HSDRVMODE={}]",
+            v & 1,
+            (v >> 1) & 1,
+            (v >> 2) & 1,
+            (v >> 3) & 1
+        ),
+        // EARCTL: bit0 EARENA, bits1-4 EARGAIN.
+        0x13 => format!("[EARENA={} EARGAIN={}]", v & 1, (v >> 1) & 0x0f),
+        // HPPLL: bit0 HPLLENA, bit2 HPLLSQRBP, bit4 HPLLSQRENA.
+        0x07 => format!("[HPLLENA={}]", v & 1),
+        // LPPLL: bit0 LPLLENA, bit4 LPLLFIN.
+        0x08 => format!("[LPLLENA={}]", v & 1),
+        // STATUS: bit0 PLUGCOMP, bit3 VIBLOCDET, bit6 TSHUTDET... bit? ready.
+        0x2e => format!("[raw bits set: {v:08b}]"),
+        _ => String::new(),
+    }
+}
+
+/// Reads the ASoC codec_reg debugfs file (driver's own register view), if present.
+fn dump_codec_reg_debugfs(emit: &mut dyn FnMut(&str)) {
+    fn find(dir: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+        if depth > 4 {
+            return;
+        }
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                find(&p, depth + 1, out);
+            } else if e.file_name() == "codec_reg" {
+                out.push(p);
             }
         }
-        Err(e) => emit(&format!("/sys/kernel/debug/regmap: {e} (debugfs mounted?)")),
     }
-    dump_dapm(emit);
+    let mut files = Vec::new();
+    find(
+        std::path::Path::new("/sys/kernel/debug/asoc"),
+        0,
+        &mut files,
+    );
+    for f in files {
+        if let Ok(s) = fs::read_to_string(&f) {
+            emit(&format!(
+                "codec_reg ({}): {}",
+                f.display(),
+                s.replace('\n', " ")
+            ));
+        }
+    }
+}
+
+/// Opens a char device, creating the node from `/sys/class/i2c-dev/i2c-<bus>/dev` if the
+/// device tmpfs has none (mdev may not have created it).
+fn open_snd_like(path: &str, bus: u32) -> io::Result<Fd> {
+    if let Some(fd) = try_open(path) {
+        return Ok(fd);
+    }
+    let dev = fs::read_to_string(format!("/sys/class/i2c-dev/i2c-{bus}/dev"))?;
+    let (maj, min) = dev
+        .trim()
+        .split_once(':')
+        .and_then(|(a, b)| Some((a.parse::<u32>().ok()?, b.parse::<u32>().ok()?)))
+        .ok_or_else(|| Error::other("bad i2c dev"))?;
+    let c = CString::new(path).unwrap();
+    unsafe { libc::mknod(c.as_ptr(), libc::S_IFCHR | 0o600, libc::makedev(maj, min)) };
+    try_open(path).ok_or_else(|| Error::other(format!("open {path}: {}", Error::last_os_error())))
 }
 
 /// Emits the power state of the EP-path ASoC DAPM widgets (handles widget names with
