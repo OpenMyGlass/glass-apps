@@ -89,6 +89,30 @@ struct Args {
     audio_diag2: bool,
     /// `--self-test`: run the guided on-screen self-test walkthrough (needs `fb`).
     self_test: bool,
+    /// `--audio-sweep`: play an EP amplitude×volume audibility matrix (needs `fb`+`sound`).
+    audio_sweep: bool,
+    /// `--audio-tone-long`: play one long (~15 s) EP tone so the init can read the
+    /// McPDM/ABE/DAPM running state while it plays (needs `sound`).
+    audio_tone_long: bool,
+    /// `--audio-analog`: TWL6040 earphone-path variants, dumping the codec registers +
+    /// EP-path DAPM during playback (needs `sound`; debugfs mounted by the init).
+    audio_analog: bool,
+    /// `--audio-devsweep`: play the same EP tone on each earphone-capable PCM front-end
+    /// (D0 ABE, D6 ABE-LP, D8 twl6040-legacy/McPDM-direct) to find which one is audible.
+    audio_devsweep: bool,
+    /// `--audio-legacy`: play a tone through the legacy McPDM-direct path (D8, S32/96 kHz),
+    /// bypassing the ABE/AESS entirely — the decisive "is the ABE the culprit?" test.
+    audio_legacy: bool,
+    /// `--audio-mmap`: stock-HAL-matched earphone playback (MMAP + NOIRQ on the ABE D0).
+    audio_mmap: bool,
+    /// `--audio-stock-exact`: byte-for-byte stock pcm_open (MMAP+NOIRQ, period 14784, st 2112).
+    audio_stock_exact: bool,
+    /// `--audio-headset`: play the tone on the headset/USB-earbud output (not bone-conduction).
+    audio_headset: bool,
+    /// `--audio-writei14784`: EP tone via writei at the stock ABE period (isolates period vs MMAP).
+    audio_writei14784: bool,
+    /// `--audio-dump-state`: dump live regs/ABE/mixer/DAPM without playing (gold-ref capture).
+    audio_dump_state: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -121,6 +145,16 @@ fn parse_args() -> Result<Args, String> {
             "--audio-diag" => a.audio_diag = true,
             "--audio-diag2" => a.audio_diag2 = true,
             "--self-test" => a.self_test = true,
+            "--audio-sweep" => a.audio_sweep = true,
+            "--audio-tone-long" => a.audio_tone_long = true,
+            "--audio-analog" => a.audio_analog = true,
+            "--audio-devsweep" => a.audio_devsweep = true,
+            "--audio-legacy" => a.audio_legacy = true,
+            "--audio-mmap" => a.audio_mmap = true,
+            "--audio-stock-exact" => a.audio_stock_exact = true,
+            "--audio-headset" => a.audio_headset = true,
+            "--audio-writei14784" => a.audio_writei14784 = true,
+            "--audio-dump-state" => a.audio_dump_state = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -146,8 +180,8 @@ fn parse_args() -> Result<Args, String> {
     if a.glassd.is_some() && a.window && a.out.is_some() {
         return Err("--glassd takes --out or --window, not both".into());
     }
-    if a.fb.is_some() && a.glassd.is_none() {
-        return Err("--display fb needs --glassd".into());
+    if a.fb.is_some() && a.glassd.is_none() && !a.self_test && !a.audio_sweep {
+        return Err("--display fb needs --glassd (or --self-test / --audio-sweep)".into());
     }
     if a.fb.is_some() && (a.window || a.out.is_some()) {
         return Err("--display fb excludes --out and --window".into());
@@ -358,6 +392,295 @@ fn run_audio_diag2() -> Result<(), String> {
     }
 }
 
+/// `--audio-analog`: TWL6040 earphone-path variants with register + DAPM dumps.
+fn run_audio_analog() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::analog_diag(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-AUDIO: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-devsweep`: play the same EP tone on D0 (ABE), D6 (ABE-LP) and D8 (legacy McPDM)
+/// so the owner can identify which earphone front-end is actually audible.
+fn run_audio_devsweep() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::device_sweep(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-DEV: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-stock-exact`: byte-for-byte stock pcm_open (MMAP+NOIRQ, period 14784, st 2112).
+fn run_audio_stock_exact() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::stock_exact_diag(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-STOCK: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support".into())
+    }
+}
+
+/// `--audio-writei14784`: EP tone via writei at the stock ABE period (isolates period vs MMAP).
+fn run_audio_writei14784() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::writei_stock_diag(&mut |l: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-WRITEI: {l}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("no sound support".into())
+    }
+}
+
+/// `--audio-dump-state`: dump live regs/ABE/mixer/DAPM without playing (gold-ref capture).
+fn run_audio_dump_state() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::dump_state(&mut |l: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-STATE: {l}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("no sound support".into())
+    }
+}
+
+/// `--audio-headset`: play the tone on the headset/USB-earbud output (not bone-conduction).
+fn run_audio_headset() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::headset_diag(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-HS: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support".into())
+    }
+}
+
+/// `--audio-mmap`: stock-HAL-matched earphone playback (MMAP + NOIRQ on the ABE D0).
+fn run_audio_mmap() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::mmap_diag(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-MMAP: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-legacy`: play a tone via the legacy McPDM-direct path (D8), bypassing the ABE.
+fn run_audio_legacy() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::legacy_play(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-LEGACY: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-tone-long`: play one long (~15 s) steady EP tone and report how long the play
+/// took. If McPDM is actually clocking the samples out, the ABE consumes in real time and
+/// the ~15 s of audio drain in ~15 s; if the back-end never clocks, the ABE buffer fills
+/// and the write stalls / fails early (EIO) — so the elapsed time and OK/FAIL are
+/// themselves a McPDM-transfer verdict. The init reads the McPDM/DAPM/PCM state meanwhile.
+fn run_audio_tone_long() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        use std::time::Instant;
+        let emit = |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-MCPDM: {line}");
+            let _ = e.flush();
+        };
+        let (sweep, report) = glass_launcher::audio::AudioSweep::open();
+        for l in &report {
+            emit(&format!("open: {l}"));
+        }
+        let Some(sweep) = sweep else {
+            return Err("audio-tone-long: ALSA unavailable".into());
+        };
+        let _ = sweep.set_ep_volume(12);
+        emit("playing a 15 s 1 kHz tone (amp 0.4, EP vol 12) -- timing the drain ...");
+        let t0 = Instant::now();
+        let r = sweep.play(1000.0, 15000.0, 0.4);
+        let ms = t0.elapsed().as_millis();
+        match r {
+            Ok(()) => {
+                emit(&format!(
+                    "tone drained in {ms} ms (expect ~15000 if McPDM clocks real-time; a few seconds then OK would mean the ABE just buffered)"
+                ));
+                Ok(())
+            }
+            Err(e) => {
+                emit(&format!(
+                    "tone FAILED after {ms} ms: {e} -- back-end likely not clocking (ABE buffer filled, DMA stalled)"
+                ));
+                Err("audio-tone-long: play failed".into())
+            }
+        }
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-sweep`: play an EP audibility matrix — synth amplitude × Earphone Playback
+/// Volume — each a clearly-labelled ~2 s tone, rendering the combo on the framebuffer and
+/// logging it, so the owner can tell us which combo is clean + audible. The digital path
+/// is known-good; this finds a non-clipping analog level.
+#[cfg(all(feature = "fb", target_os = "linux"))]
+fn run_audio_sweep(args: &Args) -> Result<(), String> {
+    use glass_launcher::panel::Panel;
+    use glass_ui::i18n::Locale;
+    use glass_ui::CardContent;
+    use std::io::Write;
+    use std::time::Duration;
+
+    let dev = args.fb.clone().unwrap_or_else(|| PathBuf::from("/dev/fb0"));
+    let base = clock::now();
+    let ctx = RenderContext {
+        now_s: base.now_s,
+        hour: base.hour,
+        minute: base.minute,
+        locale: Locale::It,
+    };
+    let emit = |line: &str| {
+        let mut e = std::io::stderr();
+        let _ = writeln!(e, "OMGB-AUDIO: {line}");
+        let _ = e.flush();
+    };
+
+    #[cfg(not(feature = "sound"))]
+    {
+        let _ = (dev, ctx, emit);
+        return Err("this build has no sound support: rebuild with --features sound".into());
+    }
+    #[cfg(feature = "sound")]
+    {
+        use glass_launcher::audio::AudioSweep;
+        let mut compositor = compositor_for(Some(Renderer::Software))?;
+        let mut display = glass_gfx::FramebufferDisplay::open(&dev).map_err(|e| e.to_string())?;
+        let mut show = |title: String, body: String| {
+            let mut p = Panel::new(
+                CardContent::Info {
+                    title,
+                    lines: vec![body],
+                },
+                ctx,
+            );
+            let _ = p.render(compositor.as_mut());
+            let _ = compositor.present(&mut display);
+        };
+
+        emit("============ EP AUDIBILITY SWEEP (amplitude × Earphone volume) ============");
+        let (sweep, report) = AudioSweep::open();
+        for l in &report {
+            emit(&format!("sweep: {l}"));
+        }
+        let Some(sweep) = sweep else {
+            show("Audio sweep".into(), "ALSA open FAILED".into());
+            std::thread::sleep(Duration::from_secs(3));
+            return Err("audio sweep: ALSA unavailable".into());
+        };
+        let mut n = 0;
+        let total = AudioSweep::AMPS.len() * AudioSweep::VOLUMES.len();
+        for &vol in &AudioSweep::VOLUMES {
+            for &amp in &AudioSweep::AMPS {
+                n += 1;
+                let set = sweep.set_ep_volume(vol);
+                let label = format!("amp={amp:.1} EPvol={vol}");
+                show(
+                    format!("SWEEP {n}/{total}"),
+                    format!("{label}\nASCOLTA (2s)"),
+                );
+                emit(&format!(
+                    ">>> {n}/{total} {label} (set {}) -- ASCOLTA ORA 2s",
+                    if set.is_ok() { "ok" } else { "FAIL" }
+                ));
+                std::thread::sleep(Duration::from_millis(400));
+                match sweep.play(1000.0, 2000.0, amp) {
+                    Ok(()) => emit(&format!("    {label}: played")),
+                    Err(e) => emit(&format!("    {label}: PLAY FAIL: {e}")),
+                }
+                std::thread::sleep(Duration::from_millis(800));
+            }
+        }
+        show(
+            "Sweep done".into(),
+            "Dimmi quale combo era pulita+udibile".into(),
+        );
+        emit("SWEEP DONE: report which amp/EPvol was clean + audible (clipping = 'pessimo').");
+        std::thread::sleep(Duration::from_secs(4));
+        Ok(())
+    }
+}
+
+#[cfg(not(all(feature = "fb", target_os = "linux")))]
+fn run_audio_sweep(_args: &Args) -> Result<(), String> {
+    Err("this build has no framebuffer support: rebuild with --features fb on Linux".into())
+}
+
 /// `--self-test`: the guided on-screen walkthrough. Renders instruction cards to the
 /// framebuffer, drives the [`selftest::SelfTest`] machine from glassd frames, plays the
 /// audio cues, and logs one `OMGB-SELFTEST:` line per step to stderr (the image's init
@@ -499,9 +822,11 @@ fn run_self_test(args: &Args) -> Result<(), String> {
     let mut keep_awake = true;
 
     loop {
-        // Keep-awake: a periodic UserActivity resets glassd's screen-off timer, so the
-        // display never idles out during the walkthrough (except while released for dim).
-        if keep_awake && last_poke.elapsed() >= Duration::from_secs(2) {
+        // Keep-awake: a frequent UserActivity resets glassd's screen-off timer, so the
+        // display never idles out or dims during the walkthrough (a dim would consume the
+        // owner's taps as wake instead of delivering them — the touch_precision regression).
+        // Except while released for the dim step.
+        if keep_awake && last_poke.elapsed() >= Duration::from_millis(1000) {
             if let Some(c) = client.as_mut() {
                 let _ = c.send(client_frame::Body::Screen(ScreenRequest {
                     action: screen_request::Action::UserActivity as i32,
@@ -767,7 +1092,27 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.self_test {
+    let result = if args.audio_dump_state {
+        run_audio_dump_state()
+    } else if args.audio_writei14784 {
+        run_audio_writei14784()
+    } else if args.audio_headset {
+        run_audio_headset()
+    } else if args.audio_stock_exact {
+        run_audio_stock_exact()
+    } else if args.audio_mmap {
+        run_audio_mmap()
+    } else if args.audio_legacy {
+        run_audio_legacy()
+    } else if args.audio_devsweep {
+        run_audio_devsweep()
+    } else if args.audio_analog {
+        run_audio_analog()
+    } else if args.audio_tone_long {
+        run_audio_tone_long()
+    } else if args.audio_sweep {
+        run_audio_sweep(&args)
+    } else if args.self_test {
         run_self_test(&args)
     } else if args.audio_diag2 {
         run_audio_diag2()

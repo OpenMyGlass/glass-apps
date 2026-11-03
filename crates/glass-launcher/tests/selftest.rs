@@ -151,9 +151,10 @@ fn a_swipe_down_skips_a_step_and_timeouts_skip_sensors() {
         .iter()
         .any(|l| l.contains("step=nav_swipe_fwd") && l.contains("result=SKIP")));
 
-    // Now on step 2 (nav_swipe_back). Let every remaining step time out (20 s each).
+    // Now on step 2. Let every remaining step time out; one big tick (>= the longest,
+    // the 40 s sensor timeout) skips each step per iteration.
     for _ in 0..glass_launcher::selftest::Step::ALL.len() {
-        st.tick(21.0);
+        st.tick(41.0);
         drain(&mut st, &mut log);
     }
     assert!(st.is_done());
