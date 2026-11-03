@@ -876,6 +876,9 @@ impl App {
         if let Some(Overlay::Menu(m, _)) = self.overlay.as_mut() {
             m.cancel_touch();
         }
+        if let Some(Overlay::Adjust(a, _)) = self.overlay.as_mut() {
+            a.cancel_touch();
+        }
     }
 
     /// The connection to glassd is gone: its settings are unknown again and requests made
