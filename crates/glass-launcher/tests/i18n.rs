@@ -99,21 +99,21 @@ fn key_screens_read_correctly_in_each_locale() {
     assert_eq!(settings_title(ids::WIFI, Locale::It), "Wi-Fi");
     assert_eq!(
         settings_subtitle(ids::SCREEN_TIMEOUT, Locale::It),
-        "15 secondi"
+        "2 minuti"
     );
     assert_eq!(
         settings_subtitle(ids::SCREEN_TIMEOUT, Locale::En),
-        "15 seconds"
+        "2 minutes"
     );
     assert_eq!(
         settings_subtitle(ids::SCREEN_TIMEOUT, Locale::Fr),
-        "15 secondes"
+        "2 minutes"
     );
     assert_eq!(
         settings_subtitle(ids::SCREEN_TIMEOUT, Locale::Es),
-        "15 segundos"
+        "2 minutos"
     );
-    assert_eq!(settings_subtitle(ids::ON_HEAD, Locale::Fr), "Désactivé");
+    assert_eq!(settings_subtitle(ids::NUDGE, Locale::Fr), "Désactivé");
     // The language card names each language in its own language.
     assert_eq!(settings_title(ids::LANGUAGE, Locale::Es), "Idioma");
     assert_eq!(settings_subtitle(ids::LANGUAGE, Locale::Es), "Español");

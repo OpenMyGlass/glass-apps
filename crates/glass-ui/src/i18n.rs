@@ -153,6 +153,8 @@ messages! {
     SettingsWifi          => { it: "Wi-Fi", en: "Wi-Fi", fr: "Wi-Fi", es: "Wi-Fi" },
     SettingsBluetooth     => { it: "Bluetooth", en: "Bluetooth", fr: "Bluetooth", es: "Bluetooth" },
     SettingsScreenTimeout => { it: "Timeout schermo", en: "Screen timeout", fr: "Veille de l'écran", es: "Apagado de pantalla" },
+    SettingsRoot          => { it: "Impostazioni", en: "Settings", fr: "Paramètres", es: "Ajustes" },
+    SettingsVolume        => { it: "Volume", en: "Volume", fr: "Volume", es: "Volumen" },
     SettingsHeadWake      => { it: "Attiva con la testa", en: "Head wake", fr: "Réveil par la tête", es: "Activar con la cabeza" },
     HeadWakeOnAt          => { it: "Attivo, a {}", en: "On, at {}", fr: "Activé, à {}", es: "Activado, a {}" },
     SettingsWink          => { it: "Strizza l'occhio", en: "Wink", fr: "Clin d'œil", es: "Guiño" },

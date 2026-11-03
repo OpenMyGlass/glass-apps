@@ -65,6 +65,7 @@ fn scenes() -> Vec<(String, Card, Tolerance)> {
             let name = match c.id {
                 ids::WIFI => "wifi",
                 ids::BLUETOOTH => "bluetooth",
+                ids::VOLUME => "volume",
                 ids::SCREEN_TIMEOUT => "screen-timeout",
                 ids::HEAD_WAKE => "head-wake",
                 ids::WINK => "wink",

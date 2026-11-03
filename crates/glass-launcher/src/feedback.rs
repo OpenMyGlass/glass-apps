@@ -32,6 +32,9 @@ pub enum Cue {
 pub trait Feedback {
     /// Play `cue` (best effort: feedback is never essential, so errors are swallowed).
     fn play(&mut self, cue: Cue);
+
+    /// Sets the output volume in earpiece gain steps (0 to 15). No sound here.
+    fn set_volume(&mut self, _steps: u32) {}
 }
 
 /// The default player: no sound. Used everywhere the `sound` feature is off, and on the
