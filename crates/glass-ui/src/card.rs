@@ -329,21 +329,43 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
     }
 }
 
-/// The info card's lines: left-aligned, wrapped, as many as fit above the bottom margin.
+/// The info card's lines, wrapped, at the largest size where all of them fit: (size, lines,
+/// whether some still had to be left out at the smallest size).
+fn info_layout(w: f32, h: f32, lines: &[String]) -> (f32, Vec<String>, bool) {
+    let font = fonts::font(Weight::Light);
+    let max_w = w - 2.0 * style::MARGIN;
+    let last_baseline = h - style::FOOTER_BASELINE_FROM_BOTTOM;
+    let wrap = |size: f32| -> Vec<String> {
+        lines
+            .iter()
+            .flat_map(|l| text::wrap(font, size, l, max_w))
+            .collect()
+    };
+    let count = |size: f32| {
+        1 + ((last_baseline - style::INFO_TOP) / (size * style::BODY_LINE_HEIGHT)).floor() as usize
+    };
+    for size in [style::INFO_SIZE, 26.0, 24.0, style::MIN_TEXT_SIZE] {
+        let wrapped = wrap(size);
+        if wrapped.len() <= count(size) {
+            return (size, wrapped, false);
+        }
+    }
+    let size = style::MIN_TEXT_SIZE;
+    let mut wrapped = wrap(size);
+    wrapped.truncate(count(size));
+    (size, wrapped, true)
+}
+
+/// The info card's lines: left-aligned, wrapped, shrunk until all of them fit.
 fn info_lines(f: &mut dyn Painter, lines: &[String]) {
     let font = fonts::font(Weight::Light);
     let (w, h) = f.size();
-    let size = style::INFO_SIZE;
-    let step = size * style::BODY_LINE_HEIGHT;
-    let max_w = w as f32 - 2.0 * style::MARGIN;
+    let (size, wrapped, _) = info_layout(w as f32, h as f32, lines);
     let mut baseline = style::INFO_TOP;
-    for line in lines.iter().flat_map(|l| text::wrap(font, size, l, max_w)) {
-        if baseline > h as f32 - style::FOOTER_BASELINE_FROM_BOTTOM {
-            break;
-        }
-        let (run, _) = text::layout_line(font, size, style::MARGIN, baseline, &line);
+    for line in &wrapped {
+        let (run, _) = text::layout_line(font, size, style::MARGIN, baseline, line);
         f.draw_glyph_run(&run, style::TEXT);
-        baseline += step;
+        baseline += size * style::BODY_LINE_HEIGHT;
     }
 }
 
@@ -435,6 +457,26 @@ fn title_and_detail(f: &mut dyn Painter, title_size: f32, title: &str, detail: O
         }
         return;
     }
+    let (title_block, detail_block) = fit_title_detail(w, h, title_size, title, detail);
+    let detail_h = detail_block.as_ref().map_or(0.0, |b| b.height + FIT_GAP);
+    let mut top = (h - title_block.height - detail_h) / 2.0;
+    draw_block(f, font, &title_block, top, style::TEXT);
+    top += title_block.height + FIT_GAP;
+    if let Some(b) = &detail_block {
+        draw_block(f, font, b, top, style::SECONDARY);
+    }
+}
+
+/// The blocks of [`title_and_detail`] when they do not fit on one line each.
+fn fit_title_detail(
+    w: f32,
+    h: f32,
+    title_size: f32,
+    title: &str,
+    detail: Option<&str>,
+) -> (Block, Option<Block>) {
+    let font = fonts::font(Weight::Light);
+    let max_w = w - 2.0 * style::MARGIN;
     // The dots of a menu sit in the bottom margin, so the block stays above it.
     let room = h - 2.0 * FIT_MARGIN_Y;
     let detail_block = detail.map(|d| {
@@ -457,12 +499,29 @@ fn title_and_detail(f: &mut dyn Painter, title_size: f32, title: &str, detail: O
         style::MIN_TEXT_SIZE,
     ];
     let sizes: Vec<f32> = sizes.into_iter().filter(|s| *s <= title_size).collect();
-    let title_block = fit_block(font, &sizes, title, max_w, room - detail_h);
-    let mut top = (h - title_block.height - detail_h) / 2.0;
-    draw_block(f, font, &title_block, top, style::TEXT);
-    top += title_block.height + FIT_GAP;
-    if let Some(b) = &detail_block {
-        draw_block(f, font, b, top, style::SECONDARY);
+    (
+        fit_block(font, &sizes, title, max_w, room - detail_h),
+        detail_block,
+    )
+}
+
+/// Whether a card of this size has to cut any of its text (it should not, in any language:
+/// the i18n tests check every screen with this).
+pub fn text_is_cut(content: &CardContent, width: u32, height: u32) -> bool {
+    let (w, h) = (width as f32, height as f32);
+    let fits = |size, title: &str, detail: Option<&str>| {
+        let (t, d) = fit_title_detail(w, h, size, title, detail);
+        !t.cut && d.map_or(true, |b| !b.cut)
+    };
+    match content {
+        CardContent::Settings { title, subtitle } => {
+            !fits(style::TITLE_SIZE, title, subtitle.as_deref())
+        }
+        CardContent::MenuItem { label, detail, .. } => {
+            !fits(style::MENU_SIZE, label, detail.as_deref())
+        }
+        CardContent::Info { lines, .. } => info_layout(w, h, lines).2,
+        _ => false,
     }
 }
 
@@ -476,6 +535,8 @@ struct Block {
     size: f32,
     lines: Vec<String>,
     height: f32,
+    /// The text did not fit even at the smallest size.
+    cut: bool,
 }
 
 fn block_height(font: &glass_gfx::Font, size: f32, lines: usize) -> f32 {
@@ -494,13 +555,15 @@ fn fit_block(font: &glass_gfx::Font, sizes: &[f32], t: &str, max_w: f32, max_h: 
                 size,
                 lines,
                 height,
+                cut: false,
             };
         }
     }
     let size = *sizes.last().expect("at least one size");
     let mut lines = text::wrap(font, size, t, max_w);
     let fit = lines_that_fit(font, size, max_h).max(1);
-    if lines.len() > fit {
+    let cut = lines.len() > fit;
+    if cut {
         lines.truncate(fit);
         let last = format!("{}…", lines[fit - 1]);
         lines[fit - 1] = text::ellipsize(font, size, &last, max_w);
@@ -510,6 +573,7 @@ fn fit_block(font: &glass_gfx::Font, sizes: &[f32], t: &str, max_w: f32, max_h: 
         size,
         lines,
         height,
+        cut,
     }
 }
 
