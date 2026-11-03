@@ -157,7 +157,8 @@ messages! {
     HeadWakeOnAt          => { it: "Attivo, a {}", en: "On, at {}", fr: "Activé, à {}", es: "Activado, a {}" },
     SettingsWink          => { it: "Strizza l'occhio", en: "Wink", fr: "Clin d'œil", es: "Guiño" },
     SettingsOnHead        => { it: "Rilevamento in testa", en: "On-head detection", fr: "Détection sur la tête", es: "Detección en la cabeza" },
-    SettingsNudge         => { it: "Spegni con un cenno", en: "Nudge to sleep", fr: "Incliner pour éteindre", es: "Inclinar para apagar" },
+    SettingsNudge         => { it: "Spegni con la testa", en: "Nudge to sleep", fr: "Éteindre avec la tête", es: "Apagar con la cabeza" },
+    NudgeHint             => { it: "Un colpetto di testa in su spegne lo schermo", en: "A quick upward flick of the head turns the screen off", fr: "Un petit coup de tête vers le haut éteint l'écran", es: "Un toque rápido de cabeza hacia arriba apaga la pantalla" },
     SettingsDevice        => { it: "Dispositivo", en: "Device", fr: "Appareil", es: "Dispositivo" },
     SettingsLanguage      => { it: "Lingua", en: "Language", fr: "Langue", es: "Idioma" },
 

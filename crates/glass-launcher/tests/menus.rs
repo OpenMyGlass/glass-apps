@@ -127,9 +127,11 @@ fn screen_timeout_menu_starts_at_the_current_choice() {
 }
 
 #[test]
-fn toggles_for_wink_on_head_and_nudge() {
+fn toggles_for_on_head_and_nudge() {
     let mut a = app();
-    for id in [ids::WINK, ids::ON_HEAD, ids::NUDGE] {
+    // Wink is not in the settings (the glasshub firmware delivers no wink event).
+    assert!(!glass_launcher::settings::ORDER.contains(&ids::WINK));
+    for id in [ids::ON_HEAD, ids::NUDGE] {
         goto(&mut a, id);
         assert_eq!(subtitle(&a, id), "Off");
         g(&mut a, GestureKind::Tap);
@@ -138,7 +140,7 @@ fn toggles_for_wink_on_head_and_nudge() {
         assert_eq!(subtitle(&a, id), "On");
     }
     let s = a.settings().unwrap();
-    assert_eq!(s.wink_enabled, Some(true));
+    assert_eq!(s.wink_enabled, Some(false), "no card can turn wink on");
     assert_eq!(s.on_head_detection_enabled, Some(true));
     assert_eq!(s.nudge_sleep_enabled, Some(true));
 }
@@ -221,7 +223,7 @@ fn a_menu_covers_the_screen_and_keeps_layers_bounded() {
 #[test]
 fn the_screen_turning_off_closes_a_menu() {
     let mut a = app();
-    goto(&mut a, ids::WINK);
+    goto(&mut a, ids::ON_HEAD);
     g(&mut a, GestureKind::Tap);
     assert!(a.overlay().is_some());
     a.screen_off();
