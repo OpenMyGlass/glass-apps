@@ -23,6 +23,8 @@ fn ctx(locale: Locale) -> RenderContext {
         hour: 10,
         minute: 42,
         locale,
+        time_24h: true,
+        battery_percent: None,
     }
 }
 

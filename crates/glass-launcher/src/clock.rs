@@ -1,7 +1,9 @@
 //! The wall clock for the home card.
 
 use glass_ui::RenderContext;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// Now, with the local hour and minute where the platform tells them (Unix), else UTC.
 pub fn now() -> RenderContext {
@@ -14,8 +16,56 @@ pub fn now() -> RenderContext {
         now_s,
         hour,
         minute,
+        battery_percent: battery_percent(),
         ..RenderContext::default()
     }
+}
+
+/// Sets the process's time zone from a POSIX `TZ` string (no tz database needed).
+#[cfg(unix)]
+pub fn set_timezone(posix_tz: &str) {
+    extern "C" {
+        fn tzset();
+    }
+    if std::env::var("TZ").as_deref() != Ok(posix_tz) {
+        std::env::set_var("TZ", posix_tz);
+        // SAFETY: called from the UI thread; the audio thread does not read the time zone.
+        unsafe { tzset() };
+    }
+}
+
+#[cfg(not(unix))]
+pub fn set_timezone(_posix_tz: &str) {}
+
+/// How long a battery reading is reused.
+const BATTERY_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// The battery charge, re-read at most every [`BATTERY_MAX_AGE`] (this runs on every frame).
+fn battery_percent() -> Option<u8> {
+    static LAST: Mutex<Option<(Instant, Option<u8>)>> = Mutex::new(None);
+    let mut last = LAST.lock().ok()?;
+    if let Some((at, v)) = *last {
+        if at.elapsed() < BATTERY_MAX_AGE {
+            return v;
+        }
+    }
+    let v = read_battery(Path::new("/sys/class/power_supply"));
+    *last = Some((Instant::now(), v));
+    v
+}
+
+/// The `capacity` of the first supply of `type` Battery under `root`.
+fn read_battery(root: &Path) -> Option<u8> {
+    for entry in std::fs::read_dir(root).ok()?.flatten() {
+        let dir = entry.path();
+        let kind = std::fs::read_to_string(dir.join("type")).unwrap_or_default();
+        if kind.trim() != "Battery" {
+            continue;
+        }
+        let capacity = std::fs::read_to_string(dir.join("capacity")).ok()?;
+        return capacity.trim().parse::<u8>().ok().map(|p| p.min(100));
+    }
+    None
 }
 
 /// A fixed clock: `now_s` and the given wall-clock time. The locale is left at the default;

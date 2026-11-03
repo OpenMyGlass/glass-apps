@@ -30,7 +30,7 @@
 //! - **Fingers:** only one-finger gestures act (`glassd` handles the two-finger swipe down
 //!   itself); `Scroll` is followed with any number of fingers.
 //! - **Animation:** from the current position to the target with an ease-out cubic curve over
-//!   `min(0.12 s + 0.12 s × distance, 0.45 s)`. Time only advances through [`Timeline::tick`],
+//!   `min(0.16 s + 0.16 s × distance, 0.8 s)`. Time only advances through [`Timeline::tick`],
 //!   so animation is deterministic for any sequence of time steps and lands exactly on the
 //!   target.
 //!
@@ -59,9 +59,9 @@ use std::collections::HashMap;
 /// Cards moved by a drag across the full touchpad width.
 pub const CARDS_PER_PAD_WIDTH: f32 = 2.0;
 /// How far ahead (seconds) the release velocity is projected to choose where to settle.
-pub const FLING_PROJECTION_S: f32 = 0.15;
+pub const FLING_PROJECTION_S: f32 = 0.40;
 /// Release velocity (pad widths per second) above which at least one card is moved.
-pub const FLING_MIN_VELOCITY: f32 = 0.5;
+pub const FLING_MIN_VELOCITY: f32 = 0.3;
 /// Largest gap between a `Scroll{ended}` and a swipe gesture of the same touch, by their
 /// event timestamps (both are sent at the finger lift; this only guards against a lost
 /// gesture making a later swipe look like the same touch).
@@ -539,7 +539,7 @@ impl Timeline {
             from: self.pos,
             to: to as f32,
             elapsed: 0.0,
-            duration: (0.12 + 0.12 * distance).min(0.45),
+            duration: (0.16 + 0.16 * distance).min(0.8),
         });
         self.dirty = true;
     }

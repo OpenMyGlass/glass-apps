@@ -8,6 +8,8 @@ fn ctx(now_s: i64) -> RenderContext {
         hour: 22,
         minute: 7,
         locale: glass_ui::Locale::En,
+        time_24h: true,
+        battery_percent: None,
     }
 }
 
@@ -18,6 +20,15 @@ fn clock_is_twelve_hour_without_leading_zero() {
     assert_eq!(clock_text(0, 0), "12:00");
     assert_eq!(clock_text(12, 30), "12:30");
     assert_eq!(clock_text(9, 5), "9:05");
+    let ctx = |hour, time_24h| RenderContext {
+        hour,
+        minute: 5,
+        time_24h,
+        ..RenderContext::default()
+    };
+    assert_eq!(glass_ui::card::clock_text_in(&ctx(21, true)), "21:05");
+    assert_eq!(glass_ui::card::clock_text_in(&ctx(9, true)), "09:05");
+    assert_eq!(glass_ui::card::clock_text_in(&ctx(21, false)), "9:05");
 }
 
 #[test]
@@ -215,4 +226,18 @@ fn a_very_long_text_is_cut_but_stays_inside_the_card() {
     let huge = "parola ".repeat(200);
     let (_, _, y0, y1) = lit_extent(&Card::new(1, CardContent::settings(huge)));
     assert!(y0 >= 20 && y1 <= 340, "inside the card: {y0}..{y1}");
+}
+
+#[test]
+fn the_battery_is_shown_small_above_the_clock() {
+    let top_row_lit = |battery_percent| {
+        let ctx = RenderContext {
+            battery_percent,
+            ..RenderContext::default()
+        };
+        let f = render_card(&Card::new(10, CardContent::Home), &ctx, 640, 360);
+        (0..640).any(|x| (0..70).any(|y| f.pixel(x, y) != Color::BLACK))
+    };
+    assert!(top_row_lit(Some(87)));
+    assert!(!top_row_lit(None));
 }

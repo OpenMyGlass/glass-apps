@@ -492,7 +492,18 @@ impl App {
         }
         self.settings = Some(s);
         self.apply_volume();
+        self.apply_time();
         self.refresh_settings_cards();
+    }
+
+    fn apply_time(&mut self) {
+        let zone = self
+            .settings
+            .and_then(|s| s.timezone_id)
+            .and_then(|i| glass_api::hub::settings_rules::TIME_ZONES.get(i as usize));
+        if let Some(z) = zone {
+            clock::set_timezone(z.1);
+        }
     }
 
     fn apply_volume(&mut self) {
@@ -689,6 +700,7 @@ impl App {
                     .get_or_insert_with(settings::settings_defaults);
                 settings::apply_locally(current, &patch);
                 self.apply_volume();
+                self.apply_time();
                 self.refresh_settings_cards();
             }
         }
@@ -1011,6 +1023,10 @@ impl App {
     /// it overrides whatever the clock's context carries.
     pub fn step(&mut self, dt: f32, mut ctx: RenderContext) {
         ctx.locale = self.locale;
+        ctx.time_24h = self
+            .settings
+            .and_then(|s| s.time_24h)
+            .unwrap_or(ctx.time_24h);
         self.ctx = ctx;
         self.timeline.set_context(ctx);
         self.timeline.tick(dt);

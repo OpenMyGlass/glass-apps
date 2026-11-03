@@ -96,6 +96,10 @@ pub struct RenderContext {
     /// The language the footer's relative times render in. Other card text is built in the
     /// current language by the launcher; only the renderer-side strings use this.
     pub locale: Locale,
+    /// A 24-hour home clock, else 12-hour.
+    pub time_24h: bool,
+    /// The battery charge shown small above the home clock, when known.
+    pub battery_percent: Option<u8>,
 }
 
 impl Default for RenderContext {
@@ -105,7 +109,18 @@ impl Default for RenderContext {
             hour: 0,
             minute: 0,
             locale: Locale::DEFAULT,
+            time_24h: true,
+            battery_percent: None,
         }
+    }
+}
+
+/// The home clock text in the chosen format; 24-hour has a leading zero ("09:05").
+pub fn clock_text_in(ctx: &RenderContext) -> String {
+    if ctx.time_24h {
+        format!("{:02}:{:02}", ctx.hour % 24, ctx.minute)
+    } else {
+        clock_text(ctx.hour, ctx.minute)
     }
 }
 
@@ -147,7 +162,8 @@ pub fn render_key(card: &Card, ctx: &RenderContext) -> u64 {
     match &card.content {
         CardContent::Home => {
             0u8.hash(&mut h);
-            clock_text(ctx.hour, ctx.minute).hash(&mut h);
+            clock_text_in(ctx).hash(&mut h);
+            ctx.battery_percent.hash(&mut h);
         }
         CardContent::Text {
             body,
@@ -224,10 +240,20 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
                 f,
                 Weight::Light,
                 style::CLOCK_SIZE,
-                &clock_text(ctx.hour, ctx.minute),
+                &clock_text_in(ctx),
                 h / 2.0,
                 style::TEXT,
             );
+            if let Some(p) = ctx.battery_percent {
+                centered_line(
+                    f,
+                    Weight::Light,
+                    style::FOOTER_SIZE,
+                    &format!("{p}%"),
+                    style::MARGIN,
+                    style::SECONDARY,
+                );
+            }
         }
         CardContent::Text {
             body,
