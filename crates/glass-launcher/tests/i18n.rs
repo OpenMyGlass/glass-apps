@@ -113,7 +113,7 @@ fn key_screens_read_correctly_in_each_locale() {
         settings_subtitle(ids::SCREEN_TIMEOUT, Locale::Es),
         "15 segundos"
     );
-    assert_eq!(settings_subtitle(ids::WINK, Locale::Fr), "Désactivé");
+    assert_eq!(settings_subtitle(ids::ON_HEAD, Locale::Fr), "Désactivé");
     // The language card names each language in its own language.
     assert_eq!(settings_title(ids::LANGUAGE, Locale::Es), "Idioma");
     assert_eq!(settings_subtitle(ids::LANGUAGE, Locale::Es), "Español");

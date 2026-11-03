@@ -1,7 +1,8 @@
 //! The settings cards and the card menus.
 //!
 //! Settings cards sit on the backward side of the timeline, after the "now" cards: Wi-Fi,
-//! Bluetooth, screen timeout, head wake, wink, on-head detection, nudge to sleep, device.
+//! Bluetooth, screen timeout, head wake, on-head detection, nudge to sleep, device (wink is
+//! hidden until the glasshub firmware delivers wink events).
 //! What they show comes from [`SettingsView`]: the `Settings` that `glassd` applied (so a
 //! clamped value is shown as applied), the platform's radios, and the service's
 //! `Welcome`. A choice in a menu becomes a [`Choice`]: a `SetSettings` patch, a radio
@@ -28,12 +29,15 @@ pub mod ids {
 }
 
 /// The settings cards from the one next to the "now" cards to the farthest.
-pub const ORDER: [CardId; 9] = [
+///
+/// The wink card ([`ids::WINK`]) is not shown: the Glass glasshub firmware (1.22) never
+/// delivers a wink event, so the toggle did nothing the owner could see. `glassd` keeps the
+/// setting; the card comes back here once the MCU wink threshold is tuned.
+pub const ORDER: [CardId; 8] = [
     ids::WIFI,
     ids::BLUETOOTH,
     ids::SCREEN_TIMEOUT,
     ids::HEAD_WAKE,
-    ids::WINK,
     ids::ON_HEAD,
     ids::NUDGE,
     ids::LANGUAGE,
@@ -289,9 +293,11 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
         ids::ON_HEAD => vec![toggle_item(loc, s.on_head_detection_enabled, |p, b| {
             p.on_head_detection_enabled = Some(b)
         })],
+        // The toggle explains the gesture: the card title alone ("nudge") was not clear.
         ids::NUDGE => vec![toggle_item(loc, s.nudge_sleep_enabled, |p, b| {
             p.nudge_sleep_enabled = Some(b)
-        })],
+        })
+        .with_detail(Msg::NudgeHint.get(loc))],
         ids::LANGUAGE => {
             // One item per language, in the picker's order; the active one shows "Current".
             let items: Vec<MenuItem<Choice>> = Locale::ALL

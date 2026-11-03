@@ -608,10 +608,10 @@ fn settings_cards_wait_for_glassd_then_show_its_snapshot() {
     let m = MockService::start().unwrap();
     let mut a = app();
     use glass_launcher::settings::ids;
-    assert_eq!(settings_subtitle(&a, ids::WINK), "Waiting for glassd");
+    assert_eq!(settings_subtitle(&a, ids::ON_HEAD), "Waiting for glassd");
     let mut s = Session::connect(m.path()).unwrap();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
-    assert_eq!(settings_subtitle(&a, ids::WINK), "Off");
+    assert_eq!(settings_subtitle(&a, ids::ON_HEAD), "Off");
     assert_eq!(settings_subtitle(&a, ids::SCREEN_TIMEOUT), "15 seconds");
 }
 
@@ -621,7 +621,7 @@ fn a_menu_choice_sends_set_settings_and_the_reply_updates_the_card() {
     let (m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
     while m.next_client_frame(Duration::from_millis(100)).is_some() {}
-    show(&mut a, ids::WINK);
+    show(&mut a, ids::ON_HEAD);
     m.publish_body(gesture(PKind::Tap)); // opens the menu
     pump_until(&mut s, &mut a, |_, a| a.overlay().is_some());
     m.publish_body(gesture(PKind::Tap)); // "Turn on"
@@ -629,16 +629,16 @@ fn a_menu_choice_sends_set_settings_and_the_reply_updates_the_card() {
     assert_eq!(
         sent,
         glass_api::proto::Settings {
-            wink_enabled: Some(true),
+            on_head_detection_enabled: Some(true),
             ..Default::default()
         },
         "only the changed field"
     );
     pump_until(&mut s, &mut a, |_, a| {
-        settings_subtitle(a, ids::WINK) == "On"
+        settings_subtitle(a, ids::ON_HEAD) == "On"
     });
     assert_eq!(
-        m.with_hub(|h| h.settings().and_then(|s| s.wink_enabled)),
+        m.with_hub(|h| h.settings().and_then(|s| s.on_head_detection_enabled)),
         Some(true)
     );
 }
@@ -779,7 +779,7 @@ fn an_open_menu_follows_a_settings_change() {
     use glass_launcher::OverlayKind;
     let (m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
-    show(&mut a, ids::WINK);
+    show(&mut a, ids::ON_HEAD);
     m.publish_body(gesture(PKind::Tap));
     pump_until(&mut s, &mut a, |_, a| a.overlay().is_some());
     assert_eq!(a.menu_labels(), vec!["Turn on"]);
@@ -788,7 +788,7 @@ fn an_open_menu_follows_a_settings_change() {
         .send(client_frame::Body::SetSettings(
             glass_api::proto::SetSettings {
                 settings: Some(glass_api::proto::Settings {
-                    wink_enabled: Some(true),
+                    on_head_detection_enabled: Some(true),
                     ..Default::default()
                 }),
             },
@@ -804,11 +804,11 @@ fn losing_glassd_forgets_its_settings_and_pending_requests() {
     let (_m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
     a.change_settings(glass_api::proto::Settings {
-        wink_enabled: Some(true),
+        on_head_detection_enabled: Some(true),
         ..Default::default()
     });
     a.glassd_disconnected();
     assert!(a.take_requests().is_empty());
     assert!(a.settings().is_none());
-    assert_eq!(settings_subtitle(&a, ids::WINK), "Waiting for glassd");
+    assert_eq!(settings_subtitle(&a, ids::ON_HEAD), "Waiting for glassd");
 }
