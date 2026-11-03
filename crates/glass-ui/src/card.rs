@@ -243,29 +243,7 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
             );
         }
         CardContent::Settings { title, subtitle } => {
-            let title_center = if subtitle.is_some() {
-                h * 0.44
-            } else {
-                h / 2.0
-            };
-            centered_line(
-                f,
-                Weight::Light,
-                style::TITLE_SIZE,
-                title,
-                title_center,
-                style::TEXT,
-            );
-            if let Some(sub) = subtitle {
-                centered_line(
-                    f,
-                    Weight::Light,
-                    style::SUBTITLE_SIZE,
-                    sub,
-                    h * 0.66,
-                    style::SECONDARY,
-                );
-            }
+            title_and_detail(f, style::TITLE_SIZE, title, subtitle.as_deref());
         }
         CardContent::Image {
             image,
@@ -301,25 +279,7 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
             index,
             count,
         } => {
-            let center = if detail.is_some() { h * 0.44 } else { h / 2.0 };
-            centered_line(
-                f,
-                Weight::Light,
-                style::MENU_SIZE,
-                label,
-                center,
-                style::TEXT,
-            );
-            if let Some(d) = detail {
-                centered_line(
-                    f,
-                    Weight::Light,
-                    style::SUBTITLE_SIZE,
-                    d,
-                    h * 0.66,
-                    style::SECONDARY,
-                );
-            }
+            title_and_detail(f, style::MENU_SIZE, label, detail.as_deref());
             position_dots(f, *index, *count);
         }
         CardContent::Adjust {
@@ -444,7 +404,135 @@ pub fn shape_rects(card: &Card, width: u32, height: u32) -> Vec<Rect> {
     }
 }
 
-/// Draws one line centred horizontally, its digits/capitals centred on `center_y`.
+/// A large text with an optional grey detail under it, for texts of any length in any
+/// language. When both fit on one line at their full size they sit at the usual places;
+/// otherwise each shrinks and wraps as needed and the block is centred on the card.
+fn title_and_detail(f: &mut dyn Painter, title_size: f32, title: &str, detail: Option<&str>) {
+    let font = fonts::font(Weight::Light);
+    let (fw, fh) = f.size();
+    let (w, h) = (fw as f32, fh as f32);
+    let max_w = w - 2.0 * style::MARGIN;
+    let one_line = |size: f32, t: &str| text::wrap(font, size, t, max_w).len() <= 1;
+    if one_line(title_size, title) && detail.is_none_or(|d| one_line(style::SUBTITLE_SIZE, d)) {
+        let title_center = if detail.is_some() { h * 0.44 } else { h / 2.0 };
+        centered_line(
+            f,
+            Weight::Light,
+            title_size,
+            title,
+            title_center,
+            style::TEXT,
+        );
+        if let Some(d) = detail {
+            centered_line(
+                f,
+                Weight::Light,
+                style::SUBTITLE_SIZE,
+                d,
+                h * 0.66,
+                style::SECONDARY,
+            );
+        }
+        return;
+    }
+    // The dots of a menu sit in the bottom margin, so the block stays above it.
+    let room = h - 2.0 * FIT_MARGIN_Y;
+    let detail_block = detail.map(|d| {
+        fit_block(
+            font,
+            &[style::SUBTITLE_SIZE, 28.0, 24.0, style::MIN_TEXT_SIZE],
+            d,
+            max_w,
+            room * 0.4,
+        )
+    });
+    let detail_h = detail_block.as_ref().map_or(0.0, |b| b.height + FIT_GAP);
+    let sizes = [
+        title_size,
+        56.0,
+        48.0,
+        40.0,
+        34.0,
+        28.0,
+        style::MIN_TEXT_SIZE,
+    ];
+    let sizes: Vec<f32> = sizes.into_iter().filter(|s| *s <= title_size).collect();
+    let title_block = fit_block(font, &sizes, title, max_w, room - detail_h);
+    let mut top = (h - title_block.height - detail_h) / 2.0;
+    draw_block(f, font, &title_block, top, style::TEXT);
+    top += title_block.height + FIT_GAP;
+    if let Some(b) = &detail_block {
+        draw_block(f, font, b, top, style::SECONDARY);
+    }
+}
+
+/// Space kept free above and below a fitted text block.
+const FIT_MARGIN_Y: f32 = 28.0;
+/// Space between the title and the detail of a fitted block.
+const FIT_GAP: f32 = 10.0;
+
+/// Wrapped lines at the size that was chosen.
+struct Block {
+    size: f32,
+    lines: Vec<String>,
+    height: f32,
+}
+
+fn block_height(font: &glass_gfx::Font, size: f32, lines: usize) -> f32 {
+    let (ascent, descent) = text::line_metrics(font, size);
+    ascent + descent + size * style::BODY_LINE_HEIGHT * lines.saturating_sub(1) as f32
+}
+
+/// The first of `sizes` (largest first) at which `t` wraps into `max_h`. At the last size,
+/// what still does not fit is cut with an ellipsis on the last line that fits.
+fn fit_block(font: &glass_gfx::Font, sizes: &[f32], t: &str, max_w: f32, max_h: f32) -> Block {
+    for &size in sizes {
+        let lines = text::wrap(font, size, t, max_w);
+        let height = block_height(font, size, lines.len());
+        if height <= max_h {
+            return Block {
+                size,
+                lines,
+                height,
+            };
+        }
+    }
+    let size = *sizes.last().expect("at least one size");
+    let mut lines = text::wrap(font, size, t, max_w);
+    let fit = lines_that_fit(font, size, max_h).max(1);
+    if lines.len() > fit {
+        lines.truncate(fit);
+        let last = format!("{}…", lines[fit - 1]);
+        lines[fit - 1] = text::ellipsize(font, size, &last, max_w);
+    }
+    let height = block_height(font, size, lines.len());
+    Block {
+        size,
+        lines,
+        height,
+    }
+}
+
+/// Draws the lines centred horizontally, the block's top at `top`.
+fn draw_block(
+    f: &mut dyn Painter,
+    font: &glass_gfx::Font,
+    b: &Block,
+    top: f32,
+    color: glass_gfx::Color,
+) {
+    let (fw, _) = f.size();
+    let (ascent, _) = text::line_metrics(font, b.size);
+    for (i, line) in b.lines.iter().enumerate() {
+        let w = text::measure(font, b.size, line);
+        let baseline = top + ascent + b.size * style::BODY_LINE_HEIGHT * i as f32;
+        let (run, _) = text::layout_line(font, b.size, (fw as f32 - w) / 2.0, baseline, line);
+        f.draw_glyph_run(&run, color);
+    }
+}
+
+/// Draws one line centred horizontally, its digits/capitals centred on `center_y`. A line
+/// that is too wide shrinks first, and is cut only at the smallest text size.
 fn centered_line(
     f: &mut dyn Painter,
     weight: Weight,
@@ -456,6 +544,14 @@ fn centered_line(
     let font = fonts::font(weight);
     let (fw, _) = f.size();
     let max_w = fw as f32 - 2.0 * style::MARGIN;
+    let wide = text::measure(font, size, line);
+    let size = if wide > max_w {
+        (size * max_w / wide)
+            .floor()
+            .clamp(style::MIN_TEXT_SIZE.min(size), size)
+    } else {
+        size
+    };
     let line = text::ellipsize(font, size, line, max_w);
     let w = text::measure(font, size, &line);
     // Cap height from the glyph of '0' (same as capitals in Inter).
