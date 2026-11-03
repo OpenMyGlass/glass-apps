@@ -183,6 +183,6 @@ fn changing_the_volume_plays_a_blip_at_the_new_level() {
     g(&mut a, GestureKind::Tap); // the volume screen
     rec.clear();
     g(&mut a, GestureKind::SwipeBackward);
-    assert_eq!(rec.cues(), vec![Cue::Select]);
+    assert_eq!(rec.cues(), vec![Cue::VolumeStep]);
     assert!(a.overlay().is_some(), "the screen stays open");
 }

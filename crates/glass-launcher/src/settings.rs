@@ -431,12 +431,9 @@ pub fn apply_locally(current: &mut Settings, change: &Settings) {
     settings_rules::merge(current, change);
 }
 
-/// A volume in earpiece gain steps as a percentage of the maximum.
-fn volume_text(steps: f32) -> String {
-    format!(
-        "{}%",
-        (steps * 100.0 / settings_rules::AUDIO_VOLUME_MAX as f32).round() as u32
-    )
+/// A volume percentage.
+fn volume_text(percent: f32) -> String {
+    format!("{}%", percent.round() as u32)
 }
 
 /// The volume sub-screen, starting at the current volume.

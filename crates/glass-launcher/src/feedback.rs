@@ -20,6 +20,8 @@ pub enum Cue {
     Select,
     /// The highlighted item in an open menu changed: a soft, higher tick.
     MenuMove,
+    /// The volume changed while adjusting it: a blip, limited in rate like the ticks.
+    VolumeStep,
     /// A setting (Wi-Fi, Bluetooth) turned on: a rising two-tone tick.
     ToggleOn,
     /// A setting turned off: a falling two-tone tick.
@@ -33,8 +35,8 @@ pub trait Feedback {
     /// Play `cue` (best effort: feedback is never essential, so errors are swallowed).
     fn play(&mut self, cue: Cue);
 
-    /// Sets the output volume in earpiece gain steps (0 to 15). No sound here.
-    fn set_volume(&mut self, _steps: u32) {}
+    /// Sets the output volume in percent (0 to 100). No sound here.
+    fn set_volume(&mut self, _percent: u32) {}
 }
 
 /// The default player: no sound. Used everywhere the `sound` feature is off, and on the
