@@ -327,7 +327,7 @@ dependencies = [
 [[package]]
 name = "glass-api"
 version = "0.1.0"
-source = "git+https://github.com/OpenMyGlass/glass-services?rev=dbd409663d2aea6ca0e2312b73293e85cdb26009#dbd409663d2aea6ca0e2312b73293e85cdb26009"
+source = "git+https://github.com/OpenMyGlass/glass-services?rev=917914d2b16b68a646c50140a9b32388d3941646#917914d2b16b68a646c50140a9b32388d3941646"
 dependencies = [
  "libc",
  "prost",

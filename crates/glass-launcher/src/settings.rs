@@ -29,6 +29,8 @@ pub mod ids {
     /// The one card on the main timeline; a tap opens the settings cards.
     pub const ROOT: CardId = 110;
     pub const VOLUME: CardId = 111;
+    pub const TIME_FORMAT: CardId = 112;
+    pub const TIMEZONE: CardId = 113;
 }
 
 /// The settings cards from the one next to the "now" cards to the farthest.
@@ -36,7 +38,7 @@ pub mod ids {
 /// The wink card ([`ids::WINK`]) is not shown: the Glass glasshub firmware (1.22) never
 /// delivers a wink event, so the toggle did nothing the owner could see. `glassd` keeps the
 /// setting; the card comes back here once the MCU wink threshold is tuned.
-pub const ORDER: [CardId; 9] = [
+pub const ORDER: [CardId; 11] = [
     ids::WIFI,
     ids::BLUETOOTH,
     ids::VOLUME,
@@ -44,6 +46,8 @@ pub const ORDER: [CardId; 9] = [
     ids::HEAD_WAKE,
     ids::ON_HEAD,
     ids::NUDGE,
+    ids::TIME_FORMAT,
+    ids::TIMEZONE,
     ids::LANGUAGE,
     ids::DEVICE,
 ];
@@ -194,6 +198,24 @@ pub fn card_content(id: CardId, v: &SettingsView) -> Option<CardContent> {
                 ))
             }),
         ),
+        ids::TIME_FORMAT => entry(
+            Msg::SettingsTimeFormat,
+            setting_text(v, |s| {
+                s.time_24h.map(|h24| {
+                    if h24 { Msg::Time24h } else { Msg::Time12h }
+                        .get(loc)
+                        .to_string()
+                })
+            }),
+        ),
+        ids::TIMEZONE => entry(
+            Msg::SettingsTimezone,
+            setting_text(v, |s| {
+                s.timezone_id
+                    .and_then(|i| settings_rules::TIME_ZONES.get(i as usize))
+                    .map(|z| z.0.to_string())
+            }),
+        ),
         ids::LANGUAGE => entry(Msg::SettingsLanguage, loc.endonym().into()),
         ids::DEVICE => {
             let mut lines = vec![fmt2(
@@ -263,7 +285,13 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
     let loc = v.locale;
     let owned_by_glassd = matches!(
         card.id,
-        ids::SCREEN_TIMEOUT | ids::HEAD_WAKE | ids::WINK | ids::ON_HEAD | ids::NUDGE
+        ids::SCREEN_TIMEOUT
+            | ids::HEAD_WAKE
+            | ids::WINK
+            | ids::ON_HEAD
+            | ids::NUDGE
+            | ids::TIME_FORMAT
+            | ids::TIMEZONE
     );
     if owned_by_glassd && v.settings.is_none() {
         // Unknown until glassd sends them: no menu, so nothing is written blind.
@@ -326,6 +354,38 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
             p.nudge_sleep_enabled = Some(b)
         })
         .with_detail(Msg::NudgeHint.get(loc))],
+        ids::TIME_FORMAT => {
+            let current = usize::from(!s.time_24h.unwrap_or(true));
+            let items = [(true, Msg::Time24h), (false, Msg::Time12h)]
+                .into_iter()
+                .enumerate()
+                .map(|(i, (h24, label))| {
+                    let it = MenuItem::new(patch(|p| p.time_24h = Some(h24)), label.get(loc));
+                    if i == current {
+                        it.with_detail(Msg::Current.get(loc))
+                    } else {
+                        it
+                    }
+                })
+                .collect();
+            return Some((items, current));
+        }
+        ids::TIMEZONE => {
+            let current = s.timezone_id.unwrap_or(settings_rules::TIMEZONE_DEFAULT) as usize;
+            let items = settings_rules::TIME_ZONES
+                .iter()
+                .enumerate()
+                .map(|(i, z)| {
+                    let it = MenuItem::new(patch(|p| p.timezone_id = Some(i as u32)), z.0);
+                    if i == current {
+                        it.with_detail(Msg::Current.get(loc))
+                    } else {
+                        it
+                    }
+                })
+                .collect();
+            return Some((items, current));
+        }
         ids::LANGUAGE => {
             // One item per language, in the picker's order; the active one shows "Current".
             let items: Vec<MenuItem<Choice>> = Locale::ALL

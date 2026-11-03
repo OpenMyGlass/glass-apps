@@ -23,6 +23,8 @@ fn ctx() -> RenderContext {
         hour: 10,
         minute: 42,
         locale: glass_ui::Locale::En,
+        time_24h: true,
+        battery_percent: None,
     }
 }
 
@@ -71,6 +73,8 @@ fn scenes() -> Vec<(String, Card, Tolerance)> {
                 ids::WINK => "wink",
                 ids::ON_HEAD => "on-head",
                 ids::NUDGE => "nudge",
+                ids::TIME_FORMAT => "time-format",
+                ids::TIMEZONE => "timezone",
                 ids::LANGUAGE => "language",
                 ids::DEVICE => "device",
                 _ => unreachable!(),

@@ -604,6 +604,8 @@ fn run_audio_sweep(args: &Args) -> Result<(), String> {
         hour: base.hour,
         minute: base.minute,
         locale: Locale::It,
+        time_24h: true,
+        battery_percent: base.battery_percent,
     };
     let emit = |line: &str| {
         let mut e = std::io::stderr();
@@ -711,6 +713,8 @@ fn run_self_test(args: &Args) -> Result<(), String> {
         hour: base.hour,
         minute: base.minute,
         locale,
+        time_24h: true,
+        battery_percent: base.battery_percent,
     };
 
     let emit = |line: &str| {
