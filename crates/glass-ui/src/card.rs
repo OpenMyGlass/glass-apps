@@ -413,7 +413,7 @@ fn title_and_detail(f: &mut dyn Painter, title_size: f32, title: &str, detail: O
     let (w, h) = (fw as f32, fh as f32);
     let max_w = w - 2.0 * style::MARGIN;
     let one_line = |size: f32, t: &str| text::wrap(font, size, t, max_w).len() <= 1;
-    if one_line(title_size, title) && detail.is_none_or(|d| one_line(style::SUBTITLE_SIZE, d)) {
+    if one_line(title_size, title) && detail.map_or(true, |d| one_line(style::SUBTITLE_SIZE, d)) {
         let title_center = if detail.is_some() { h * 0.44 } else { h / 2.0 };
         centered_line(
             f,
