@@ -173,3 +173,41 @@ fn adjuster_snaps_to_its_step_grid() {
         40.0
     );
 }
+
+#[test]
+fn an_adjuster_follows_a_drag_without_lifting_the_finger() {
+    let scroll = |d: f32, ended: bool, cancelled: bool| InputEvent::Scroll {
+        displacement: d,
+        delta: 0.0,
+        velocity: 0.0,
+        fingers: 1,
+        ended,
+        cancelled,
+        timestamp_us: 1000,
+    };
+    let mut a = Adjuster::new("Volume", 0.0, 15.0, 1.0, 12.0, degrees);
+    // One touch, back and forth: the value follows, in steps, within the range.
+    a.handle(&scroll(-0.2, false, false));
+    assert_eq!(a.value(), 9.0);
+    a.handle(&scroll(-0.6, false, false));
+    assert_eq!(a.value(), 3.0);
+    a.handle(&scroll(-2.0, false, false));
+    assert_eq!(a.value(), 0.0);
+    a.handle(&scroll(0.1, true, false));
+    assert_eq!(a.value(), 14.0);
+    let after = a.value();
+    // The swipe that ends the same touch adds nothing.
+    a.handle(&InputEvent::Gesture {
+        kind: GestureKind::SwipeForward,
+        fingers: 1,
+        velocity: 1.0,
+        timestamp_us: 1001,
+    });
+    assert_eq!(a.value(), after);
+    // A later swipe is one step again, and a cancelled drag returns to its start.
+    a.handle(&InputEvent::gesture(GestureKind::SwipeBackward));
+    assert_eq!(a.value(), after - 1.0);
+    a.handle(&scroll(0.3, false, false));
+    a.handle(&scroll(0.3, true, true));
+    assert_eq!(a.value(), after - 1.0);
+}

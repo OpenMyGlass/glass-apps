@@ -160,6 +160,10 @@ pub struct Adjuster {
     value: f32,
     format: fn(f32) -> String,
     screen: Timeline,
+    /// The value when the current drag started.
+    drag_start: Option<f32>,
+    /// When a drag last ended: the swipe of that same touch must not add another step.
+    drag_end_us: Option<u64>,
 }
 
 /// `v` clamped to `min..=max` and moved to the nearest step from `min`.
@@ -190,6 +194,8 @@ impl Adjuster {
             value: snap(value, min, max, step),
             format,
             screen: Timeline::new(vec![], Card::new(0, CardContent::Home), vec![]),
+            drag_start: None,
+            drag_end_us: None,
         };
         a.screen = Timeline::new(vec![], a.card(), vec![]);
         a
@@ -223,15 +229,60 @@ impl Adjuster {
         }
     }
 
-    /// Handles one input event: forward raises the value one step, backward lowers it.
+    /// A touch whose end will not arrive: the value returns to where the drag started.
+    pub fn cancel_touch(&mut self) {
+        if let Some(start) = self.drag_start.take() {
+            self.set(start);
+        }
+    }
+
+    /// Handles one input event. Dragging follows the finger, one touchpad width covering the
+    /// whole range, without lifting it. A swipe forward raises the value one step, backward
+    /// lowers it; the swipe that ends a drag adds nothing.
     pub fn handle(&mut self, event: &InputEvent) -> Option<Outcome<f32>> {
-        let InputEvent::Gesture { kind, fingers, .. } = *event else {
-            return None;
+        let (kind, fingers, timestamp_us) = match *event {
+            InputEvent::Scroll {
+                displacement,
+                ended,
+                cancelled,
+                timestamp_us,
+                ..
+            } => {
+                let start = *self.drag_start.get_or_insert(self.value);
+                if cancelled {
+                    self.cancel_touch();
+                    return None;
+                }
+                let span = self.max - self.min;
+                self.set(snap(
+                    start + displacement * span,
+                    self.min,
+                    self.max,
+                    self.step,
+                ));
+                if ended {
+                    self.drag_start = None;
+                    self.drag_end_us = Some(timestamp_us);
+                }
+                return None;
+            }
+            InputEvent::Gesture {
+                kind,
+                fingers,
+                timestamp_us,
+                ..
+            } => (kind, fingers, timestamp_us),
         };
+        let same_touch_as_drag = self.drag_end_us.take().is_some_and(|end| {
+            end == 0
+                || timestamp_us == 0
+                || timestamp_us.saturating_sub(end) <= crate::timeline::SAME_TOUCH_US
+        });
         if fingers != 1 {
             return None;
         }
         match kind {
+            GestureKind::SwipeForward | GestureKind::SwipeBackward if same_touch_as_drag => {}
             GestureKind::SwipeForward => self.set(self.value + self.step),
             GestureKind::SwipeBackward => self.set(self.value - self.step),
             GestureKind::Tap => return Some(Outcome::Selected(self.value)),
