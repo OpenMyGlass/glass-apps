@@ -43,11 +43,18 @@ use setup::{Companion, Setup, SetupEffect};
 use std::path::PathBuf;
 
 /// What is shown over the timeline.
+/// What an adjuster sub-screen changes.
+#[derive(Clone, Copy, PartialEq)]
+enum Adjusting {
+    WakeAngle,
+    Volume,
+}
+
 enum Overlay {
     /// The menu of card `.1`.
     Menu(Menu<Choice>, CardId),
-    /// The wake-angle sub-screen.
-    Adjust(Adjuster),
+    /// A value sub-screen (wake angle, volume).
+    Adjust(Adjuster, Adjusting),
     /// Taking a note by dictation.
     Dictation(Dictation, Panel),
 }
@@ -91,6 +98,8 @@ pub enum ScreenOwner {
 /// state (owned by `glassd`, or simulated locally without it).
 pub struct App {
     timeline: Timeline,
+    /// The main timeline, set aside while the settings cards are open in `timeline`.
+    main_timeline: Option<Timeline>,
     compositor: Box<dyn Compositor>,
     owner: ScreenOwner,
     screen_on: bool,
@@ -139,6 +148,7 @@ impl App {
         let last_index = timeline.current_index();
         let mut app = App {
             timeline,
+            main_timeline: None,
             compositor,
             owner: ScreenOwner::Local,
             screen_on: true,
@@ -481,7 +491,42 @@ impl App {
             self.set_locale(loc);
         }
         self.settings = Some(s);
+        self.apply_volume();
         self.refresh_settings_cards();
+    }
+
+    fn apply_volume(&mut self) {
+        if let Some(v) = self.settings.and_then(|s| s.audio_volume) {
+            self.feedback.set_volume(v);
+        }
+    }
+
+    /// Whether the settings cards are open (the main timeline is set aside).
+    pub fn settings_open(&self) -> bool {
+        self.main_timeline.is_some()
+    }
+
+    fn open_settings(&mut self) {
+        if self.main_timeline.is_some() {
+            return;
+        }
+        let mut sub = settings::timeline(&self.settings_view());
+        sub.set_context(self.ctx);
+        self.timeline.release_layers(self.compositor.as_mut());
+        self.main_timeline = Some(std::mem::replace(&mut self.timeline, sub));
+        self.last_index = self.timeline.current_index();
+        self.shown = false;
+    }
+
+    fn close_settings(&mut self) {
+        let Some(main) = self.main_timeline.take() else {
+            return;
+        };
+        self.timeline.release_layers(self.compositor.as_mut());
+        self.timeline = main;
+        self.timeline.set_context(self.ctx);
+        self.last_index = self.timeline.current_index();
+        self.shown = false;
     }
 
     /// Persists `locale` through glassd's settings (no separate store). glassd carries the
@@ -527,7 +572,7 @@ impl App {
         match &self.overlay {
             None => None,
             Some(Overlay::Menu(m, _)) => Some(OverlayKind::Menu { index: m.index() }),
-            Some(Overlay::Adjust(_)) => Some(OverlayKind::Adjust),
+            Some(Overlay::Adjust(..)) => Some(OverlayKind::Adjust),
             Some(Overlay::Dictation(..)) => Some(OverlayKind::Dictation),
         }
     }
@@ -542,6 +587,11 @@ impl App {
 
     fn refresh_settings_card_contents(&mut self) {
         let v = self.settings_view();
+        let root = settings::root_card(v.locale).content;
+        self.main_timeline
+            .as_mut()
+            .unwrap_or(&mut self.timeline)
+            .update_card(settings::ids::ROOT, root);
         for id in settings::ORDER {
             if let Some(c) = settings::card_content(id, &v) {
                 let same = self
@@ -617,7 +667,7 @@ impl App {
     fn close_overlay(&mut self) {
         match self.overlay.take() {
             Some(Overlay::Menu(mut m, _)) => m.release(self.compositor.as_mut()),
-            Some(Overlay::Adjust(mut a)) => a.release(self.compositor.as_mut()),
+            Some(Overlay::Adjust(mut a, _)) => a.release(self.compositor.as_mut()),
             Some(Overlay::Dictation(d, mut panel)) => {
                 if d.is_open() {
                     self.requests.push(Request::DictationCancel(d.request_id()));
@@ -638,6 +688,7 @@ impl App {
                     .settings
                     .get_or_insert_with(settings::settings_defaults);
                 settings::apply_locally(current, &patch);
+                self.apply_volume();
                 self.refresh_settings_cards();
             }
         }
@@ -676,7 +727,7 @@ impl App {
             }
             Choice::WakeAngle => {
                 let a = settings::wake_angle_adjuster(&self.settings_view());
-                self.show_overlay(Overlay::Adjust(a));
+                self.show_overlay(Overlay::Adjust(a, Adjusting::WakeAngle));
             }
             Choice::SetLocale(loc) => {
                 self.log.push(format!("locale: {}", loc.tag()));
@@ -702,6 +753,8 @@ impl App {
             /// Already handled (dictation), nothing more to do.
             Done,
         }
+        let mut preview_volume = None;
+        let mut restore_volume = false;
         let react = match self.overlay.as_mut() {
             Some(Overlay::Menu(m, _)) => {
                 let before = m.index();
@@ -715,20 +768,49 @@ impl App {
                 self.with_dictation(|d| d.input(event));
                 React::Done
             }
-            Some(Overlay::Adjust(a)) => match a.handle(event) {
-                None => React::OpenStill(false),
-                Some(Outcome::Closed) => React::Close,
-                Some(Outcome::Selected(v)) => React::Selected(Choice::Patch(Settings {
-                    head_wake_angle_deg: Some(v),
-                    ..Default::default()
-                })),
-            },
+            Some(Overlay::Adjust(a, what)) => {
+                let what = *what;
+                let before = a.value();
+                match a.handle(event) {
+                    None => {
+                        let moved = a.value() != before;
+                        if moved && what == Adjusting::Volume {
+                            // Hear the new level while choosing it.
+                            preview_volume = Some(a.value() as u32);
+                        }
+                        React::OpenStill(moved)
+                    }
+                    Some(Outcome::Closed) => {
+                        restore_volume = what == Adjusting::Volume;
+                        React::Close
+                    }
+                    Some(Outcome::Selected(v)) => React::Selected(Choice::Patch(match what {
+                        Adjusting::WakeAngle => Settings {
+                            head_wake_angle_deg: Some(v),
+                            ..Default::default()
+                        },
+                        Adjusting::Volume => Settings {
+                            audio_volume: Some(v as u32),
+                            ..Default::default()
+                        },
+                    })),
+                }
+            }
             None => React::Done,
         };
+        if let Some(v) = preview_volume {
+            self.feedback.set_volume(v);
+        }
+        if restore_volume {
+            self.apply_volume();
+        }
         match react {
             React::Done => {}
             React::OpenStill(moved) => {
-                if moved {
+                if preview_volume.is_some() {
+                    // A clear blip at the new level, so the level can be judged by ear.
+                    self.feedback.play(Cue::Select);
+                } else if moved {
                     self.feedback.play(Cue::MenuMove);
                 }
             }
@@ -780,6 +862,7 @@ impl App {
     /// The screen is on again; `return_home` shows the home card at once.
     pub fn screen_wake(&mut self, return_home: bool) {
         if return_home {
+            self.close_settings();
             self.timeline.show_home();
         }
         self.screen_on = true;
@@ -878,6 +961,19 @@ impl App {
             self.overlay_input(event);
             return None;
         }
+        if self.main_timeline.is_some()
+            && matches!(
+                event,
+                InputEvent::Gesture {
+                    kind: GestureKind::SwipeDown,
+                    fingers: 1,
+                    ..
+                }
+            )
+        {
+            self.close_settings();
+            return None;
+        }
         let action = self.timeline.handle(event);
         // A tap on a card (whether or not it has a menu): a confirm blip.
         if let Some(Action::OpenMenu(_)) = action {
@@ -888,6 +984,17 @@ impl App {
         if action == Some(Action::OpenMenu(NOTE_CARD)) && self.dictation_offered() {
             self.start_dictation();
             return action;
+        }
+        if action == Some(Action::OpenMenu(settings::ids::ROOT)) {
+            self.open_settings();
+            return None;
+        }
+        if action == Some(Action::OpenMenu(settings::ids::VOLUME)) {
+            if self.settings.is_some() {
+                let a = settings::volume_adjuster(&self.settings_view());
+                self.show_overlay(Overlay::Adjust(a, Adjusting::Volume));
+            }
+            return None;
         }
         if let Some(Action::OpenMenu(id)) = action {
             if !self.open_menu(id) {
@@ -908,7 +1015,7 @@ impl App {
         // input (see `timeline_input`), never per frame, so a drag/rest never buzzes.
         match &mut self.overlay {
             Some(Overlay::Menu(m, _)) => m.tick(dt),
-            Some(Overlay::Adjust(a)) => a.set_context(ctx),
+            Some(Overlay::Adjust(a, _)) => a.set_context(ctx),
             Some(Overlay::Dictation(_, p)) => p.set_context(ctx),
             None => {}
         }
@@ -949,7 +1056,7 @@ impl App {
                 }
                 m.render(self.compositor.as_mut())?;
             }
-            Some(Overlay::Adjust(a)) => {
+            Some(Overlay::Adjust(a, _)) => {
                 if self.shown && !a.needs_redraw() {
                     return Ok(false);
                 }

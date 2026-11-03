@@ -38,7 +38,7 @@ pub fn timeline_at(now_s: i64) -> Timeline {
         locale: Locale::DEFAULT,
     };
     let mut backward = vec![text(2, "Partly cloudy, 14°", "Weather", 20 * 60)];
-    backward.extend(settings::cards(&view));
+    backward.push(settings::root_card(view.locale));
     Timeline::new(
         backward,
         Card::new(10, CardContent::Home),
@@ -81,7 +81,7 @@ pub fn device_timeline(now_s: i64, platform: &'static str, renderer: &'static st
         locale: Locale::DEFAULT,
     };
     Timeline::new(
-        settings::cards(&view),
+        vec![settings::root_card(view.locale)],
         Card::new(10, CardContent::Home),
         vec![Card::new(
             14,

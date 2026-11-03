@@ -51,6 +51,10 @@ fn g(app: &mut App, kind: GestureKind) {
 }
 
 fn goto(app: &mut App, id: CardId) {
+    if glass_launcher::settings::ORDER.contains(&id) && !app.settings_open() {
+        goto(app, ids::ROOT);
+        g(app, GestureKind::Tap);
+    }
     for _ in 0..30 {
         let t = app.timeline();
         let want = t.cards().iter().position(|c| c.id == id).unwrap();
@@ -167,4 +171,16 @@ fn the_default_player_is_silent() {
     a.render_if_changed().unwrap();
     g(&mut a, GestureKind::SwipeForward);
     g(&mut a, GestureKind::Tap);
+}
+
+#[test]
+fn changing_the_volume_plays_a_blip_at_the_new_level() {
+    let rec = Recorder::default();
+    let mut a = app_with(&rec);
+    goto(&mut a, ids::VOLUME);
+    g(&mut a, GestureKind::Tap); // the volume screen
+    rec.clear();
+    g(&mut a, GestureKind::SwipeBackward);
+    assert_eq!(rec.cues(), vec![Cue::Select]);
+    assert!(a.overlay().is_some(), "the screen stays open");
 }

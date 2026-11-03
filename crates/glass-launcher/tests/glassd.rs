@@ -224,7 +224,7 @@ fn session_says_hello_subscribes_and_takes_the_focus() {
 fn settings_snapshot_is_kept() {
     let (_m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |s, _| s.settings().is_some());
-    assert_eq!(s.settings().unwrap().screen_timeout_ms, Some(15_000));
+    assert_eq!(s.settings().unwrap().screen_timeout_ms, Some(120_000));
 }
 
 #[test]
@@ -560,8 +560,7 @@ fn waiting_to_reconnect_keeps_polling_and_logs_each_attempt_once() {
 // ---- settings through glassd ----
 
 fn settings_subtitle(a: &App, id: u64) -> String {
-    let card = a.timeline().cards().iter().find(|c| c.id == id).unwrap();
-    match &card.content {
+    match &glass_launcher::settings::card_content(id, &a.settings_view()).unwrap() {
         glass_ui::CardContent::Settings {
             subtitle: Some(s), ..
         } => s.clone(),
@@ -571,6 +570,11 @@ fn settings_subtitle(a: &App, id: u64) -> String {
 
 /// Shows card `id` (navigation through the app directly).
 fn show(a: &mut App, id: u64) {
+    if glass_launcher::settings::ORDER.contains(&id) && !a.settings_open() {
+        show(a, glass_launcher::settings::ids::ROOT);
+        a.input(&InputEvent::gesture(GestureKind::Tap));
+        a.step(1.0, ctx());
+    }
     for _ in 0..30 {
         let t = a.timeline();
         let want = t.cards().iter().position(|c| c.id == id).unwrap();
@@ -608,11 +612,11 @@ fn settings_cards_wait_for_glassd_then_show_its_snapshot() {
     let m = MockService::start().unwrap();
     let mut a = app();
     use glass_launcher::settings::ids;
-    assert_eq!(settings_subtitle(&a, ids::ON_HEAD), "Waiting for glassd");
+    assert_eq!(settings_subtitle(&a, ids::NUDGE), "Waiting for glassd");
     let mut s = Session::connect(m.path()).unwrap();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
-    assert_eq!(settings_subtitle(&a, ids::ON_HEAD), "Off");
-    assert_eq!(settings_subtitle(&a, ids::SCREEN_TIMEOUT), "15 seconds");
+    assert_eq!(settings_subtitle(&a, ids::NUDGE), "Off");
+    assert_eq!(settings_subtitle(&a, ids::SCREEN_TIMEOUT), "2 minutes");
 }
 
 #[test]
@@ -621,7 +625,7 @@ fn a_menu_choice_sends_set_settings_and_the_reply_updates_the_card() {
     let (m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
     while m.next_client_frame(Duration::from_millis(100)).is_some() {}
-    show(&mut a, ids::ON_HEAD);
+    show(&mut a, ids::NUDGE);
     m.publish_body(gesture(PKind::Tap)); // opens the menu
     pump_until(&mut s, &mut a, |_, a| a.overlay().is_some());
     m.publish_body(gesture(PKind::Tap)); // "Turn on"
@@ -629,16 +633,16 @@ fn a_menu_choice_sends_set_settings_and_the_reply_updates_the_card() {
     assert_eq!(
         sent,
         glass_api::proto::Settings {
-            on_head_detection_enabled: Some(true),
+            nudge_sleep_enabled: Some(true),
             ..Default::default()
         },
         "only the changed field"
     );
     pump_until(&mut s, &mut a, |_, a| {
-        settings_subtitle(a, ids::ON_HEAD) == "On"
+        settings_subtitle(a, ids::NUDGE) == "On"
     });
     assert_eq!(
-        m.with_hub(|h| h.settings().and_then(|s| s.on_head_detection_enabled)),
+        m.with_hub(|h| h.settings().and_then(|s| s.nudge_sleep_enabled)),
         Some(true)
     );
 }
@@ -648,6 +652,13 @@ fn the_wake_angle_screen_sends_the_angle() {
     use glass_launcher::settings::ids;
     let (m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
+    a.change_settings(glass_api::proto::Settings {
+        head_wake_enabled: Some(true),
+        ..Default::default()
+    });
+    pump_until(&mut s, &mut a, |_, a| {
+        a.settings().and_then(|s| s.head_wake_enabled) == Some(true)
+    });
     while m.next_client_frame(Duration::from_millis(100)).is_some() {}
     show(&mut a, ids::HEAD_WAKE);
     for kind in [PKind::Tap, PKind::SwipeForward] {
@@ -677,6 +688,7 @@ fn a_clamped_value_is_shown_as_glassd_applied_it() {
     let (_m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
     a.change_settings(glass_api::proto::Settings {
+        head_wake_enabled: Some(true),
         head_wake_angle_deg: Some(55.0),
         screen_timeout_ms: Some(1_000),
         ..Default::default()
@@ -714,13 +726,8 @@ fn the_device_card_lists_glassd_and_its_capabilities() {
     use glass_launcher::settings::ids;
     let (_m, s, mut a) = connected();
     a.set_service(Some(s.service_info()));
-    let card = a
-        .timeline()
-        .cards()
-        .iter()
-        .find(|c| c.id == ids::DEVICE)
-        .unwrap();
-    let glass_ui::CardContent::Info { lines, .. } = &card.content else {
+    let content = glass_launcher::settings::card_content(ids::DEVICE, &a.settings_view()).unwrap();
+    let glass_ui::CardContent::Info { lines, .. } = &content else {
         panic!()
     };
     assert!(
@@ -741,7 +748,7 @@ fn focus_loss_mid_drag_in_a_menu_returns_the_drag_and_the_next_tap_selects() {
     show(&mut a, ids::SCREEN_TIMEOUT);
     m.publish_body(gesture(PKind::Tap));
     pump_until(&mut s, &mut a, |_, a| a.overlay().is_some());
-    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 2 }));
+    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 5 }));
     m.publish_body(Body::Scroll(Scroll {
         displacement: 0.3,
         delta: 0.3,
@@ -759,7 +766,7 @@ fn focus_loss_mid_drag_in_a_menu_returns_the_drag_and_the_next_tap_selects() {
     assert!(!a.is_animating(), "settled: no frame-rate wake-ups");
     assert_eq!(
         a.overlay(),
-        Some(OverlayKind::Menu { index: 2 }),
+        Some(OverlayKind::Menu { index: 5 }),
         "back to the item"
     );
     drop(other);
@@ -768,7 +775,7 @@ fn focus_loss_mid_drag_in_a_menu_returns_the_drag_and_the_next_tap_selects() {
     m.publish_body(gesture(PKind::Tap));
     assert_eq!(
         next_set_settings(&m, &mut s, &mut a).screen_timeout_ms,
-        Some(15_000),
+        Some(120_000),
         "the TAP selected the item shown"
     );
 }
@@ -779,7 +786,7 @@ fn an_open_menu_follows_a_settings_change() {
     use glass_launcher::OverlayKind;
     let (m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
-    show(&mut a, ids::ON_HEAD);
+    show(&mut a, ids::NUDGE);
     m.publish_body(gesture(PKind::Tap));
     pump_until(&mut s, &mut a, |_, a| a.overlay().is_some());
     assert_eq!(a.menu_labels(), vec!["Turn on"]);
@@ -788,7 +795,7 @@ fn an_open_menu_follows_a_settings_change() {
         .send(client_frame::Body::SetSettings(
             glass_api::proto::SetSettings {
                 settings: Some(glass_api::proto::Settings {
-                    on_head_detection_enabled: Some(true),
+                    nudge_sleep_enabled: Some(true),
                     ..Default::default()
                 }),
             },
@@ -804,11 +811,11 @@ fn losing_glassd_forgets_its_settings_and_pending_requests() {
     let (_m, mut s, mut a) = connected();
     pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
     a.change_settings(glass_api::proto::Settings {
-        on_head_detection_enabled: Some(true),
+        nudge_sleep_enabled: Some(true),
         ..Default::default()
     });
     a.glassd_disconnected();
     assert!(a.take_requests().is_empty());
     assert!(a.settings().is_none());
-    assert_eq!(settings_subtitle(&a, ids::ON_HEAD), "Waiting for glassd");
+    assert_eq!(settings_subtitle(&a, ids::NUDGE), "Waiting for glassd");
 }

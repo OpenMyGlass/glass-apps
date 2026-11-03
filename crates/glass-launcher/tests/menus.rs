@@ -30,6 +30,10 @@ fn g(app: &mut App, kind: GestureKind) {
 
 /// Swipes until card `id` is shown.
 fn goto(app: &mut App, id: CardId) {
+    if glass_launcher::settings::ORDER.contains(&id) && !app.settings_open() {
+        goto(app, ids::ROOT);
+        g(app, GestureKind::Tap);
+    }
     for _ in 0..30 {
         let t = app.timeline();
         let want = t.cards().iter().position(|c| c.id == id).unwrap();
@@ -48,8 +52,7 @@ fn goto(app: &mut App, id: CardId) {
 }
 
 fn subtitle(app: &App, id: CardId) -> String {
-    let card = app.timeline().cards().iter().find(|c| c.id == id).unwrap();
-    match &card.content {
+    match &glass_launcher::settings::card_content(id, &app.settings_view()).unwrap() {
         CardContent::Settings {
             subtitle: Some(s), ..
         } => s.clone(),
@@ -58,15 +61,46 @@ fn subtitle(app: &App, id: CardId) -> String {
 }
 
 #[test]
-fn settings_cards_sit_on_the_backward_side() {
-    let a = app();
+fn settings_are_one_card_that_opens_a_submenu() {
+    let mut a = app();
     let t = a.timeline();
     let home = t.home_index();
-    let ids: Vec<CardId> = t.cards()[..home].iter().rev().map(|c| c.id).collect();
-    assert_eq!(ids[0], 2, "the now card is next to home");
-    assert_eq!(&ids[1..], &glass_launcher::settings::ORDER);
-    assert_eq!(subtitle(&a, ids::SCREEN_TIMEOUT), "15 seconds");
-    assert_eq!(subtitle(&a, ids::HEAD_WAKE), "On, at 30°");
+    let main: Vec<CardId> = t.cards()[..home].iter().rev().map(|c| c.id).collect();
+    assert_eq!(
+        main,
+        vec![2, ids::ROOT],
+        "only one settings card on the timeline"
+    );
+    assert_eq!(subtitle(&a, ids::SCREEN_TIMEOUT), "2 minutes");
+    assert_eq!(subtitle(&a, ids::HEAD_WAKE), "Off");
+    // A tap opens the settings cards; a swipe down returns to the settings card.
+    goto(&mut a, ids::ROOT);
+    g(&mut a, GestureKind::Tap);
+    assert!(a.settings_open());
+    let cards: Vec<CardId> = a.timeline().cards().iter().map(|c| c.id).collect();
+    assert_eq!(&cards[..], &glass_launcher::settings::ORDER);
+    g(&mut a, GestureKind::SwipeForward);
+    g(&mut a, GestureKind::SwipeDown);
+    assert!(!a.settings_open());
+    assert_eq!(a.timeline().current_card().id, ids::ROOT);
+}
+
+#[test]
+fn the_volume_screen_sets_the_volume() {
+    let mut a = app();
+    goto(&mut a, ids::VOLUME);
+    assert_eq!(subtitle(&a, ids::VOLUME), "80%");
+    g(&mut a, GestureKind::Tap);
+    assert!(a.overlay().is_some());
+    g(&mut a, GestureKind::SwipeBackward);
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.settings().unwrap().audio_volume, Some(11));
+    assert_eq!(subtitle(&a, ids::VOLUME), "73%");
+    // Leaving without choosing keeps it.
+    g(&mut a, GestureKind::Tap);
+    g(&mut a, GestureKind::SwipeBackward);
+    g(&mut a, GestureKind::SwipeDown);
+    assert_eq!(a.settings().unwrap().audio_volume, Some(11));
 }
 
 #[test]
@@ -75,7 +109,7 @@ fn head_wake_menu_and_the_wake_angle_screen() {
     goto(&mut a, ids::HEAD_WAKE);
     g(&mut a, GestureKind::Tap);
     assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 0 }));
-    assert_eq!(a.menu_labels(), vec!["Turn off", "Wake angle"]);
+    assert_eq!(a.menu_labels(), vec!["Turn on", "Wake angle"]);
     g(&mut a, GestureKind::SwipeForward);
     assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 1 }));
     g(&mut a, GestureKind::Tap);
@@ -84,11 +118,11 @@ fn head_wake_menu_and_the_wake_angle_screen() {
     g(&mut a, GestureKind::Tap);
     assert_eq!(a.overlay(), None);
     assert_eq!(a.settings().unwrap().head_wake_angle_deg, Some(35.0));
-    assert_eq!(subtitle(&a, ids::HEAD_WAKE), "On, at 35°");
-    // Turn it off from the menu.
-    g(&mut a, GestureKind::Tap);
-    g(&mut a, GestureKind::Tap);
     assert_eq!(subtitle(&a, ids::HEAD_WAKE), "Off");
+    // Turn it on from the menu.
+    g(&mut a, GestureKind::Tap);
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(subtitle(&a, ids::HEAD_WAKE), "On, at 35°");
     assert!(a.take_log().iter().any(|l| l.starts_with("settings:")));
 }
 
@@ -99,7 +133,7 @@ fn swipe_down_leaves_a_menu_or_the_angle_screen_unchanged() {
     g(&mut a, GestureKind::Tap);
     g(&mut a, GestureKind::SwipeDown);
     assert_eq!(a.overlay(), None);
-    assert_eq!(subtitle(&a, ids::HEAD_WAKE), "On, at 30°");
+    assert_eq!(subtitle(&a, ids::HEAD_WAKE), "Off");
     g(&mut a, GestureKind::Tap);
     g(&mut a, GestureKind::SwipeForward);
     g(&mut a, GestureKind::Tap);
@@ -119,11 +153,11 @@ fn screen_timeout_menu_starts_at_the_current_choice() {
     let mut a = app();
     goto(&mut a, ids::SCREEN_TIMEOUT);
     g(&mut a, GestureKind::Tap);
-    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 2 }));
+    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 5 }));
     g(&mut a, GestureKind::SwipeForward);
     g(&mut a, GestureKind::Tap);
-    assert_eq!(a.settings().unwrap().screen_timeout_ms, Some(30_000));
-    assert_eq!(subtitle(&a, ids::SCREEN_TIMEOUT), "30 seconds");
+    assert_eq!(a.settings().unwrap().screen_timeout_ms, Some(300_000));
+    assert_eq!(subtitle(&a, ids::SCREEN_TIMEOUT), "5 minutes");
 }
 
 #[test]
@@ -131,14 +165,15 @@ fn toggles_for_on_head_and_nudge() {
     let mut a = app();
     // Wink is not in the settings (the glasshub firmware delivers no wink event).
     assert!(!glass_launcher::settings::ORDER.contains(&ids::WINK));
-    for id in [ids::ON_HEAD, ids::NUDGE] {
-        goto(&mut a, id);
-        assert_eq!(subtitle(&a, id), "Off");
-        g(&mut a, GestureKind::Tap);
-        assert_eq!(a.menu_labels(), vec!["Turn on"]);
-        g(&mut a, GestureKind::Tap);
-        assert_eq!(subtitle(&a, id), "On");
-    }
+    goto(&mut a, ids::NUDGE);
+    assert_eq!(subtitle(&a, ids::NUDGE), "Off");
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.menu_labels(), vec!["Turn on"]);
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(subtitle(&a, ids::NUDGE), "On");
+    // On-head detection is on by default.
+    goto(&mut a, ids::ON_HEAD);
+    assert_eq!(subtitle(&a, ids::ON_HEAD), "On");
     let s = a.settings().unwrap();
     assert_eq!(s.wink_enabled, Some(false), "no card can turn wink on");
     assert_eq!(s.on_head_detection_enabled, Some(true));
@@ -252,5 +287,5 @@ fn language_card_menu_switches_the_whole_ui() {
     assert_eq!(a.locale(), glass_ui::Locale::It);
     // Every settings card now reads Italian.
     assert_eq!(subtitle(&a, ids::LANGUAGE), "Italiano");
-    assert_eq!(subtitle(&a, ids::SCREEN_TIMEOUT), "15 secondi");
+    assert_eq!(subtitle(&a, ids::SCREEN_TIMEOUT), "2 minuti");
 }

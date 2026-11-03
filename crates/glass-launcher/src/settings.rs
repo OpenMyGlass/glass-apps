@@ -12,7 +12,7 @@ use crate::platform::RadioStatus;
 use glass_api::hub::settings_rules;
 use glass_api::proto::Settings;
 use glass_ui::i18n::{fmt1, fmt2, Locale, Msg};
-use glass_ui::{Adjuster, Card, CardContent, CardId, MenuItem};
+use glass_ui::{Adjuster, Card, CardContent, CardId, MenuItem, Timeline};
 
 /// Card ids of the settings cards (fixed, so updates find them).
 pub mod ids {
@@ -26,6 +26,9 @@ pub mod ids {
     pub const NUDGE: CardId = 107;
     pub const LANGUAGE: CardId = 108;
     pub const DEVICE: CardId = 109;
+    /// The one card on the main timeline; a tap opens the settings cards.
+    pub const ROOT: CardId = 110;
+    pub const VOLUME: CardId = 111;
 }
 
 /// The settings cards from the one next to the "now" cards to the farthest.
@@ -33,9 +36,10 @@ pub mod ids {
 /// The wink card ([`ids::WINK`]) is not shown: the Glass glasshub firmware (1.22) never
 /// delivers a wink event, so the toggle did nothing the owner could see. `glassd` keeps the
 /// setting; the card comes back here once the MCU wink threshold is tuned.
-pub const ORDER: [CardId; 8] = [
+pub const ORDER: [CardId; 9] = [
     ids::WIFI,
     ids::BLUETOOTH,
+    ids::VOLUME,
     ids::SCREEN_TIMEOUT,
     ids::HEAD_WAKE,
     ids::ON_HEAD,
@@ -181,6 +185,15 @@ pub fn card_content(id: CardId, v: &SettingsView) -> Option<CardContent> {
             Msg::SettingsNudge,
             setting_text(v, |s| s.nudge_sleep_enabled.map(|b| on_off(loc, b).into())),
         ),
+        ids::VOLUME => entry(
+            Msg::SettingsVolume,
+            setting_text(v, |s| {
+                Some(volume_text(
+                    s.audio_volume
+                        .unwrap_or(settings_rules::AUDIO_VOLUME_DEFAULT) as f32,
+                ))
+            }),
+        ),
         ids::LANGUAGE => entry(Msg::SettingsLanguage, loc.endonym().into()),
         ids::DEVICE => {
             let mut lines = vec![fmt2(
@@ -206,6 +219,21 @@ pub fn card_content(id: CardId, v: &SettingsView) -> Option<CardContent> {
 }
 
 /// The settings cards in timeline order (from the "now" cards outward).
+/// The card that stands for the settings on the main timeline.
+pub fn root_card(locale: Locale) -> Card {
+    Card::new(
+        ids::ROOT,
+        CardContent::settings(Msg::SettingsRoot.get(locale)),
+    )
+}
+
+/// The timeline shown when the settings are open: their cards, the first one in front.
+pub fn timeline(v: &SettingsView) -> Timeline {
+    let mut all = cards(v).into_iter();
+    let first = all.next().expect("there are settings cards");
+    Timeline::new(vec![], first, all.collect())
+}
+
 pub fn cards(v: &SettingsView) -> Vec<Card> {
     ORDER
         .iter()
@@ -343,6 +371,30 @@ pub fn apply_locally(current: &mut Settings, change: &Settings) {
     settings_rules::merge(current, change);
 }
 
+/// A volume in earpiece gain steps as a percentage of the maximum.
+fn volume_text(steps: f32) -> String {
+    format!(
+        "{}%",
+        (steps * 100.0 / settings_rules::AUDIO_VOLUME_MAX as f32).round() as u32
+    )
+}
+
+/// The volume sub-screen, starting at the current volume.
+pub fn volume_adjuster(v: &SettingsView) -> Adjuster {
+    let start = v
+        .settings
+        .and_then(|s| s.audio_volume)
+        .unwrap_or(settings_rules::AUDIO_VOLUME_DEFAULT);
+    Adjuster::new(
+        Msg::SettingsVolume.get(v.locale),
+        0.0,
+        settings_rules::AUDIO_VOLUME_MAX as f32,
+        1.0,
+        start as f32,
+        volume_text,
+    )
+}
+
 /// The wake-angle sub-screen, starting at the current angle.
 pub fn wake_angle_adjuster(v: &SettingsView) -> Adjuster {
     let start = v
@@ -431,12 +483,9 @@ mod tests {
         let v = view(Some(settings_defaults()));
         assert_eq!(
             subtitle(card_content(ids::SCREEN_TIMEOUT, &v).unwrap()),
-            "15 seconds"
+            "2 minutes"
         );
-        assert_eq!(
-            subtitle(card_content(ids::HEAD_WAKE, &v).unwrap()),
-            "On, at 30°"
-        );
+        assert_eq!(subtitle(card_content(ids::HEAD_WAKE, &v).unwrap()), "Off");
         assert_eq!(subtitle(card_content(ids::WINK, &v).unwrap()), "Off");
         assert_eq!(
             subtitle(card_content(ids::WIFI, &v).unwrap()),
@@ -462,7 +511,7 @@ mod tests {
         let v = view_in(Some(settings_defaults()), Locale::It);
         assert_eq!(
             subtitle(card_content(ids::SCREEN_TIMEOUT, &v).unwrap()),
-            "15 secondi"
+            "2 minuti"
         );
         assert_eq!(subtitle(card_content(ids::WINK, &v).unwrap()), "Disattivo");
         // The language menu offers every language and marks the current one.
@@ -480,18 +529,18 @@ mod tests {
         let card = |id| Card::new(id, card_content(id, &v).unwrap());
         let (items, first) = menu_for(&card(ids::HEAD_WAKE), &v).unwrap();
         assert_eq!(first, 0);
-        assert_eq!(items[0].label, "Turn off");
+        assert_eq!(items[0].label, "Turn on");
         assert_eq!(
             items[0].value,
             Choice::Patch(Settings {
-                head_wake_enabled: Some(false),
+                head_wake_enabled: Some(true),
                 ..Default::default()
             })
         );
         assert_eq!(items[1].value, Choice::WakeAngle);
         let (items, first) = menu_for(&card(ids::SCREEN_TIMEOUT), &v).unwrap();
         assert_eq!(items.len(), TIMEOUT_CHOICES_MS.len());
-        assert_eq!(items[first].label, "15 seconds");
+        assert_eq!(items[first].label, "2 minutes");
         assert_eq!(items[first].detail.as_deref(), Some("Current"));
         let (items, _) = menu_for(&card(ids::WINK), &v).unwrap();
         assert_eq!(items[0].label, "Turn on");

@@ -931,6 +931,8 @@ pub fn startup_tone() -> Vec<i16> {
 /// [`Feedback::play`] only sends a cue and returns at once (never blocks the input loop).
 pub struct AlsaFeedback {
     tx: mpsc::Sender<Snd>,
+    /// The wanted earpiece volume (`u32::MAX`: not set yet); the audio thread applies it.
+    volume: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 /// Playback period/count for the UI player: 1056 frames × 4 = low latency (~22 ms period,
@@ -996,6 +998,8 @@ impl AlsaFeedback {
         }
 
         let (tx, rx) = mpsc::channel::<Snd>();
+        let volume = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(u32::MAX));
+        let thread_volume = volume.clone();
         thread::Builder::new()
             .name("ui-audio".into())
             .spawn(move || {
@@ -1008,8 +1012,8 @@ impl AlsaFeedback {
                 const MIN_GAP: Duration = Duration::from_millis(70);
                 let clips = Clips::new();
                 let chime = startup_tone();
-                // keep the mixer handle alive for the session
-                let _mixer = mixer;
+                // The mixer stays open for the session: the volume is set from here.
+                let mut applied = u32::MAX;
                 let mut last = Instant::now() - Duration::from_secs(1);
                 while let Ok(mut snd) = rx.recv() {
                     // Coalesce a backlog (fast swipes) down to the latest sound.
@@ -1022,6 +1026,11 @@ impl AlsaFeedback {
                         continue;
                     }
                     last = Instant::now();
+                    let wanted = thread_volume.load(std::sync::atomic::Ordering::Relaxed);
+                    if wanted != applied && wanted != u32::MAX {
+                        let _ = mixer.set("Earphone Playback Volume", wanted as i32);
+                        applied = wanted;
+                    }
                     let buf: &[i16] = match snd {
                         Snd::Cue(cue) => clips.for_cue(cue),
                         Snd::Chime => &chime,
@@ -1031,7 +1040,7 @@ impl AlsaFeedback {
             })
             .ok();
         report.push("audio thread started".into());
-        (Some(AlsaFeedback { tx }), report)
+        (Some(AlsaFeedback { tx, volume }), report)
     }
 
     /// Plays the startup chime (for the self-test audibility check).
@@ -1049,6 +1058,11 @@ enum Snd {
 impl Feedback for AlsaFeedback {
     fn play(&mut self, cue: Cue) {
         let _ = self.tx.send(Snd::Cue(cue));
+    }
+
+    fn set_volume(&mut self, steps: u32) {
+        self.volume
+            .store(steps, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
