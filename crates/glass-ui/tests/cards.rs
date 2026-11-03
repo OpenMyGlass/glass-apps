@@ -170,3 +170,49 @@ fn relative_time_survives_extreme_timestamps() {
     assert_eq!(relative_time(En, i64::MIN, i64::MAX), "just now");
     assert!(relative_time(En, i64::MAX, i64::MIN).ends_with("days ago"));
 }
+
+/// The rows and columns with lit pixels of a rendered card.
+fn lit_extent(card: &Card) -> (u32, u32, u32, u32) {
+    let f = render_card(card, &RenderContext::default(), 640, 360);
+    let (mut x0, mut x1, mut y0, mut y1) = (640, 0, 360, 0);
+    for y in 0..360 {
+        for x in 0..640 {
+            if f.pixel(x, y) != Color::BLACK {
+                x0 = x0.min(x);
+                x1 = x1.max(x);
+                y0 = y0.min(y);
+                y1 = y1.max(y);
+            }
+        }
+    }
+    (x0, x1, y0, y1)
+}
+
+#[test]
+fn long_translations_wrap_and_shrink_inside_the_card() {
+    let long = "Un colpetto di testa in su spegne lo schermo quando vuoi riposare gli occhi";
+    for content in [
+        CardContent::Settings {
+            title: "Détection sur la tête de l'utilisateur".into(),
+            subtitle: Some(long.into()),
+        },
+        CardContent::MenuItem {
+            label: "Désactiver la détection sur la tête".into(),
+            detail: Some(long.into()),
+            index: 0,
+            count: 1,
+        },
+        CardContent::settings(long),
+    ] {
+        let (x0, x1, y0, y1) = lit_extent(&Card::new(1, content));
+        assert!(x0 >= 30 && x1 <= 610, "inside the side margins: {x0}..{x1}");
+        assert!(y0 >= 20 && y1 <= 340, "inside the card: {y0}..{y1}");
+    }
+}
+
+#[test]
+fn a_very_long_text_is_cut_but_stays_inside_the_card() {
+    let huge = "parola ".repeat(200);
+    let (_, _, y0, y1) = lit_extent(&Card::new(1, CardContent::settings(huge)));
+    assert!(y0 >= 20 && y1 <= 340, "inside the card: {y0}..{y1}");
+}

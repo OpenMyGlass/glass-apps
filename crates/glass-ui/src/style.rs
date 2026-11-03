@@ -19,6 +19,8 @@ pub const CLOCK_SIZE: f32 = 128.0;
 pub const BODY_SIZES: [f32; 4] = [64.0, 48.0, 40.0, 34.0];
 /// Body line height as a multiple of the text size.
 pub const BODY_LINE_HEIGHT: f32 = 1.2;
+/// The smallest size a title, label or detail shrinks to before it is cut.
+pub const MIN_TEXT_SIZE: f32 = 22.0;
 /// Footer text size.
 pub const FOOTER_SIZE: f32 = 26.0;
 /// Footer baseline, measured up from the bottom edge.
