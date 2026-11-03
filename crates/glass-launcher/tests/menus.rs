@@ -91,18 +91,18 @@ fn settings_are_one_card_that_opens_a_submenu() {
 fn the_volume_screen_sets_the_volume() {
     let mut a = app();
     goto(&mut a, ids::VOLUME);
-    assert_eq!(subtitle(&a, ids::VOLUME), "80%");
+    assert_eq!(subtitle(&a, ids::VOLUME), "87%");
     g(&mut a, GestureKind::Tap);
     assert!(a.overlay().is_some());
     g(&mut a, GestureKind::SwipeBackward);
     g(&mut a, GestureKind::Tap);
-    assert_eq!(a.settings().unwrap().audio_volume, Some(11));
-    assert_eq!(subtitle(&a, ids::VOLUME), "73%");
+    assert_eq!(a.settings().unwrap().audio_volume, Some(86));
+    assert_eq!(subtitle(&a, ids::VOLUME), "86%");
     // Leaving without choosing keeps it.
     g(&mut a, GestureKind::Tap);
     g(&mut a, GestureKind::SwipeBackward);
     g(&mut a, GestureKind::SwipeDown);
-    assert_eq!(a.settings().unwrap().audio_volume, Some(11));
+    assert_eq!(a.settings().unwrap().audio_volume, Some(86));
 }
 
 #[test]

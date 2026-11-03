@@ -849,7 +849,7 @@ impl Clips {
     fn for_cue(&self, cue: Cue) -> &[i16] {
         match cue {
             Cue::CardChange => &self.card_change,
-            Cue::Select => &self.select,
+            Cue::Select | Cue::VolumeStep => &self.select,
             Cue::MenuMove => &self.menu_move,
             Cue::ToggleOn => &self.toggle_on,
             Cue::ToggleOff => &self.toggle_off,
@@ -1020,15 +1020,19 @@ impl AlsaFeedback {
                     while let Ok(newer) = rx.try_recv() {
                         snd = newer;
                     }
-                    let repeatable =
-                        matches!(snd, Snd::Cue(Cue::CardChange) | Snd::Cue(Cue::MenuMove));
+                    let repeatable = matches!(
+                        snd,
+                        Snd::Cue(Cue::CardChange | Cue::MenuMove | Cue::VolumeStep)
+                    );
                     if repeatable && last.elapsed() < MIN_GAP {
                         continue;
                     }
                     last = Instant::now();
                     let wanted = thread_volume.load(std::sync::atomic::Ordering::Relaxed);
                     if wanted != applied && wanted != u32::MAX {
-                        let _ = mixer.set("Earphone Playback Volume", wanted as i32);
+                        let (ep, media) = volume_gains(wanted);
+                        let _ = mixer.set("Earphone Playback Volume", ep);
+                        let _ = mixer.set("DL1 Media Playback Volume", media);
                         applied = wanted;
                     }
                     let buf: &[i16] = match snd {
@@ -1049,6 +1053,37 @@ impl AlsaFeedback {
     }
 }
 
+/// The mixer values for a volume in percent: (`Earphone Playback Volume`, `DL1 Media Playback
+/// Volume`). The earpiece stays at its +6 dB maximum, and the ABE gain (120 = 0 dB, taken as
+/// 1 dB per step) does the fine control: 100 % is +6 dB overall, each percent 0.46 dB less, and
+/// 0 is the bottom of the ABE range. The 1 dB step has not been measured on the device.
+pub fn volume_gains(percent: u32) -> (i32, i32) {
+    const EP_MAX: i32 = 15;
+    const ABE_0_DB: f32 = 120.0;
+    const DB_PER_PERCENT: f32 = 0.46;
+    if percent == 0 {
+        return (EP_MAX, 0);
+    }
+    let below_max = 100u32.saturating_sub(percent) as f32 * DB_PER_PERCENT;
+    (EP_MAX, (ABE_0_DB - below_max).round() as i32)
+}
+
+#[cfg(test)]
+mod volume_tests {
+    use super::volume_gains;
+
+    #[test]
+    fn the_volume_falls_steadily_and_0_is_the_bottom() {
+        assert_eq!(volume_gains(100), (15, 120));
+        assert_eq!(volume_gains(87), (15, 114));
+        assert_eq!(volume_gains(1), (15, 74));
+        assert_eq!(volume_gains(0), (15, 0));
+        for p in 1..=100 {
+            assert!(volume_gains(p).1 >= volume_gains(p - 1).1);
+        }
+    }
+}
+
 /// A queued sound for the audio thread.
 enum Snd {
     Cue(Cue),
@@ -1060,9 +1095,9 @@ impl Feedback for AlsaFeedback {
         let _ = self.tx.send(Snd::Cue(cue));
     }
 
-    fn set_volume(&mut self, steps: u32) {
+    fn set_volume(&mut self, percent: u32) {
         self.volume
-            .store(steps, std::sync::atomic::Ordering::Relaxed);
+            .store(percent, std::sync::atomic::Ordering::Relaxed);
     }
 }
 

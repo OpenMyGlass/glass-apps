@@ -820,8 +820,8 @@ impl App {
             React::Done => {}
             React::OpenStill(moved) => {
                 if preview_volume.is_some() {
-                    // A clear blip at the new level, so the level can be judged by ear.
-                    self.feedback.play(Cue::Select);
+                    // A blip at the new level, so the level can be judged by ear.
+                    self.feedback.play(Cue::VolumeStep);
                 } else if moved {
                     self.feedback.play(Cue::MenuMove);
                 }
