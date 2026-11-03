@@ -97,6 +97,22 @@ struct Args {
     /// `--audio-analog`: TWL6040 earphone-path variants, dumping the codec registers +
     /// EP-path DAPM during playback (needs `sound`; debugfs mounted by the init).
     audio_analog: bool,
+    /// `--audio-devsweep`: play the same EP tone on each earphone-capable PCM front-end
+    /// (D0 ABE, D6 ABE-LP, D8 twl6040-legacy/McPDM-direct) to find which one is audible.
+    audio_devsweep: bool,
+    /// `--audio-legacy`: play a tone through the legacy McPDM-direct path (D8, S32/96 kHz),
+    /// bypassing the ABE/AESS entirely — the decisive "is the ABE the culprit?" test.
+    audio_legacy: bool,
+    /// `--audio-mmap`: stock-HAL-matched earphone playback (MMAP + NOIRQ on the ABE D0).
+    audio_mmap: bool,
+    /// `--audio-stock-exact`: byte-for-byte stock pcm_open (MMAP+NOIRQ, period 14784, st 2112).
+    audio_stock_exact: bool,
+    /// `--audio-headset`: play the tone on the headset/USB-earbud output (not bone-conduction).
+    audio_headset: bool,
+    /// `--audio-writei14784`: EP tone via writei at the stock ABE period (isolates period vs MMAP).
+    audio_writei14784: bool,
+    /// `--audio-dump-state`: dump live regs/ABE/mixer/DAPM without playing (gold-ref capture).
+    audio_dump_state: bool,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -132,6 +148,13 @@ fn parse_args() -> Result<Args, String> {
             "--audio-sweep" => a.audio_sweep = true,
             "--audio-tone-long" => a.audio_tone_long = true,
             "--audio-analog" => a.audio_analog = true,
+            "--audio-devsweep" => a.audio_devsweep = true,
+            "--audio-legacy" => a.audio_legacy = true,
+            "--audio-mmap" => a.audio_mmap = true,
+            "--audio-stock-exact" => a.audio_stock_exact = true,
+            "--audio-headset" => a.audio_headset = true,
+            "--audio-writei14784" => a.audio_writei14784 = true,
+            "--audio-dump-state" => a.audio_dump_state = true,
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
@@ -377,6 +400,133 @@ fn run_audio_analog() -> Result<(), String> {
         glass_launcher::audio::analog_diag(&mut |line: &str| {
             let mut e = std::io::stderr();
             let _ = writeln!(e, "OMGB-AUDIO: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-devsweep`: play the same EP tone on D0 (ABE), D6 (ABE-LP) and D8 (legacy McPDM)
+/// so the owner can identify which earphone front-end is actually audible.
+fn run_audio_devsweep() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::device_sweep(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-DEV: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-stock-exact`: byte-for-byte stock pcm_open (MMAP+NOIRQ, period 14784, st 2112).
+fn run_audio_stock_exact() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::stock_exact_diag(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-STOCK: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support".into())
+    }
+}
+
+/// `--audio-writei14784`: EP tone via writei at the stock ABE period (isolates period vs MMAP).
+fn run_audio_writei14784() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::writei_stock_diag(&mut |l: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-WRITEI: {l}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("no sound support".into())
+    }
+}
+
+/// `--audio-dump-state`: dump live regs/ABE/mixer/DAPM without playing (gold-ref capture).
+fn run_audio_dump_state() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::dump_state(&mut |l: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-STATE: {l}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("no sound support".into())
+    }
+}
+
+/// `--audio-headset`: play the tone on the headset/USB-earbud output (not bone-conduction).
+fn run_audio_headset() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::headset_diag(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-HS: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support".into())
+    }
+}
+
+/// `--audio-mmap`: stock-HAL-matched earphone playback (MMAP + NOIRQ on the ABE D0).
+fn run_audio_mmap() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::mmap_diag(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-MMAP: {line}");
+            let _ = e.flush();
+        });
+        Ok(())
+    }
+    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    {
+        Err("this build has no sound support: rebuild with --features sound on Linux".into())
+    }
+}
+
+/// `--audio-legacy`: play a tone via the legacy McPDM-direct path (D8), bypassing the ABE.
+fn run_audio_legacy() -> Result<(), String> {
+    #[cfg(all(feature = "sound", target_os = "linux"))]
+    {
+        use std::io::Write;
+        glass_launcher::audio::legacy_play(&mut |line: &str| {
+            let mut e = std::io::stderr();
+            let _ = writeln!(e, "OMGB-LEGACY: {line}");
             let _ = e.flush();
         });
         Ok(())
@@ -942,7 +1092,21 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let result = if args.audio_analog {
+    let result = if args.audio_dump_state {
+        run_audio_dump_state()
+    } else if args.audio_writei14784 {
+        run_audio_writei14784()
+    } else if args.audio_headset {
+        run_audio_headset()
+    } else if args.audio_stock_exact {
+        run_audio_stock_exact()
+    } else if args.audio_mmap {
+        run_audio_mmap()
+    } else if args.audio_legacy {
+        run_audio_legacy()
+    } else if args.audio_devsweep {
+        run_audio_devsweep()
+    } else if args.audio_analog {
         run_audio_analog()
     } else if args.audio_tone_long {
         run_audio_tone_long()

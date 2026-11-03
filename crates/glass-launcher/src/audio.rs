@@ -60,6 +60,9 @@ const SNDRV_PCM_IOCTL_START: libc::c_ulong = ioc(IOC_NONE, A, 0x42, 0);
 const SNDRV_PCM_IOCTL_DRAIN: libc::c_ulong = ioc(IOC_NONE, A, 0x44, 0);
 const SNDRV_PCM_IOCTL_DROP: libc::c_ulong = ioc(IOC_NONE, A, 0x43, 0);
 const SNDRV_PCM_IOCTL_WRITEI_FRAMES: libc::c_ulong = ioc(IOC_WRITE, A, 0x50, 12);
+const SNDRV_PCM_IOCTL_HWSYNC: libc::c_ulong = ioc(IOC_NONE, A, 0x22, 0);
+const SIZEOF_SYNC_PTR: usize = 132; // flags(4) + status union(64) + control union(64)
+const SNDRV_PCM_IOCTL_SYNC_PTR: libc::c_ulong = ioc(IOC_READ | IOC_WRITE, A, 0x23, SIZEOF_SYNC_PTR);
 const SNDRV_CTL_IOCTL_ELEM_WRITE: libc::c_ulong =
     ioc(IOC_READ | IOC_WRITE, U, 0x13, SIZEOF_CTL_ELEM_VALUE);
 const SNDRV_CTL_IOCTL_ELEM_READ: libc::c_ulong =
@@ -84,8 +87,19 @@ const P_PERIODS: usize = 15;
 const P_BUFFER_SIZE: usize = 17;
 const FIRST_INTERVAL: usize = 8;
 
+const SNDRV_PCM_ACCESS_MMAP_INTERLEAVED: u32 = 0;
 const SNDRV_PCM_ACCESS_RW_INTERLEAVED: u32 = 3;
 const SNDRV_PCM_FORMAT_S16_LE: u32 = 2;
+const SNDRV_PCM_FORMAT_S32_LE: u32 = 10;
+// hw_params.flags bit0 = NO_PERIOD_WAKEUP (what tinyalsa's PCM_NOIRQ sets).
+const SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP: u32 = 1 << 0;
+// snd_pcm_sync_ptr flags
+const SNDRV_PCM_SYNC_PTR_HWSYNC: u32 = 1 << 0;
+// byte offsets inside snd_pcm_sync_ptr (32-bit ARM)
+const SP_FLAGS: usize = 0;
+const SP_STATUS_HWPTR: usize = 4 + 8; // status union @4; hw_ptr @ status+8
+const SP_CTRL_APPLPTR: usize = 4 + 64; // control union @68; appl_ptr @ +0
+const SP_CTRL_AVAILMIN: usize = 4 + 64 + 4; // avail_min @ +4
 
 const SNDRV_CTL_ELEM_IFACE_MIXER: u32 = 2;
 
@@ -297,24 +311,30 @@ pub fn route_controls(headset: bool) -> Vec<(&'static str, i32)> {
 /// has clocked the codec **once** (with [`Pcm::play_explicit`], an explicit START), the
 /// path stays primed and every later open drains normally, in any order.
 ///
-/// It is: the codec power/PLL in **High-Performance** mode (so the McPDM PDM clock runs
-/// from cold), the stock ABE DL1 mixer settings (spec 4.2), and the output [`route_controls`].
+/// It is: the codec power/PLL in the **stock** modes (Low-Power PLL + Low-Power codec,
+/// High-Performance headset DAC), the stock ABE DL1 mixer settings (spec 4.2), and the
+/// output [`route_controls`].
 /// Applied **before** opening the front-end PCM (so DPCM links the McPDM back-end at open).
 ///
 /// | Control | Value | Why |
 /// |---|---|---|
-/// | `PLL Selection` | 1 = High-Performance (HPPLL) | McPDM clock from the 38.4 MHz MCLK, cold-reliable |
-/// | `TWL6040 Power Mode` | 1 = High-Performance | codec analog in high-performance mode |
-/// | `Headset Power Mode` | 1 = High-Performance | HSDAC (feeds the Earphone) in high-performance |
+/// | `PLL Selection` | 0 = Low-Power (LPPLL) | stock; the HPPLL/MCLK path is silent on Glass |
+/// | `TWL6040 Power Mode` | 0 = Low-Power | stock codec analog mode |
+/// | `Headset Power Mode` | 1 = High-Performance | stock; HSDAC (feeds the Earphone) |
 /// | `DL1 Mono Mixer` | 0 | off (stock) |
 /// | `Sidetone Mixer Playback` | 1 | stock DL1 path |
 /// | `DL1 Mixer Voice` | 0 | only Multimedia feeds DL1 |
 /// | …then [`route_controls`] | | DL1 Mixer Multimedia / Media Vol / PDM Switch + EP (or Headset) output |
 pub fn prime_controls(headset: bool) -> Vec<(&'static str, i32)> {
     let mut v = vec![
-        ("PLL Selection", 1),      // High-Performance (HPPLL)
-        ("TWL6040 Power Mode", 1), // High-Performance
-        ("Headset Power Mode", 1), // High-Performance
+        // Stock power modes, captured live from the audible stock HAL on 2026-11-03 (gold
+        // reference, same kernel, same pcm params): the codec clocks from the Low-Power PLL
+        // (32 kHz). High-Performance (HPPLL, from the 38.4 MHz MCLK) left every register,
+        // DAPM widget and ABE port looking right but the earpiece SILENT: the owner heard
+        // the Low-Power variant of --audio-analog only (one of three patterned tones).
+        ("PLL Selection", 0), // Low-Power PLL (stock; HPPLL = silent on Glass)
+        ("TWL6040 Power Mode", 0), // Low-Power (stock)
+        ("Headset Power Mode", 1), // High-Performance (stock: HSDAC feeds the Earphone)
         ("DL1 Mono Mixer", 0),
         ("Sidetone Mixer Playback", 1),
         ("DL1 Mixer Voice", 0),
@@ -486,6 +506,32 @@ impl Pcm {
         Ok(())
     }
 
+    /// As [`Pcm::open_params`] but for an arbitrary playback device number (card 0). Used by
+    /// the device sweep to compare the three earphone-capable front-ends: D0 (ABE
+    /// MultiMedia1), D6 (ABE MultiMedia1 LP) and D8 (twl6040-legacy, McPDM direct, no ABE).
+    pub fn open_params_dev(
+        device: u32,
+        period: u32,
+        periods: u32,
+        start_threshold: u32,
+    ) -> io::Result<Pcm> {
+        let fd = open_snd(&format!("pcmC{CARD}D{device}p"))?;
+        let (period_size, buffer_size) = set_hw_params(&fd, period, periods)?;
+        let st = if start_threshold == 0 {
+            buffer_size
+        } else {
+            start_threshold.min(buffer_size)
+        };
+        set_sw_params_st(&fd, period_size, buffer_size, st)?;
+        ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("PREPARE: {e}")))?;
+        Ok(Pcm {
+            fd,
+            period_size,
+            buffer_size,
+        })
+    }
+
     /// Opens device 0 with an explicit period/count and start threshold (frames). Used by
     /// the diagnostic to compare parameter sets. Leaves the stream PREPARED.
     pub fn open_params(period: u32, periods: u32, start_threshold: u32) -> io::Result<Pcm> {
@@ -567,6 +613,26 @@ impl Drop for Pcm {
 }
 
 fn set_hw_params(fd: &Fd, period_size: u32, periods: u32) -> io::Result<(u32, u32)> {
+    set_hw_params_ex(
+        fd,
+        SNDRV_PCM_FORMAT_S16_LE,
+        RATE,
+        CHANNELS,
+        period_size,
+        periods,
+    )
+}
+
+/// As [`set_hw_params`] but with an explicit format / rate / channel count — for the legacy
+/// McPDM-direct path (D8), which is S32_LE at 88.2/96 kHz (OMAP_MCPDM_RATES, TWL6040_FORMATS).
+fn set_hw_params_ex(
+    fd: &Fd,
+    format: u32,
+    rate: u32,
+    channels: u32,
+    period_size: u32,
+    periods: u32,
+) -> io::Result<(u32, u32)> {
     let mut p = [0u8; SIZEOF_HW_PARAMS];
     // param_init: all masks full, all intervals [0, ~0], rmask/info all set.
     for k in 0..3 {
@@ -581,9 +647,9 @@ fn set_hw_params(fd: &Fd, period_size: u32, periods: u32) -> io::Result<(u32, u3
     put_u32(&mut p, HWP_INFO, 0xffff_ffff);
 
     set_mask(&mut p, P_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
-    set_mask(&mut p, P_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
-    set_interval_exact(&mut p, P_CHANNELS, CHANNELS);
-    set_interval_exact(&mut p, P_RATE, RATE);
+    set_mask(&mut p, P_FORMAT, format);
+    set_interval_exact(&mut p, P_CHANNELS, channels);
+    set_interval_exact(&mut p, P_RATE, rate);
     if period_size > 0 {
         set_interval_exact(&mut p, P_PERIOD_SIZE, period_size);
     }
@@ -800,6 +866,20 @@ impl Default for Clips {
 /// A clear, sustained single-frequency tone: `freq` Hz for `ms` milliseconds at `peak`
 /// (0..1 of full scale), with short linear attack/release so it is unmistakable but does
 /// not click. Interleaved S16 stereo (same on both channels). For the diagnostic sweep.
+/// `n` short tones of `ms` each separated by `gap_ms` of silence (interleaved stereo).
+pub fn beeps(n: usize, freq: f32, ms: f32, gap_ms: f32, peak: f32) -> Vec<i16> {
+    let gap = (gap_ms * RATE as f32 / 1000.0) as usize * 2;
+    let one = tone(freq, ms, peak);
+    let mut out = Vec::with_capacity((one.len() + gap) * n);
+    for i in 0..n {
+        if i > 0 {
+            out.extend(std::iter::repeat(0i16).take(gap));
+        }
+        out.extend_from_slice(&one);
+    }
+    out
+}
+
 pub fn tone(freq: f32, ms: f32, peak: f32) -> Vec<i16> {
     let total = (ms * RATE as f32 / 1000.0) as usize;
     let edge = (RATE as f32 * 0.008) as usize; // 8 ms attack / release
@@ -821,35 +901,26 @@ pub fn tone(freq: f32, ms: f32, peak: f32) -> Vec<i16> {
     out
 }
 
-/// A clear, unmistakable startup chime: three ascending sustained notes, each long and
-/// loud with a short fade. Deliberately well above the cue level so it is obvious on the
-/// bone-conduction transducer (the earlier short/quiet two-note tone was inaudible).
+/// The startup chime: an ascending major arpeggio, Do-Mi-Sol-Do (C5 E5 G5 C6), the
+/// owner's choice. Each note is a clean sine with a short fade so nothing clicks; the
+/// last note is held longer. Moderate level: clean on the earpiece at 0 dB without
+/// clipping the bone-conduction amp.
 pub fn startup_tone() -> Vec<i16> {
-    // A long (~2.5 s), loud (near full-scale), unmistakable tone for the audibility test:
-    // a slow siren sweeping 800↔1200 Hz, which is harder to miss than a steady tone and
-    // definitively answers "does any sound come out of the bone-conduction stack". With a
-    // short fade in/out so it does not click.
-    let total_ms = 2500.0f32;
-    let total = (total_ms * RATE as f32 / 1000.0) as usize;
-    let edge = (RATE as f32 * 0.02) as usize; // 20 ms fade
-    let peak = 0.45f32; // moderate: clean on the earpiece at 0 dB, without clipping
-    let mut out = Vec::with_capacity(total * 2);
-    let mut phase = 0.0f32;
-    for n in 0..total {
-        // Siren: 800..1200 Hz, ~1.4 Hz sweep.
-        let sweep = (2.0 * std::f32::consts::PI * 1.4 * n as f32 / RATE as f32).sin();
-        let freq = 1000.0 + 200.0 * sweep;
-        phase += 2.0 * std::f32::consts::PI * freq / RATE as f32;
-        let env = if n < edge {
-            n as f32 / edge as f32
-        } else if n >= total - edge {
-            (total - n) as f32 / edge as f32
-        } else {
-            1.0
-        };
-        let s = (phase.sin() * env * peak * 32767.0) as i16;
-        out.push(s);
-        out.push(s);
+    const PEAK: f32 = 0.45;
+    const GAP_MS: f32 = 35.0;
+    let notes: [(f32, f32); 4] = [
+        (523.25, 230.0),  // C5  do
+        (659.25, 230.0),  // E5  mi
+        (783.99, 230.0),  // G5  sol
+        (1046.50, 520.0), // C6  do (alto)
+    ];
+    let gap = (GAP_MS * RATE as f32 / 1000.0) as usize * 2;
+    let mut out = Vec::new();
+    for (i, (freq, ms)) in notes.iter().enumerate() {
+        if i > 0 {
+            out.extend(std::iter::repeat(0i16).take(gap));
+        }
+        out.extend(tone(*freq, *ms, PEAK));
     }
     out
 }
@@ -1711,10 +1782,18 @@ pub fn analog_diag(emit: &mut dyn FnMut(&str)) {
             return;
         }
     };
-    let buf = tone(1000.0, 2500.0, 0.4);
     let ch = CHANNELS as usize;
-    for (label, overrides) in analog_variants() {
-        emit(&format!("######## ANALOG VARIANT {label} ########"));
+    for (idx, (label, overrides)) in analog_variants().into_iter().enumerate() {
+        // Countable patterns so the owner can say WHICH variant sounded: V1 = one long
+        // tone, V2 = two short beeps, V3 = three short beeps.
+        let buf = match idx {
+            0 => tone(1000.0, 2000.0, 0.4),
+            n => beeps(n + 1, 1000.0, 350.0, 300.0, 0.4),
+        };
+        emit(&format!(
+            "######## ANALOG VARIANT {label} ({} beep(s)) ########",
+            if idx == 0 { 1 } else { idx + 1 }
+        ));
         // Base bone-conduction prime, then the variant overrides.
         for (name, val, r) in set_prime(&mixer, false) {
             if let Err(e) = r {
@@ -1764,4 +1843,610 @@ pub fn analog_diag(emit: &mut dyn FnMut(&str)) {
         std::thread::sleep(Duration::from_millis(800));
     }
     emit("ANALOG DIAG done: report which VARIANT made sound; compare twl6040 registers (EARCTL/HSLCTL/HSRCTL/NCPCTRL/LDOCTL/HPPLLCTL) and dapm HSDAC/Earphone Driver On/Off across variants.");
+}
+
+// ---- PCM DEVICE sweep (which front-end actually reaches the earphone) ---------------
+
+/// The card exposes three earphone-capable playback front-ends:
+///   D0 = "Multimedia"      -> OMAP ABE MultiMedia1 (through the AESS)  [what we use]
+///   D6 = "Multimedia"      -> OMAP ABE MultiMedia1 **LP** (low-power ABE path)
+///   D8 = "Headset Playback"-> twl6040-legacy (McPDM **direct**, bypasses the ABE/AESS)
+/// Every machine-observable state (codec regs, ABE ports, OPP, mixer controls) is identical
+/// between our D0 playback on the silent Model B and on the working stock kernel — so the
+/// difference must be *which front-end actually carries audio to the earphone*. This plays
+/// the SAME 3 s tone on each device in turn (same EP codec route) so the owner reports which
+/// device number is audible. The audible one is the front-end the fix must use.
+pub fn device_sweep(emit: &mut dyn FnMut(&str)) {
+    use std::time::Duration;
+    let devs: &[(u32, &str)] = &[
+        (0, "ABE MultiMedia1 (current)"),
+        (6, "ABE MultiMedia1 LP"),
+        (8, "twl6040-legacy / McPDM direct (no ABE)"),
+    ];
+    let mixer = match Mixer::open() {
+        Ok(m) => m,
+        Err(e) => {
+            emit(&format!("mixer open FAILED: {e}"));
+            return;
+        }
+    };
+    for (dev, label) in devs {
+        emit(&format!("######## DEVICE {dev}: {label} ########"));
+        // (Re)apply the bone-conduction (EP) codec route + ABE DL1 prime before each open.
+        for (name, val, r) in set_prime(&mixer, false) {
+            if let Err(e) = r {
+                emit(&format!("  prime {name}={val}: {e}"));
+            }
+        }
+        let pcm = match Pcm::open_params_dev(*dev, UI_PERIOD, UI_PERIODS, 0) {
+            Ok(p) => {
+                emit(&format!(
+                    "  open pcmC0D{dev}p ok (period {} buffer {} @ {RATE} Hz S16_LE stereo)",
+                    p.period_size, p.buffer_size
+                ));
+                p
+            }
+            Err(e) => {
+                emit(&format!(
+                    "  open pcmC0D{dev}p FAILED: {e}{}",
+                    errno_suffix(&e)
+                ));
+                continue;
+            }
+        };
+        emit(&format!(
+            ">>> playing 3 s 1 kHz tone on DEVICE {dev} ({label}) -- ASCOLTA ORA"
+        ));
+        let t0 = std::time::Instant::now();
+        match pcm.play_explicit(&tone(1000.0, 3000.0, 0.4)) {
+            Ok(()) => emit(&format!(
+                "  DEVICE {dev}: played (drained in {} ms)",
+                t0.elapsed().as_millis()
+            )),
+            Err(e) => emit(&format!(
+                "  DEVICE {dev}: play FAILED: {e}{}",
+                errno_suffix(&e)
+            )),
+        }
+        drop(pcm);
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+    emit("DEVICE SWEEP done: report which DEVICE number (0 / 6 / 8) made audible sound.");
+}
+
+// ---- legacy McPDM-direct path (bypasses the ABE/AESS entirely) ----------------------
+
+impl Pcm {
+    /// Opens an arbitrary device with an explicit format/rate/channels (for the legacy
+    /// McPDM path, which is S32_LE @ 88.2/96 kHz). Leaves the stream PREPARED.
+    pub fn open_ex(
+        device: u32,
+        rate: u32,
+        format: u32,
+        channels: u32,
+        period: u32,
+        periods: u32,
+    ) -> io::Result<Pcm> {
+        let fd = open_snd(&format!("pcmC{CARD}D{device}p"))?;
+        let (period_size, buffer_size) =
+            set_hw_params_ex(&fd, format, rate, channels, period, periods)?;
+        set_sw_params_st(&fd, period_size, buffer_size, buffer_size)?;
+        ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())
+            .map_err(|e| Error::new(e.kind(), format!("PREPARE: {e}")))?;
+        Ok(Pcm {
+            fd,
+            period_size,
+            buffer_size,
+        })
+    }
+
+    /// Raw interleaved byte write; `frames` is the frame count (caller knows bytes/frame).
+    pub fn writei_bytes(&self, bytes: &[u8], frames: u32) -> io::Result<usize> {
+        let mut x = Xferi {
+            result: 0,
+            buf: bytes.as_ptr() as *const libc::c_void,
+            frames: frames as libc::c_ulong,
+        };
+        ioctl_ptr(
+            self.fd.0,
+            SNDRV_PCM_IOCTL_WRITEI_FRAMES,
+            &mut x as *mut _ as *mut _,
+        )
+        .map_err(|e| Error::new(e.kind(), format!("WRITEI: {e}")))?;
+        Ok(x.result as usize)
+    }
+}
+
+/// S32_LE interleaved-stereo sine tone (for the legacy path) at `rate` Hz.
+fn tone_s32(freq: f32, ms: f32, peak: f32, rate: u32) -> Vec<u8> {
+    let total = (ms * rate as f32 / 1000.0) as usize;
+    let edge = (rate as f32 * 0.008) as usize;
+    let mut out = Vec::with_capacity(total * 2 * 4);
+    let mut phase = 0.0f32;
+    for n in 0..total {
+        phase += 2.0 * std::f32::consts::PI * freq / rate as f32;
+        let env = if n < edge {
+            n as f32 / edge as f32
+        } else if n >= total - edge {
+            (total - n) as f32 / edge as f32
+        } else {
+            1.0
+        };
+        let s = (phase.sin() * env * peak * 2_147_483_000.0) as i32;
+        let b = s.to_le_bytes();
+        out.extend_from_slice(&b);
+        out.extend_from_slice(&b);
+    }
+    out
+}
+
+/// `--audio-legacy`: play a tone through the **legacy McPDM-direct** front-end (card0 D8,
+/// "Headset Playback" / twl6040-legacy), which bypasses the OMAP4 ABE/AESS ENTIRELY —
+/// McPDM reads straight from DMA and drives the TWL6040. This is the decisive "is the ABE
+/// the culprit?" test: if this is audible but the ABE path (D0) is not, the AESS data path
+/// is at fault; if this is also silent, the codec/McPDM/physical output is. Requires
+/// S32_LE at 88.2/96 kHz (OMAP_MCPDM_RATES × TWL6040_FORMATS).
+pub fn legacy_play(emit: &mut dyn FnMut(&str)) {
+    let mixer = match Mixer::open() {
+        Ok(m) => m,
+        Err(e) => {
+            emit(&format!("mixer open FAILED: {e}"));
+            return;
+        }
+    };
+    // EP codec route (ABE DL1 controls are harmless/ignored on the legacy path).
+    for (name, val, r) in set_prime(&mixer, false) {
+        if let Err(e) = r {
+            emit(&format!("  prime {name}={val}: {e}"));
+        }
+    }
+    let rate = 96_000u32;
+    // Try a few periods; the McPDM DMA has its own alignment needs.
+    let mut pcm = None;
+    for (ps, pc) in [(1024u32, 4u32), (960, 4), (1920, 2), (0, 0)] {
+        match Pcm::open_ex(8, rate, SNDRV_PCM_FORMAT_S32_LE, 2, ps, pc) {
+            Ok(p) => {
+                emit(&format!(
+                    "  open pcmC0D8p ok: S32_LE {rate} Hz stereo, period {} buffer {} (req {ps}/{pc})",
+                    p.period_size, p.buffer_size
+                ));
+                pcm = Some(p);
+                break;
+            }
+            Err(e) => emit(&format!(
+                "  open D8 S32/{rate} period {ps}/{pc}: {e}{}",
+                errno_suffix(&e)
+            )),
+        }
+    }
+    let Some(pcm) = pcm else {
+        emit("  could not open the legacy McPDM path (D8) in any config");
+        return;
+    };
+    let buf = tone_s32(1000.0, 4000.0, 0.4, rate);
+    let frames = (buf.len() / 8) as u32; // 8 bytes/frame (S32 stereo)
+    let one = pcm.period_size.min(frames);
+    emit(">>> playing 4 s 1 kHz tone on the LEGACY McPDM path (no ABE) -- ASCOLTA ORA");
+    let r = (|| -> io::Result<()> {
+        pcm.prepare()?;
+        pcm.writei_bytes(&buf[..(one as usize) * 8], one)?;
+        pcm.start()?;
+        if one < frames {
+            pcm.writei_bytes(&buf[(one as usize) * 8..], frames - one)?;
+        }
+        pcm.drain()
+    })();
+    match r {
+        Ok(()) => emit("  legacy path: tone played/drained OK"),
+        Err(e) => emit(&format!(
+            "  legacy path: play FAILED: {e}{}",
+            errno_suffix(&e)
+        )),
+    }
+}
+
+// ---- stock-HAL-matched playback: MMAP + NO_PERIOD_WAKEUP (NOIRQ) --------------------
+//
+// The stock audio.primary.glass_1 HAL opens the earphone playback PCM with
+// pcm_open(card=0, device=0, flags = PCM_MMAP | PCM_NOIRQ, config{ABE period}), i.e. it
+// drives the OMAP4 ABE front-end in MMAP + no-period-wakeup mode and feeds it by writing
+// into the mmap'd DMA buffer and advancing appl_ptr via SYNC_PTR — NOT with blocking
+// writei() as our launcher does. This reproduces that exact path, the one real difference
+// found between the (audible) stock HAL and our (silent) launcher on the identical kernel.
+
+/// hw_params for the MMAP/NOIRQ path: MMAP_INTERLEAVED access + NO_PERIOD_WAKEUP flag.
+fn set_hw_params_mmap(fd: &Fd, period_size: u32, periods: u32) -> io::Result<(u32, u32)> {
+    let mut p = [0u8; SIZEOF_HW_PARAMS];
+    put_u32(&mut p, 0, SNDRV_PCM_HW_PARAMS_NO_PERIOD_WAKEUP); // flags @ offset 0
+    for k in 0..3 {
+        put_u32(&mut p, HWP_MASK0 + k * 32, 0xffff_ffff);
+        put_u32(&mut p, HWP_MASK0 + k * 32 + 4, 0xffff_ffff);
+    }
+    for i in 0..12 {
+        put_u32(&mut p, HWP_INTERVAL0 + i * 12, 0);
+        put_u32(&mut p, HWP_INTERVAL0 + i * 12 + 4, 0xffff_ffff);
+    }
+    put_u32(&mut p, HWP_RMASK, 0xffff_ffff);
+    put_u32(&mut p, HWP_INFO, 0xffff_ffff);
+    set_mask(&mut p, P_ACCESS, SNDRV_PCM_ACCESS_MMAP_INTERLEAVED);
+    set_mask(&mut p, P_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
+    set_interval_exact(&mut p, P_CHANNELS, CHANNELS);
+    set_interval_exact(&mut p, P_RATE, RATE);
+    if period_size > 0 {
+        set_interval_exact(&mut p, P_PERIOD_SIZE, period_size);
+    }
+    if periods > 0 {
+        set_interval_exact(&mut p, P_PERIODS, periods);
+    }
+    ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_HW_PARAMS, p.as_mut_ptr() as *mut _)?;
+    let got_period = get_u32(&p, HWP_INTERVAL0 + (P_PERIOD_SIZE - FIRST_INTERVAL) * 12);
+    let got_buffer = get_u32(&p, HWP_INTERVAL0 + (P_BUFFER_SIZE - FIRST_INTERVAL) * 12);
+    let period = if got_period == 0 || got_period == 0xffff_ffff {
+        period_size.max(1024)
+    } else {
+        got_period
+    };
+    let buffer = if got_buffer == 0 || got_buffer == 0xffff_ffff {
+        period * periods.max(2)
+    } else {
+        got_buffer
+    };
+    Ok((period, buffer))
+}
+
+/// SYNC_PTR: push appl_ptr + avail_min to the kernel and read back hw_ptr (frames). HWSYNC
+/// forces a DMA-position resync. appl_ptr/hw_ptr are monotonic frame counters.
+fn sync_ptr(fd: RawFd, hwsync: bool, appl: u32, avail_min: u32) -> io::Result<u32> {
+    let mut sp = [0u8; SIZEOF_SYNC_PTR];
+    // HWSYNC forces a DMA-position re-read; only valid once the stream is RUNNING.
+    put_u32(
+        &mut sp,
+        SP_FLAGS,
+        if hwsync { SNDRV_PCM_SYNC_PTR_HWSYNC } else { 0 },
+    );
+    put_u32(&mut sp, SP_CTRL_APPLPTR, appl);
+    put_u32(&mut sp, SP_CTRL_AVAILMIN, avail_min);
+    ioctl_ptr(fd, SNDRV_PCM_IOCTL_SYNC_PTR, sp.as_mut_ptr() as *mut _)
+        .map_err(|e| Error::new(e.kind(), format!("SYNC_PTR: {e}")))?;
+    Ok(get_u32(&sp, SP_STATUS_HWPTR))
+}
+
+/// Plays `samples` (S16 interleaved stereo) on card0 D`device` via MMAP + NO_PERIOD_WAKEUP,
+/// exactly like the stock HAL. Returns the drain time in ms.
+pub fn mmap_play(
+    emit: &mut dyn FnMut(&str),
+    device: u32,
+    period: u32,
+    periods: u32,
+    start_threshold: u32,
+    samples: &[i16],
+) -> io::Result<u128> {
+    use std::time::Instant;
+    let ch = CHANNELS as usize;
+    let fd = open_snd(&format!("pcmC{CARD}D{device}p"))?;
+    let (period_size, buffer_size) = set_hw_params_mmap(&fd, period, periods)?;
+    let st = if start_threshold == 0 {
+        buffer_size
+    } else {
+        start_threshold
+    };
+    set_sw_params_st(&fd, period_size, buffer_size, st)?;
+    ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_PREPARE, std::ptr::null_mut())
+        .map_err(|e| Error::new(e.kind(), format!("PREPARE: {e}")))?;
+    emit(&format!(
+        "mmap: pcmC0D{device}p period {period_size} buffer {buffer_size} frames, MMAP+NOIRQ"
+    ));
+
+    // mmap the DMA data buffer (offset 0 = DATA).
+    let map_len = buffer_size as usize * ch * 2; // 2 bytes/sample (S16)
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd.0,
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(Error::new(
+            Error::last_os_error().kind(),
+            format!("mmap data buffer: {}", Error::last_os_error()),
+        ));
+    }
+    let dma: &mut [i16] =
+        unsafe { std::slice::from_raw_parts_mut(ptr as *mut i16, buffer_size as usize * ch) };
+
+    let total = samples.len() / ch; // total frames to play
+    let buff = buffer_size as usize;
+    let copy_frame = |dma: &mut [i16], dst_frame: usize, src_frame: usize, samples: &[i16]| {
+        let d = (dst_frame % buff) * ch;
+        let s = src_frame * ch;
+        dma[d] = samples[s];
+        dma[d + 1] = samples[s + 1];
+    };
+
+    // Prime: fill one full buffer (or all we have), set appl_ptr, START.
+    let prime = buff.min(total);
+    for f in 0..prime {
+        copy_frame(dma, f, f, samples);
+    }
+    let mut appl: u32 = prime as u32;
+    let mut src: usize = prime;
+    emit(&format!(
+        "mmap: primed {prime} frames; setting appl_ptr pre-START"
+    ));
+    sync_ptr(fd.0, false, appl, period_size)
+        .map_err(|e| Error::new(e.kind(), format!("pre-START {e}")))?;
+    emit("mmap: appl set; issuing START");
+    ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_START, std::ptr::null_mut())
+        .map_err(|e| Error::new(e.kind(), format!("START: {e}")))?;
+    emit("mmap: START ok; entering fill loop");
+
+    let t0 = Instant::now();
+    let mut spins = 0u32;
+    while src < total {
+        // Refresh the DMA position: the dedicated HWSYNC ioctl, then read hw_ptr.
+        let _ = ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_HWSYNC, std::ptr::null_mut());
+        let hw = sync_ptr(fd.0, false, appl, period_size)?;
+        // free space = buffer - (appl - hw)
+        let in_flight = appl.wrapping_sub(hw);
+        let free = buffer_size.saturating_sub(in_flight);
+        if free < period_size {
+            // no room yet: the ABE is draining; wait ~ one period then retry.
+            unsafe { libc::usleep(2000) };
+            spins += 1;
+            if spins > 3000 {
+                return Err(Error::other(format!(
+                    "mmap: stalled (hw_ptr={hw} appl={appl} not advancing)"
+                )));
+            }
+            continue;
+        }
+        spins = 0;
+        let n = (free as usize).min(total - src);
+        for i in 0..n {
+            copy_frame(dma, (appl as usize) + i, src + i, samples);
+        }
+        appl = appl.wrapping_add(n as u32);
+        src += n;
+        sync_ptr(fd.0, false, appl, period_size)?;
+    }
+    // wait for the queued tail to drain
+    let mut dspins = 0u32;
+    loop {
+        let _ = ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_HWSYNC, std::ptr::null_mut());
+        let hw = sync_ptr(fd.0, false, appl, period_size)?;
+        if appl.wrapping_sub(hw) == 0 {
+            break;
+        }
+        unsafe { libc::usleep(5000) };
+        dspins += 1;
+        if dspins > 400 {
+            break;
+        }
+    }
+    let ms = t0.elapsed().as_millis();
+    let _ = ioctl_ptr(fd.0, SNDRV_PCM_IOCTL_DROP, std::ptr::null_mut());
+    unsafe { libc::munmap(ptr, map_len) };
+    Ok(ms)
+}
+
+/// `--audio-mmap`: the stock-HAL-matched earphone playback (MMAP + NOIRQ on the ABE D0).
+pub fn mmap_diag(emit: &mut dyn FnMut(&str)) {
+    let mixer = match Mixer::open() {
+        Ok(m) => m,
+        Err(e) => {
+            emit(&format!("mixer open FAILED: {e}"));
+            return;
+        }
+    };
+    for (name, val, r) in set_prime(&mixer, false) {
+        if let Err(e) = r {
+            emit(&format!("  prime {name}={val}: {e}"));
+        }
+    }
+    let _ = mixer.set("Earphone Playback Volume", 12);
+    emit(">>> MMAP+NOIRQ earphone tone (stock-HAL path): 6 s 1 kHz -- ASCOLTA ORA");
+    // ABE period like the stock HAL; fall back to the proven 1056/4 if the big one is rejected.
+    let buf = tone(1000.0, 6000.0, 0.4);
+    let mut done = false;
+    for (ps, pc) in [(1056u32, 4u32), (1920, 4), (14784, 2)] {
+        match mmap_play(emit, 0, ps, pc, 0, &buf) {
+            Ok(ms) => {
+                emit(&format!(
+                    "  MMAP play OK on period {ps}/{pc}, drained in {ms} ms"
+                ));
+                done = true;
+                break;
+            }
+            Err(e) => emit(&format!(
+                "  MMAP period {ps}/{pc} FAILED: {e}{}",
+                errno_suffix(&e)
+            )),
+        }
+    }
+    if !done {
+        emit("  MMAP path failed on all periods");
+    }
+}
+
+/// `--audio-stock-exact`: reproduce the stock HAL's earphone pcm_open BYTE-FOR-BYTE —
+/// MMAP + NO_PERIOD_WAKEUP, card 0 device 0, **period 14784, start_threshold 2112**,
+/// S16_LE / 48 kHz stereo (the exact values disassembled from audio.primary.glass_1.so),
+/// on the bone-conduction EP route. The earlier --audio-mmap used period 1056/4, not the
+/// stock 14784; this is the true byte-for-byte branch-B test.
+pub fn stock_exact_diag(emit: &mut dyn FnMut(&str)) {
+    let mixer = match Mixer::open() {
+        Ok(m) => m,
+        Err(e) => {
+            emit(&format!("mixer open FAILED: {e}"));
+            return;
+        }
+    };
+    for (name, val, r) in set_prime(&mixer, false) {
+        if let Err(e) = r {
+            emit(&format!("  prime {name}={val}: {e}"));
+        }
+    }
+    let _ = mixer.set("Earphone Playback Volume", 12);
+    emit(">>> STOCK-EXACT earphone tone: MMAP+NOIRQ, period 14784, start_threshold 2112, D0 EP -- ASCOLTA");
+    let buf = tone(1000.0, 6000.0, 0.4);
+    match mmap_play(emit, 0, 14784, 2, 2112, &buf) {
+        Ok(ms) => emit(&format!("  stock-exact MMAP play OK, drained in {ms} ms")),
+        Err(e) => {
+            emit(&format!(
+                "  stock-exact (14784/2) FAILED: {e}{}",
+                errno_suffix(&e)
+            ));
+            // fall back to period 14784 x3 (buffer ~44352) in case /2 is rejected
+            match mmap_play(emit, 0, 14784, 3, 2112, &buf) {
+                Ok(ms) => emit(&format!("  stock-exact (14784/3) OK, drained in {ms} ms")),
+                Err(e) => emit(&format!(
+                    "  stock-exact (14784/3) FAILED: {e}{}",
+                    errno_suffix(&e)
+                )),
+            }
+        }
+    }
+}
+
+/// `--audio-writei14784`: EP tone via plain blocking writei() at the STOCK ABE period
+/// (14784 / start_threshold 2112), NOT mmap. Isolates the variable: if this is audible but
+/// writei@1056 is not, the key is the ABE period, not MMAP; if only --audio-stock-exact
+/// (MMAP) is audible, the key is MMAP+NOIRQ.
+pub fn writei_stock_diag(emit: &mut dyn FnMut(&str)) {
+    let mixer = match Mixer::open() {
+        Ok(m) => m,
+        Err(e) => {
+            emit(&format!("mixer open FAILED: {e}"));
+            return;
+        }
+    };
+    for (name, val, r) in set_prime(&mixer, false) {
+        if let Err(e) = r {
+            emit(&format!("  prime {name}={val}: {e}"));
+        }
+    }
+    let _ = mixer.set("Earphone Playback Volume", 12);
+    let pcm = match Pcm::open_params(14784, 2, 2112) {
+        Ok(p) => {
+            emit(&format!(
+                "  writei pcmC0D0p period {} buffer {} (stock 14784/st2112), EP route",
+                p.period_size, p.buffer_size
+            ));
+            p
+        }
+        Err(e) => {
+            emit(&format!("  open 14784/2 FAILED: {e}{}", errno_suffix(&e)));
+            return;
+        }
+    };
+    emit(">>> WRITEI @ stock period 14784 (bone conduction) 6 s 1 kHz -- ASCOLTA");
+    match pcm.play_explicit(&tone(1000.0, 6000.0, 0.4)) {
+        Ok(()) => emit("  writei@14784: played/drained OK"),
+        Err(e) => emit(&format!("  writei@14784 FAILED: {e}{}", errno_suffix(&e))),
+    }
+}
+
+/// Reads the REAL TWL6040 registers via the regmap debugfs (works while the codec is
+/// powered, i.e. during playback) — unlike the I2C path which EBUSYs under the driver.
+fn dump_regmap_debugfs(emit: &mut dyn FnMut(&str)) {
+    let Ok(rd) = fs::read_dir("/sys/kernel/debug/regmap") else {
+        emit("regmap: /sys/kernel/debug/regmap absent");
+        return;
+    };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = fs::read_to_string(p.join("name")).unwrap_or_default();
+        if name.trim() == "twl6040" {
+            match fs::read_to_string(p.join("registers")) {
+                Ok(s) => emit(&format!(
+                    "regmap twl6040 registers: {}",
+                    s.replace('\n', " ")
+                )),
+                Err(err) => emit(&format!("regmap registers read FAIL: {err}")),
+            }
+            return;
+        }
+    }
+    emit("regmap: no twl6040 node");
+}
+
+/// `--audio-dump-state`: dump the FULL live audio state WITHOUT playing anything — real
+/// TWL6040 regs (regmap debugfs), ABE ports + OPP, every EP/DL1 mixer control value, and
+/// the EP DAPM widgets + codec_reg cache. Run this WHILE the stock HAL is playing audible
+/// audio to capture the gold reference, then run it during our launcher's playback and diff.
+pub fn dump_state(emit: &mut dyn FnMut(&str)) {
+    emit("==== LIVE AUDIO STATE DUMP (no playback) ====");
+    dump_regmap_debugfs(emit);
+    // ABE ports + OPP
+    let rd = |f: &str| fs::read_to_string(f).unwrap_or_default().trim().to_string();
+    emit(&format!(
+        "abe opp_level={} mm_dl1={}/{} mm_dl_lp={}/{} pdmdl1={}/{} pdmdl2={}/{}",
+        rd("/sys/kernel/debug/omap-abe/opp_level"),
+        rd("/sys/kernel/debug/abe_port/mm_dl1_state"),
+        rd("/sys/kernel/debug/abe_port/mm_dl1_users"),
+        rd("/sys/kernel/debug/abe_port/mm_dl_lp_state"),
+        rd("/sys/kernel/debug/abe_port/mm_dl_lp_users"),
+        rd("/sys/kernel/debug/abe_port/pdmdl1_state"),
+        rd("/sys/kernel/debug/abe_port/pdmdl1_users"),
+        rd("/sys/kernel/debug/abe_port/pdmdl2_state"),
+        rd("/sys/kernel/debug/abe_port/pdmdl2_users"),
+    ));
+    // Mixer control values
+    match Mixer::open() {
+        Ok(mixer) => {
+            for line in ep_state_report(&mixer) {
+                emit(&line);
+            }
+        }
+        Err(e) => emit(&format!("mixer open FAIL: {e}")),
+    }
+    dump_dapm(emit);
+    dump_codec_reg_debugfs(emit);
+    emit("==== END STATE DUMP ====");
+}
+
+/// `--audio-headset`: play the tone on the HEADSET / USB-earbud output (TWL6040 HSOL/HSOR)
+/// instead of the bone-conduction earpiece — Headset L/R on, Earphone off. The headset
+/// output is far louder/clearer and bypasses the bone-conduction transducer, so it
+/// disambiguates a weak/faulty EP transducer from a software fault: if the owner (earbud
+/// plugged) hears THIS but not the EP tone, the problem is EP/bone-conduction-specific.
+pub fn headset_diag(emit: &mut dyn FnMut(&str)) {
+    let mixer = match Mixer::open() {
+        Ok(m) => m,
+        Err(e) => {
+            emit(&format!("mixer open FAILED: {e}"));
+            return;
+        }
+    };
+    emit(&format!("headset sysfs detected: {}", headset_present()));
+    // Prime the HEADSET route (headset=true: HSOL/HSOR on, Earphone off).
+    for (name, val, r) in set_prime(&mixer, true) {
+        match r {
+            Ok(()) => emit(&format!("  mixer {name}={val}: ok")),
+            Err(e) => emit(&format!("  mixer {name}={val}: {e}")),
+        }
+    }
+    let _ = mixer.set("Headset Playback Volume", 13);
+    let pcm = match Pcm::open_params(UI_PERIOD, UI_PERIODS, 0) {
+        Ok(p) => {
+            emit(&format!(
+                "  pcmC0D0p open ok (period {} buffer {})",
+                p.period_size, p.buffer_size
+            ));
+            p
+        }
+        Err(e) => {
+            emit(&format!("  pcm open FAILED: {e}"));
+            return;
+        }
+    };
+    emit(">>> HEADSET tone (plug a USB earbud): 6 s 1 kHz on HSOL/HSOR -- ASCOLTA");
+    match pcm.play_explicit(&tone(1000.0, 6000.0, 0.4)) {
+        Ok(()) => emit("  headset tone: played/drained OK"),
+        Err(e) => emit(&format!("  headset tone FAILED: {e}{}", errno_suffix(&e))),
+    }
 }
