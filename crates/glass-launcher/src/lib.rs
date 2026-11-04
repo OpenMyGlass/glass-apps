@@ -540,19 +540,9 @@ impl App {
         self.shown = false;
     }
 
-    /// Persists `locale` through glassd's settings (no separate store). glassd carries the
-    /// locale in its `Settings`; once glass-api's `Settings` gains the field (see
-    /// [`settings::locale_from_settings`]) this sends
-    /// `SetSettings{settings.locale = loc.tag()}`, which glassd stores and echoes back as a
-    /// `Settings` broadcast. Without glassd (host/mock runs) the locale is session-only.
+    /// Persists `locale` through glassd's settings (no separate store).
     fn persist_locale(&mut self, loc: Locale) {
-        if self.owner == ScreenOwner::Glassd {
-            // TODO(glass-services locale field): once Settings has `locale`, replace this
-            // log with `self.requests.push(Request::SetSettings(Settings {
-            //     locale: Some(loc.tag().into()), ..Default::default() }));`
-            self.log
-                .push(format!("locale: {} (persist via glassd)", loc.tag()));
-        }
+        self.request_settings(settings::locale_settings_patch(loc));
     }
 
     /// The menus offer what is true now (also after a radio or settings change).
