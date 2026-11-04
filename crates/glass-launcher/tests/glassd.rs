@@ -821,3 +821,14 @@ fn losing_glassd_forgets_its_settings_and_pending_requests() {
     assert!(a.settings().is_none());
     assert_eq!(settings_subtitle(&a, ids::NUDGE), "Waiting for glassd");
 }
+
+#[test]
+fn the_language_is_stored_in_glassd_and_restored_from_it() {
+    use glass_ui::i18n::Locale;
+    let (_m, mut s, mut a) = connected();
+    pump_until(&mut s, &mut a, |_, a| a.settings().is_some());
+    assert!(!a.locale_chosen(), "no language yet: the picker is due");
+    a.change_settings(glass_launcher::settings::locale_settings_patch(Locale::It));
+    pump_until(&mut s, &mut a, |_, a| a.locale() == Locale::It);
+    assert!(a.locale_chosen());
+}

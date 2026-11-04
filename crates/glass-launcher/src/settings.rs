@@ -471,15 +471,36 @@ pub fn wake_angle_adjuster(v: &SettingsView) -> Adjuster {
 /// The locale glassd carries in its settings, if any — the launcher's single read point for
 /// the locale glassd and the companion push (see [`crate::App::settings_changed`]).
 ///
-/// The persisted locale lives in glassd's settings (no separate store). The pinned glass-api
-/// `Settings` message does not yet carry the field; the glass-services companion work adds
-/// it as `optional string locale = 7;` (so `SetLocale` is a `SetSettings{locale}` and
-/// `LocaleChanged` is the `Settings` broadcast the launcher already handles). When it lands,
-/// this becomes `s.locale.as_deref().and_then(Locale::from_tag)` — the only change needed to
-/// light up the glassd/companion path.
-pub fn locale_from_settings(_s: &Settings) -> Option<Locale> {
-    // glass-api rev 9bb1988 has no Settings.locale field yet; see the doc comment above.
-    None
+/// The persisted locale lives in glassd's settings (no separate store); it is absent until
+/// someone chooses, which is what sends a first boot to the language picker.
+pub fn locale_from_settings(s: &Settings) -> Option<Locale> {
+    use glass_api::proto::Locale as P;
+    match P::try_from(s.locale?).ok()? {
+        P::It => Some(Locale::It),
+        P::En => Some(Locale::En),
+        P::Fr => Some(Locale::Fr),
+        P::Es => Some(Locale::Es),
+        P::Unspecified => None,
+    }
+}
+
+/// A settings change that sets the language.
+pub fn locale_settings_patch(locale: Locale) -> Settings {
+    Settings {
+        locale: Some(locale_to_settings(locale)),
+        ..Default::default()
+    }
+}
+
+/// The `Settings.locale` value for `locale`.
+pub fn locale_to_settings(locale: Locale) -> i32 {
+    use glass_api::proto::Locale as P;
+    (match locale {
+        Locale::It => P::It,
+        Locale::En => P::En,
+        Locale::Fr => P::Fr,
+        Locale::Es => P::Es,
+    }) as i32
 }
 
 #[cfg(test)]
