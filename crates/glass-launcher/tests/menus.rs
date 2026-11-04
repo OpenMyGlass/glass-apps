@@ -151,6 +151,31 @@ fn swipe_down_leaves_a_menu_or_the_angle_screen_unchanged() {
 }
 
 #[test]
+fn power_off_menu_starts_at_the_current_choice_and_offers_never() {
+    let mut a = app();
+    goto(&mut a, ids::POWER_OFF);
+    assert_eq!(subtitle(&a, ids::POWER_OFF), "30 minutes");
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 1 }));
+    assert_eq!(
+        a.menu_labels(),
+        [
+            "10 minutes",
+            "30 minutes",
+            "60 minutes",
+            "120 minutes",
+            "Never"
+        ]
+    );
+    for _ in 0..3 {
+        g(&mut a, GestureKind::SwipeForward);
+    }
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.settings().unwrap().off_head_power_off_min, Some(0));
+    assert_eq!(subtitle(&a, ids::POWER_OFF), "Never");
+}
+
+#[test]
 fn screen_timeout_menu_starts_at_the_current_choice() {
     let mut a = app();
     goto(&mut a, ids::SCREEN_TIMEOUT);

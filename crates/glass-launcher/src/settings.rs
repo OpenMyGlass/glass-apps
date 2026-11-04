@@ -1,8 +1,8 @@
 //! The settings cards and the card menus.
 //!
 //! Settings cards sit on the backward side of the timeline, after the "now" cards: Wi-Fi,
-//! Bluetooth, screen timeout, head wake, on-head detection, nudge to sleep, device (wink is
-//! hidden until the glasshub firmware delivers wink events).
+//! Bluetooth, screen timeout, head wake, on-head detection, power off when removed, nudge to
+//! sleep, device (wink is hidden until the glasshub firmware delivers wink events).
 //! What they show comes from [`SettingsView`]: the `Settings` that `glassd` applied (so a
 //! clamped value is shown as applied), the platform's radios, and the service's
 //! `Welcome`. A choice in a menu becomes a [`Choice`]: a `SetSettings` patch, a radio
@@ -31,6 +31,7 @@ pub mod ids {
     pub const VOLUME: CardId = 111;
     pub const TIME_FORMAT: CardId = 112;
     pub const TIMEZONE: CardId = 113;
+    pub const POWER_OFF: CardId = 114;
 }
 
 /// The settings cards from the one next to the "now" cards to the farthest.
@@ -38,13 +39,14 @@ pub mod ids {
 /// The wink card ([`ids::WINK`]) is not shown: the Glass glasshub firmware (1.22) never
 /// delivers a wink event, so the toggle did nothing the owner could see. `glassd` keeps the
 /// setting; the card comes back here once the MCU wink threshold is tuned.
-pub const ORDER: [CardId; 11] = [
+pub const ORDER: [CardId; 12] = [
     ids::WIFI,
     ids::BLUETOOTH,
     ids::VOLUME,
     ids::SCREEN_TIMEOUT,
     ids::HEAD_WAKE,
     ids::ON_HEAD,
+    ids::POWER_OFF,
     ids::NUDGE,
     ids::TIME_FORMAT,
     ids::TIMEZONE,
@@ -56,6 +58,9 @@ pub const ORDER: [CardId; 11] = [
 pub const TIMEOUT_CHOICES_MS: [u32; 8] = [
     5_000, 10_000, 15_000, 30_000, 60_000, 120_000, 300_000, 600_000,
 ];
+
+/// Minutes off the head before powering off (glassd allows 0, meaning never, to 12 hours).
+pub const POWER_OFF_CHOICES_MIN: [u32; 5] = [10, 30, 60, 120, 0];
 
 /// One step of the wake-angle sub-screen, in degrees.
 pub const WAKE_ANGLE_STEP: f32 = 5.0;
@@ -116,6 +121,14 @@ pub fn timeout_text(locale: Locale, ms: u32) -> String {
         format!("{s:.1}")
     };
     fmt1(Msg::SecondsN.get(locale), &n)
+}
+
+/// "30 minutes", or "Never" for 0 (in `locale`).
+pub fn power_off_text(locale: Locale, minutes: u32) -> String {
+    match minutes {
+        0 => Msg::Never.get(locale).to_string(),
+        m => timeout_text(locale, m.saturating_mul(60_000)),
+    }
 }
 
 /// "30°" (whole degrees; glassd may store a fraction). Language-neutral.
@@ -183,6 +196,12 @@ pub fn card_content(id: CardId, v: &SettingsView) -> Option<CardContent> {
             Msg::SettingsOnHead,
             setting_text(v, |s| {
                 s.on_head_detection_enabled.map(|b| on_off(loc, b).into())
+            }),
+        ),
+        ids::POWER_OFF => entry(
+            Msg::SettingsPowerOff,
+            setting_text(v, |s| {
+                s.off_head_power_off_min.map(|m| power_off_text(loc, m))
             }),
         ),
         ids::NUDGE => entry(
@@ -259,8 +278,18 @@ pub fn timeline(v: &SettingsView) -> Timeline {
 pub fn cards(v: &SettingsView) -> Vec<Card> {
     ORDER
         .iter()
+        .filter(|&&id| applies(id, v))
         .map(|&id| Card::new(id, card_content(id, v).expect("a settings id")))
         .collect()
+}
+
+/// Whether the setting does anything here. Only a glassd with the `power` capability powers
+/// off (not on Android, where the framework owns power), so a glassd without it gets no card.
+fn applies(id: CardId, v: &SettingsView) -> bool {
+    id != ids::POWER_OFF
+        || v.service
+            .as_ref()
+            .map_or(true, |s| s.capabilities.iter().any(|c| c == "power"))
 }
 
 fn patch(f: impl FnOnce(&mut Settings)) -> Choice {
@@ -289,6 +318,7 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
             | ids::HEAD_WAKE
             | ids::WINK
             | ids::ON_HEAD
+            | ids::POWER_OFF
             | ids::NUDGE
             | ids::TIME_FORMAT
             | ids::TIMEZONE
@@ -349,6 +379,35 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
         ids::ON_HEAD => vec![toggle_item(loc, s.on_head_detection_enabled, |p, b| {
             p.on_head_detection_enabled = Some(b)
         })],
+        ids::POWER_OFF => {
+            // As for the screen timeout, with "never" kept last.
+            let mut choices = POWER_OFF_CHOICES_MIN.to_vec();
+            if let Some(m) = s.off_head_power_off_min {
+                if !choices.contains(&m) {
+                    choices.push(m);
+                    choices.sort_unstable_by_key(|&c| if c == 0 { u32::MAX } else { c });
+                }
+            }
+            let items: Vec<MenuItem<Choice>> = choices
+                .iter()
+                .map(|&m| {
+                    let it = MenuItem::new(
+                        patch(|p| p.off_head_power_off_min = Some(m)),
+                        power_off_text(loc, m),
+                    );
+                    if s.off_head_power_off_min == Some(m) {
+                        it.with_detail(Msg::Current.get(loc))
+                    } else {
+                        it
+                    }
+                })
+                .collect();
+            let first = s
+                .off_head_power_off_min
+                .and_then(|m| choices.iter().position(|&c| c == m))
+                .unwrap_or(1);
+            return Some((items, first));
+        }
         // The toggle explains the gesture: the card title alone ("nudge") was not clear.
         ids::NUDGE => vec![toggle_item(loc, s.nudge_sleep_enabled, |p, b| {
             p.nudge_sleep_enabled = Some(b)
@@ -647,6 +706,7 @@ mod tests {
             ids::HEAD_WAKE,
             ids::WINK,
             ids::ON_HEAD,
+            ids::POWER_OFF,
             ids::NUDGE,
         ] {
             let card = Card::new(id, card_content(id, &v).unwrap());
@@ -672,6 +732,65 @@ mod tests {
         assert_eq!(items[first].label, "20 seconds");
         assert_eq!(items[first].detail.as_deref(), Some("Current"));
         assert_eq!(items.iter().filter(|i| i.detail.is_some()).count(), 1);
+    }
+
+    #[test]
+    fn the_power_off_menu_offers_the_choices_and_never_last() {
+        let v = view(Some(settings_defaults()));
+        let card = Card::new(ids::POWER_OFF, card_content(ids::POWER_OFF, &v).unwrap());
+        assert_eq!(subtitle(card.content.clone()), "30 minutes");
+        let (items, first) = menu_for(&card, &v).unwrap();
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            [
+                "10 minutes",
+                "30 minutes",
+                "60 minutes",
+                "120 minutes",
+                "Never"
+            ]
+        );
+        assert_eq!(items[first].label, "30 minutes");
+        assert_eq!(items[first].detail.as_deref(), Some("Current"));
+        assert_eq!(
+            items[4].value,
+            Choice::Patch(Settings {
+                off_head_power_off_min: Some(0),
+                ..Default::default()
+            })
+        );
+
+        // A value set by another client is offered in order, before "never".
+        let mut s = settings_defaults();
+        s.off_head_power_off_min = Some(45);
+        let v = view(Some(s));
+        let (items, first) = menu_for(&card, &v).unwrap();
+        assert_eq!(first, 2);
+        assert_eq!(items[first].label, "45 minutes");
+        assert_eq!(items.last().unwrap().label, "Never");
+
+        s.off_head_power_off_min = Some(0);
+        let v = view_in(Some(s), Locale::It);
+        assert_eq!(subtitle(card_content(ids::POWER_OFF, &v).unwrap()), "Mai");
+        let (items, first) = menu_for(&card, &v).unwrap();
+        assert_eq!(items[first].label, "Mai");
+        assert_eq!(items[first].detail.as_deref(), Some("Attuale"));
+    }
+
+    #[test]
+    fn the_power_off_card_needs_a_glassd_that_powers_off() {
+        let shown = |capabilities: Option<&[&str]>| {
+            let mut v = view(Some(settings_defaults()));
+            v.service = capabilities.map(|c| ServiceInfo {
+                version: "x".into(),
+                capabilities: c.iter().map(|s| s.to_string()).collect(),
+            });
+            cards(&v).iter().any(|c| c.id == ids::POWER_OFF)
+        };
+        assert!(shown(Some(&["screen", "power"])));
+        assert!(!shown(Some(&["screen"])), "Android: no power capability");
+        assert!(shown(None), "without glassd the change is only local");
     }
 
     #[test]
