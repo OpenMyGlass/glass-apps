@@ -285,7 +285,7 @@ pub fn cards(v: &SettingsView) -> Vec<Card> {
 
 /// Whether the setting does anything here. Only a glassd with the `power` capability powers
 /// off (not on Android, where the framework owns power), so a glassd without it gets no card.
-fn applies(id: CardId, v: &SettingsView) -> bool {
+pub fn applies(id: CardId, v: &SettingsView) -> bool {
     id != ids::POWER_OFF
         || v.service
             .as_ref()

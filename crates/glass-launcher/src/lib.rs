@@ -554,6 +554,12 @@ impl App {
     /// glassd's version and capabilities, for the device card.
     pub fn set_service(&mut self, info: Option<ServiceInfo>) {
         self.service = info;
+        // The card was offered before glassd said what it can do.
+        if self.main_timeline.is_some()
+            && !settings::applies(settings::ids::POWER_OFF, &self.settings_view())
+        {
+            self.timeline.remove_card(settings::ids::POWER_OFF);
+        }
         self.refresh_settings_cards();
         self.refresh_note_card();
     }
