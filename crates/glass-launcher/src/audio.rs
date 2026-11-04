@@ -939,6 +939,10 @@ pub struct AlsaFeedback {
 /// ~88 ms buffer) for snappy cues. Confirmed working on hardware once primed.
 const UI_PERIOD: u32 = 1056;
 const UI_PERIODS: u32 = 4;
+/// How long the UI player keeps the PCM open after a cue. An open PCM keeps the audio engine and
+/// McPDM clocks on, which keeps the system out of deep sleep; the short wait saves reopening it
+/// on every tick of a fast scroll.
+const PCM_IDLE: std::time::Duration = std::time::Duration::from_secs(2);
 
 impl AlsaFeedback {
     /// Opens the mixer, applies the cold-start priming set ([`prime_controls`], the "V5"
@@ -1015,7 +1019,21 @@ impl AlsaFeedback {
                 // The mixer stays open for the session: the volume is set from here.
                 let mut applied = u32::MAX;
                 let mut last = Instant::now() - Duration::from_secs(1);
-                while let Ok(mut snd) = rx.recv() {
+                let mut pcm = Some(pcm);
+                loop {
+                    let received = if pcm.is_some() {
+                        rx.recv_timeout(PCM_IDLE)
+                    } else {
+                        rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                    };
+                    let mut snd = match received {
+                        Ok(snd) => snd,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            pcm = None;
+                            continue;
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    };
                     // Coalesce a backlog (fast swipes) down to the latest sound.
                     while let Ok(newer) = rx.try_recv() {
                         snd = newer;
@@ -1039,7 +1057,12 @@ impl AlsaFeedback {
                         Snd::Cue(cue) => clips.for_cue(cue),
                         Snd::Chime => &chime,
                     };
-                    let _ = pcm.play_explicit(buf);
+                    if pcm.is_none() {
+                        pcm = Pcm::open_params(UI_PERIOD, UI_PERIODS, 0).ok();
+                    }
+                    if let Some(p) = &pcm {
+                        let _ = p.play_explicit(buf);
+                    }
                 }
             })
             .ok();
