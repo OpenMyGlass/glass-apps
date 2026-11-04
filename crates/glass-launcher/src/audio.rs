@@ -948,8 +948,9 @@ impl AlsaFeedback {
     /// Opens the mixer, applies the cold-start priming set ([`prime_controls`], the "V5"
     /// recipe), opens the PCM (1056×4), and **primes the codec once** by playing a short
     /// startup tone with an explicit START (the step that makes the bone-conduction path
-    /// clock from cold). Then starts the audio thread, which plays each cue on the primed
-    /// path. Returns the player and a human-readable report (for the log).
+    /// clock from cold). Then starts the audio thread, which plays each cue, closing the PCM
+    /// after [`PCM_IDLE`] and reopening it for the next cue without priming again. Returns the
+    /// player and a human-readable report (for the log).
     pub fn start() -> (Option<AlsaFeedback>, Vec<String>) {
         let mut report = Vec::new();
         let mixer = match Mixer::open() {
