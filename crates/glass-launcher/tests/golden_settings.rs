@@ -82,6 +82,15 @@ fn scenes() -> Vec<(String, Card, Tolerance)> {
             (format!("settings-{name}"), c, Tolerance::Max(2))
         })
         .collect();
+    // Only a glassd with the `power` capability gets this card.
+    out.push((
+        "settings-power-off".into(),
+        Card::new(
+            ids::POWER_OFF,
+            settings::card_content(ids::POWER_OFF, &v).unwrap(),
+        ),
+        Tolerance::Max(2),
+    ));
     // The head-wake menu's second item and the timeout menu's current choice.
     let head = settings::cards(&v)
         .into_iter()

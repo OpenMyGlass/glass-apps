@@ -2,7 +2,7 @@
 
 use glass_gfx::Color;
 use glass_launcher::platform::{MockPlatform, RadioStatus};
-use glass_launcher::settings::ids;
+use glass_launcher::settings::{ids, ServiceInfo};
 use glass_launcher::{demo, App, OverlayKind};
 use glass_ui::timeline::MAX_RESIDENT_LAYERS;
 use glass_ui::{CardContent, CardId, GestureKind, InputEvent, RenderContext};
@@ -148,6 +148,43 @@ fn swipe_down_leaves_a_menu_or_the_angle_screen_unchanged() {
         ids::HEAD_WAKE,
         "the timeline is where it was"
     );
+}
+
+#[test]
+fn a_glassd_that_cannot_power_off_removes_the_card_from_open_settings() {
+    let mut a = app();
+    goto(&mut a, ids::POWER_OFF);
+    assert!(a.timeline().cards().iter().any(|c| c.id == ids::POWER_OFF));
+    a.set_service(Some(ServiceInfo {
+        version: "test".into(),
+        capabilities: vec![],
+    }));
+    assert!(!a.timeline().cards().iter().any(|c| c.id == ids::POWER_OFF));
+}
+
+#[test]
+fn power_off_menu_starts_at_the_current_choice_and_offers_never() {
+    let mut a = app();
+    goto(&mut a, ids::POWER_OFF);
+    assert_eq!(subtitle(&a, ids::POWER_OFF), "30 minutes");
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 1 }));
+    assert_eq!(
+        a.menu_labels(),
+        [
+            "10 minutes",
+            "30 minutes",
+            "60 minutes",
+            "120 minutes",
+            "Never"
+        ]
+    );
+    for _ in 0..3 {
+        g(&mut a, GestureKind::SwipeForward);
+    }
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.settings().unwrap().off_head_power_off_min, Some(0));
+    assert_eq!(subtitle(&a, ids::POWER_OFF), "Never");
 }
 
 #[test]
