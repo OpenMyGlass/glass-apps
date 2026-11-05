@@ -547,6 +547,10 @@ impl Compositor for GlesCompositor {
         if self.is_window() {
             // The frame is in the window's back buffer: show it, no read-back.
             self.current()?;
+            // The timeline paints the neighbouring cards after composing, so a layer's FBO
+            // can still be bound here. Swapping with it bound makes the SGX540 add that
+            // layer's last draw to the frame on screen.
+            self.bind_screen()?;
             return self.egl.swap_buffers().map_err(gl_err);
         }
         let frame = self.read_frame()?;
