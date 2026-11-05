@@ -7,3 +7,25 @@ Measured on the Glass (2026-11-05):
 - `framebuffer_device_t` has a `flags` field before `width`, and reports `numFramebuffers` 0. The third `alloc` fails with `-ENOMEM`, so the window has 2 buffers. Stride is 1024 pixels: OMAPLFB keeps its own TILER buffers.
 - XE24's `libEGL` calls `setSwapInterval` at window offset 68 and `perform` at 88, one word later than the AOSP 4.4 header gives. `glass_xe24_pad` matches that.
 - While the window is in use, DISPC scans TILER (`DISPC_OVL_BA0(GFX)` is `0x10000000` or `0x10001000`, pitch 32768), not `/dev/fb0`. The CPU reads the same buffer at BA0 + `0x60000000` through `/dev/mem`. After the process exits BA0 is `0x9f800000` again.
+
+## Running it on Model B
+
+`glass-launcher-supervisor.sh` starts the launcher: on the GPU when that can work, on the software renderer otherwise. Its header gives the rules; `test_supervisor.sh` checks them on a host with fake launchers (it does not cover a launcher that cannot be killed).
+
+The stock files come from the owner's own Glass and stay local, never in git or in a published image:
+
+```
+tools/extract-gpu-blobs.sh adb:SERIAL OUT_DIR    # or the factory system.img, or a copy of /system
+```
+
+It verifies each file against `gpu-blobs.sha256` (hashes only) and refuses an `OUT_DIR` inside a git work tree. Copy `OUT_DIR` over the image root, and add these, ours:
+
+| File | Path on the Glass |
+|---|---|
+| The launcher built for bionic with `gles,fb,sound` | `/usr/libexec/glass-launcher-gles` |
+| The static musl launcher | `/usr/bin/glass-launcher` |
+| `libglass_fbwin.so` | `/usr/lib/glass/libglass_fbwin.so` |
+| `pvrsrvkm_sgx540_120.ko`, from the same build as the kernel | `/lib/modules/` |
+| `glass-launcher-supervisor.sh` | anywhere; the init runs it instead of the launcher |
+
+Measured on the Glass (2026-11-05, real `glassd`, cable in, RAM boot): no blobs, or the `no-gpu` marker, go to software at once. Three kills in a row in the first seconds write the marker. A launcher stopped with `SIGSTOP` is replaced by the software one in 24 s. After a GPU run the software launcher scans out from `/dev/fb0`. Idle GPU launcher: 0 CPU ticks in 30 s with 6 heartbeats. Not run yet: deep sleep with the heartbeat, and the reboot when a launcher cannot be killed.

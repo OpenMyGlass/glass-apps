@@ -12,6 +12,7 @@
 mod android_compat;
 
 use glass_gfx::HeadlessDisplay;
+use glass_launcher::heartbeat::{self, Heartbeat};
 use glass_launcher::renderer::{self, compositor_for, Renderer};
 use glass_launcher::script::{parse, Runner};
 use glass_launcher::{clock, demo, glassd, App};
@@ -50,6 +51,8 @@ usage:
                   draw with the GPU straight into a framebuffer window from the provider
                   library LIB (default libglass_fbwin.so), no read-back. Model B's bionic
                   build; implies --renderer gles. With --glassd.
+  --heartbeat F   write a counter to the file F from the main loop, at least every 5 s while
+                  the system is awake, for the supervisor of the GPU launcher. With --glassd.
   --renderer R    gles (GPU, the default) or software (debugging aid). On the device a
                   failing EGL is an error; on a host without EGL the default is software
   --setup         start with the first-boot setup flow (mock platform: Bluetooth is
@@ -85,6 +88,8 @@ struct Args {
     fb: Option<PathBuf>,
     /// `--display fbwin [LIB]`: the GPU draws straight into a framebuffer window from LIB.
     fbwin: Option<PathBuf>,
+    /// `--heartbeat FILE`: proof of life for the supervisor.
+    heartbeat: Option<PathBuf>,
     setup: bool,
     /// `--no-sound`: do not install the UI audio feedback player (sound builds only).
     no_sound: bool,
@@ -131,6 +136,10 @@ fn parse_args() -> Result<Args, String> {
         if arg == "--glassd" {
             let sock = it.next_if(|v| !v.starts_with("--")).map(PathBuf::from);
             a.glassd = Some(sock);
+            continue;
+        }
+        if arg == "--heartbeat" {
+            a.heartbeat = Some(PathBuf::from(it.next().ok_or("--heartbeat needs a file")?));
             continue;
         }
         if arg == "--display" {
@@ -199,6 +208,9 @@ fn parse_args() -> Result<Args, String> {
     }
     if a.fb.is_some() && a.glassd.is_none() && !a.self_test && !a.audio_sweep {
         return Err("--display fb needs --glassd (or --self-test / --audio-sweep)".into());
+    }
+    if a.heartbeat.is_some() && (a.glassd.is_none() || a.window) {
+        return Err("--heartbeat needs --glassd and excludes --window".into());
     }
     if a.fbwin.is_some() && (a.glassd.is_none() || a.fb.is_some() || a.window || a.out.is_some()) {
         return Err("--display fbwin needs --glassd and excludes --out, --window and fb".into());
@@ -1024,6 +1036,14 @@ fn run_glassd(args: &Args) -> Result<(), String> {
         fps: args.fps.unwrap_or(60),
         ..Default::default()
     };
+    let mut beat = args.heartbeat.clone().map(Heartbeat::new);
+    let max_wait = beat.as_ref().map(|_| heartbeat::PERIOD);
+    let mut alive = move || {
+        if let Some(b) = &mut beat {
+            b.beat();
+        }
+        true
+    };
     if args.window {
         return glassd_window(&path, &mut app, clock, options);
     }
@@ -1033,14 +1053,14 @@ fn run_glassd(args: &Args) -> Result<(), String> {
             let dev = args.fb.clone().unwrap();
             let mut display =
                 glass_gfx::FramebufferDisplay::open(&dev).map_err(|e| e.to_string())?;
-            options.max_wait = None;
+            options.max_wait = max_wait;
             return glassd::run(
                 &path,
                 &mut app,
                 &mut display,
                 || clock(0.0),
                 options,
-                |_: &mut glass_gfx::FramebufferDisplay| true,
+                |_: &mut glass_gfx::FramebufferDisplay| alive(),
                 log,
             )
             .map_err(|e| e.to_string());
@@ -1056,14 +1076,14 @@ fn run_glassd(args: &Args) -> Result<(), String> {
     if let Some(out) = &args.out {
         display = display.with_output_dir(out).map_err(|e| e.to_string())?;
     }
-    options.max_wait = None;
+    options.max_wait = max_wait;
     glassd::run(
         &path,
         &mut app,
         &mut display,
         || clock(0.0),
         options,
-        |_: &mut HeadlessDisplay| true,
+        |_: &mut HeadlessDisplay| alive(),
         log,
     )
     .map_err(|e| e.to_string())

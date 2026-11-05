@@ -26,6 +26,7 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --locked --features glass-launcher/window -- -D warnings
       - run: cargo test --workspace --locked
+      - run: sh native/fbwin/test_supervisor.sh
       - name: Golden images that did not match
         if: failure()
         uses: actions/upload-artifact@v4

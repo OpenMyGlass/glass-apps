@@ -13,6 +13,7 @@ pub mod dictation;
 pub mod feedback;
 pub mod frame_stats;
 pub mod glassd;
+pub mod heartbeat;
 pub mod panel;
 pub mod script;
 pub mod selftest;
