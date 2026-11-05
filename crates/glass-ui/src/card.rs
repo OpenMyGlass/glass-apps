@@ -245,14 +245,13 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
                 style::TEXT,
             );
             if let Some(p) = ctx.battery_percent {
-                centered_line(
-                    f,
-                    Weight::Light,
-                    style::FOOTER_SIZE,
-                    &format!("{p}%"),
-                    style::MARGIN,
-                    style::SECONDARY,
-                );
+                // Top left, as far from both edges as the footer's text is from the left.
+                let font = fonts::font(Weight::Light);
+                let size = style::FOOTER_SIZE;
+                let baseline = style::MARGIN + font.metrics('0', size).height as f32 / 2.0;
+                let line = format!("{p}%");
+                let (run, _) = text::layout_line(font, size, style::MARGIN, baseline, &line);
+                f.draw_glyph_run(&run, style::SECONDARY);
             }
         }
         CardContent::Text {

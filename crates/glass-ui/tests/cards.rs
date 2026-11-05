@@ -229,15 +229,21 @@ fn a_very_long_text_is_cut_but_stays_inside_the_card() {
 }
 
 #[test]
-fn the_battery_is_shown_small_above_the_clock() {
-    let top_row_lit = |battery_percent| {
+fn the_battery_is_shown_small_at_the_top_left() {
+    let lit = |battery_percent, xs: std::ops::Range<u32>| {
         let ctx = RenderContext {
             battery_percent,
             ..RenderContext::default()
         };
         let f = render_card(&Card::new(10, CardContent::Home), &ctx, 640, 360);
-        (0..640).any(|x| (0..70).any(|y| f.pixel(x, y) != Color::BLACK))
+        xs.clone()
+            .any(|x| (0..70).any(|y| f.pixel(x, y) != Color::BLACK))
     };
-    assert!(top_row_lit(Some(87)));
-    assert!(!top_row_lit(None));
+    assert!(lit(Some(100), 40..160), "at the left margin");
+    assert!(!lit(Some(100), 0..40), "not past the margin");
+    assert!(
+        !lit(Some(100), 160..640),
+        "nothing in the middle or on the right"
+    );
+    assert!(!lit(None, 0..640), "nothing without a reading");
 }
