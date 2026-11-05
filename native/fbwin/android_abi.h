@@ -41,6 +41,9 @@ struct glass_ANativeWindow {
     float xdpi;
     float ydpi;
     intptr_t oem[4];
+    /* XE24's libEGL calls setSwapInterval at offset 68 and perform at 88: one word more than
+     * the AOSP 4.4 header gives (measured, 2026-11-05). */
+    intptr_t glass_xe24_pad;
     int (*setSwapInterval)(struct glass_ANativeWindow *, int);
     int (*dequeueBuffer_DEPRECATED)(struct glass_ANativeWindow *, struct ANativeWindowBuffer **);
     int (*lockBuffer_DEPRECATED)(struct glass_ANativeWindow *, struct ANativeWindowBuffer *);

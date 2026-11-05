@@ -192,6 +192,37 @@ static void fb_report(const char *tag)
     close(fd);
 }
 
+/* Reads the scanned-out buffer through /dev/mem: base and pitch as DISPC reports them. */
+static int scan(unsigned long ba, unsigned long pitch, const char *dump)
+{
+    int fd = open("/dev/mem", O_RDONLY | O_SYNC);
+    size_t len = pitch * H;
+    unsigned long page = ba & ~0xfffUL;
+    unsigned char *m;
+    if (fd < 0) {
+        perror("/dev/mem");
+        return 1;
+    }
+    m = mmap(NULL, len + (ba - page), PROT_READ, MAP_SHARED, fd, page);
+    if (m == MAP_FAILED) {
+        perror("mmap /dev/mem");
+        return 1;
+    }
+    m += ba - page;
+#define S(xx, yy) *(unsigned *)(m + (yy) * pitch + (xx) * 4)
+    printf("scan ba=%08lx pitch=%lu TL=%08x TR=%08x BL=%08x BR=%08x mid=%08x\n", ba, pitch, S(160, 90),
+           S(480, 90), S(160, 270), S(480, 270), S(320, 180));
+    if (dump) {
+        FILE *f = fopen(dump, "w");
+        int y;
+        for (y = 0; f && y < H; y++)
+            fwrite(m + y * pitch, 4, W, f);
+        if (f)
+            fclose(f);
+    }
+    return 0;
+}
+
 static int cmp(const void *a, const void *b)
 {
     double d = *(const double *)a - *(const double *)b;
@@ -333,6 +364,9 @@ int main(int argc, char **argv)
         return run(0, 1, -1);
     if (argc >= 3 && !strcmp(argv[1], "window"))
         return run(1, atoi(argv[2]), argc > 3 ? atoi(argv[3]) : -1);
+    if (argc >= 4 && !strcmp(argv[1], "scan"))
+        return scan(strtoul(argv[2], NULL, 16), strtoul(argv[3], NULL, 10), argc > 4 ? argv[4] : NULL);
+    printf("usage: gpu_probe scan BA_HEX PITCH [FILE]\n");
     printf("usage: gpu_probe pbuffer | window N [interval]\n");
     return 2;
 }
