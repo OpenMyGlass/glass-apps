@@ -72,7 +72,7 @@ impl EglContext {
     /// surfaceless platform and context and uses the default display with a pbuffer, the
     /// set-up of EGL 1.4 libraries (tests that path on Mesa).
     pub fn offscreen(force_pbuffer: bool) -> Result<EglContext, String> {
-        Self::create(force_pbuffer, false)
+        Self::create(force_pbuffer, false, None)
     }
 
     /// A GLES2 context for rendering into a native window (Android's `ANativeWindow`):
@@ -82,10 +82,21 @@ impl EglContext {
     /// with [`EglContext::attach_window`]. Call [`EglContext::native_visual_id`] first to
     /// set the window's buffer format to the config's.
     pub fn for_window() -> Result<EglContext, String> {
-        Self::create(true, true)
+        Self::create(true, true, None)
     }
 
-    fn create(force_pbuffer: bool, for_window: bool) -> Result<EglContext, String> {
+    /// [`EglContext::for_window`] for a window whose buffer format is fixed, like a
+    /// framebuffer's: the config must have `EGL_NATIVE_VISUAL_ID == format`. A mismatch would
+    /// fail silently when the buffer is posted, so no other config is taken.
+    pub fn for_window_with_format(format: i32) -> Result<EglContext, String> {
+        Self::create(true, true, Some(format))
+    }
+
+    fn create(
+        force_pbuffer: bool,
+        for_window: bool,
+        format: Option<i32>,
+    ) -> Result<EglContext, String> {
         // SAFETY: the library is the system's EGL; its symbols follow the EGL API.
         let egl = unsafe {
             egl::DynamicInstance::<egl::EGL1_4>::load_required_from_filename(EGL_LIBRARY)
@@ -142,8 +153,18 @@ impl EglContext {
             ]
         };
         let choose = |surface_type| {
-            egl.choose_first_config(display, &attribs(surface_type))
-                .map_err(|e| egl_err("eglChooseConfig", e))
+            let Some(format) = format else {
+                return egl
+                    .choose_first_config(display, &attribs(surface_type))
+                    .map_err(|e| egl_err("eglChooseConfig", e));
+            };
+            let mut configs = Vec::with_capacity(64);
+            egl.choose_config(display, &attribs(surface_type), &mut configs)
+                .map_err(|e| egl_err("eglChooseConfig", e))?;
+            Ok(configs.into_iter().find(|&c| {
+                egl.get_config_attrib(display, c, egl::NATIVE_VISUAL_ID)
+                    .is_ok_and(|v| v == format)
+            }))
         };
         // (config, whether it has pbuffers)
         let (config, pbuffers) = if for_window {

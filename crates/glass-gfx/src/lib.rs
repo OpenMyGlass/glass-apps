@@ -14,7 +14,7 @@ mod color;
 mod display;
 pub mod fonts;
 mod frame;
-#[cfg(all(feature = "fb", target_os = "linux"))]
+#[cfg(all(feature = "fb", any(target_os = "linux", target_os = "android")))]
 pub mod framebuffer;
 pub mod golden;
 mod render;
@@ -27,7 +27,7 @@ pub use display::{Display, DisplayError, HeadlessDisplay};
 pub use fontdue::Font;
 pub use fonts::Weight;
 pub use frame::{Frame, ImageError, Rect};
-#[cfg(all(feature = "fb", target_os = "linux"))]
+#[cfg(all(feature = "fb", any(target_os = "linux", target_os = "android")))]
 pub use framebuffer::FramebufferDisplay;
 pub use render::{
     Compositor, GfxError, LayerId, Painter, Placement, SkiaPainter, SoftwareCompositor,

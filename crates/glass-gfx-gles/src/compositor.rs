@@ -152,6 +152,24 @@ impl GlesCompositor {
         Self::with_context(egl, width, height, options, true)
     }
 
+    /// [`GlesCompositor::for_window`] for a window whose buffer format is fixed (a
+    /// framebuffer): the EGL config's native visual must be `format`.
+    pub fn for_window_with_format(
+        width: u32,
+        height: u32,
+        options: GlesOptions,
+        format: i32,
+    ) -> Result<GlesCompositor, GfxError> {
+        let egl = EglContext::for_window_with_format(format).map_err(gl_err)?;
+        if !egl.is_current() {
+            return Err(GfxError::Renderer(
+                "the EGL window config has no pbuffers: cannot keep the context without a window"
+                    .into(),
+            ));
+        }
+        Self::with_context(egl, width, height, options, true)
+    }
+
     fn with_context(
         egl: EglContext,
         width: u32,

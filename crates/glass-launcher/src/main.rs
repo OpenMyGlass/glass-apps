@@ -8,8 +8,11 @@
 //!                [--renderer R]
 //! ```
 
+#[cfg(target_os = "android")]
+mod android_compat;
+
 use glass_gfx::HeadlessDisplay;
-use glass_launcher::renderer::{compositor_for, Renderer};
+use glass_launcher::renderer::{self, compositor_for, Renderer};
 use glass_launcher::script::{parse, Runner};
 use glass_launcher::{clock, demo, glassd, App};
 use glass_ui::RenderContext;
@@ -43,6 +46,10 @@ usage:
                   present frames to the Linux framebuffer DEV (default /dev/fb0): mmap,
                   dirty-rectangle updates, RGBA->panel-format conversion read from the fb.
                   Needs the `fb` feature (the on-device software build). With --glassd.
+  --display fbwin [LIB]
+                  draw with the GPU straight into a framebuffer window from the provider
+                  library LIB (default libglass_fbwin.so), no read-back. Model B's bionic
+                  build; implies --renderer gles. With --glassd.
   --renderer R    gles (GPU, the default) or software (debugging aid). On the device a
                   failing EGL is an error; on a host without EGL the default is software
   --setup         start with the first-boot setup flow (mock platform: Bluetooth is
@@ -76,6 +83,8 @@ struct Args {
     glassd: Option<Option<PathBuf>>,
     /// `--display fb [DEV]`: the framebuffer device to present to.
     fb: Option<PathBuf>,
+    /// `--display fbwin [LIB]`: the GPU draws straight into a framebuffer window from LIB.
+    fbwin: Option<PathBuf>,
     setup: bool,
     /// `--no-sound`: do not install the UI audio feedback player (sound builds only).
     no_sound: bool,
@@ -125,9 +134,17 @@ fn parse_args() -> Result<Args, String> {
             continue;
         }
         if arg == "--display" {
-            let kind = it.next().ok_or("--display needs a kind (fb)")?;
+            let kind = it.next().ok_or("--display needs a kind (fb or fbwin)")?;
+            if kind == "fbwin" {
+                let lib = it
+                    .next_if(|v| !v.starts_with("--"))
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(renderer::FBWIN_LIBRARY));
+                a.fbwin = Some(lib);
+                continue;
+            }
             if kind != "fb" {
-                return Err(format!("--display: unknown kind {kind} (only fb)"));
+                return Err(format!("--display: unknown kind {kind} (fb or fbwin)"));
             }
             let dev = it
                 .next_if(|v| !v.starts_with("--"))
@@ -182,6 +199,12 @@ fn parse_args() -> Result<Args, String> {
     }
     if a.fb.is_some() && a.glassd.is_none() && !a.self_test && !a.audio_sweep {
         return Err("--display fb needs --glassd (or --self-test / --audio-sweep)".into());
+    }
+    if a.fbwin.is_some() && (a.glassd.is_none() || a.fb.is_some() || a.window || a.out.is_some()) {
+        return Err("--display fbwin needs --glassd and excludes --out, --window and fb".into());
+    }
+    if a.fbwin.is_some() && a.renderer == Some(Renderer::Software) {
+        return Err("--display fbwin is the GPU renderer: it excludes --renderer software".into());
     }
     if a.fb.is_some() && (a.window || a.out.is_some()) {
         return Err("--display fb excludes --out and --window".into());
@@ -313,7 +336,7 @@ fn run_window(_: &Args) -> Result<(), String> {
 /// unless `--no-sound` was given. A no-op in builds without the `sound` feature. Logs
 /// what it did to stderr (the init captures it as `OMGB-launcher:` / `OMGB-AUDIO:`).
 fn install_feedback(app: &mut App, args: &Args) {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         if args.no_sound {
             eprintln!("glass-launcher: sound disabled (--no-sound)");
@@ -328,7 +351,7 @@ fn install_feedback(app: &mut App, args: &Args) {
             None => eprintln!("OMGB-AUDIO: UI sound unavailable; continuing silently"),
         }
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         // Reference the sound-only field so non-sound builds have no "never read" warning.
         let _ = (app, args.no_sound);
@@ -337,7 +360,7 @@ fn install_feedback(app: &mut App, args: &Args) {
 
 /// `--audio-selftest`: set the EP mixer route and play a startup tone, logging each step.
 fn run_audio_selftest() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         let (ok, log) = glass_launcher::audio::selftest();
         for line in &log {
@@ -349,7 +372,7 @@ fn run_audio_selftest() -> Result<(), String> {
             Err("audio self-test failed (see OMGB-AUDIO lines)".into())
         }
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support: rebuild with --features sound on Linux".into())
     }
@@ -358,7 +381,7 @@ fn run_audio_selftest() -> Result<(), String> {
 /// `--audio-diag`: verbose on-screen audio diagnostic. Emits each line to stderr with the
 /// `OMGB-AUDIO:` prefix (the diag image's init tees stderr to /dev/console and /dev/kmsg).
 fn run_audio_diag() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::diag(&mut |line: &str| {
@@ -368,7 +391,7 @@ fn run_audio_diag() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support: rebuild with --features sound on Linux".into())
     }
@@ -376,7 +399,7 @@ fn run_audio_diag() -> Result<(), String> {
 
 /// `--audio-diag2`: the back-end bring-up experiment (several variants).
 fn run_audio_diag2() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::diag2(&mut |line: &str| {
@@ -386,7 +409,7 @@ fn run_audio_diag2() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support: rebuild with --features sound on Linux".into())
     }
@@ -394,7 +417,7 @@ fn run_audio_diag2() -> Result<(), String> {
 
 /// `--audio-analog`: TWL6040 earphone-path variants with register + DAPM dumps.
 fn run_audio_analog() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::analog_diag(&mut |line: &str| {
@@ -404,7 +427,7 @@ fn run_audio_analog() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support: rebuild with --features sound on Linux".into())
     }
@@ -413,7 +436,7 @@ fn run_audio_analog() -> Result<(), String> {
 /// `--audio-devsweep`: play the same EP tone on D0 (ABE), D6 (ABE-LP) and D8 (legacy McPDM)
 /// so the owner can identify which earphone front-end is actually audible.
 fn run_audio_devsweep() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::device_sweep(&mut |line: &str| {
@@ -423,7 +446,7 @@ fn run_audio_devsweep() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support: rebuild with --features sound on Linux".into())
     }
@@ -431,7 +454,7 @@ fn run_audio_devsweep() -> Result<(), String> {
 
 /// `--audio-stock-exact`: byte-for-byte stock pcm_open (MMAP+NOIRQ, period 14784, st 2112).
 fn run_audio_stock_exact() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::stock_exact_diag(&mut |line: &str| {
@@ -441,7 +464,7 @@ fn run_audio_stock_exact() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support".into())
     }
@@ -449,7 +472,7 @@ fn run_audio_stock_exact() -> Result<(), String> {
 
 /// `--audio-writei14784`: EP tone via writei at the stock ABE period (isolates period vs MMAP).
 fn run_audio_writei14784() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::writei_stock_diag(&mut |l: &str| {
@@ -459,7 +482,7 @@ fn run_audio_writei14784() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("no sound support".into())
     }
@@ -467,7 +490,7 @@ fn run_audio_writei14784() -> Result<(), String> {
 
 /// `--audio-dump-state`: dump live regs/ABE/mixer/DAPM without playing (gold-ref capture).
 fn run_audio_dump_state() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::dump_state(&mut |l: &str| {
@@ -477,7 +500,7 @@ fn run_audio_dump_state() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("no sound support".into())
     }
@@ -485,7 +508,7 @@ fn run_audio_dump_state() -> Result<(), String> {
 
 /// `--audio-headset`: play the tone on the headset/USB-earbud output (not bone-conduction).
 fn run_audio_headset() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::headset_diag(&mut |line: &str| {
@@ -495,7 +518,7 @@ fn run_audio_headset() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support".into())
     }
@@ -503,7 +526,7 @@ fn run_audio_headset() -> Result<(), String> {
 
 /// `--audio-mmap`: stock-HAL-matched earphone playback (MMAP + NOIRQ on the ABE D0).
 fn run_audio_mmap() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::mmap_diag(&mut |line: &str| {
@@ -513,7 +536,7 @@ fn run_audio_mmap() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support: rebuild with --features sound on Linux".into())
     }
@@ -521,7 +544,7 @@ fn run_audio_mmap() -> Result<(), String> {
 
 /// `--audio-legacy`: play a tone via the legacy McPDM-direct path (D8), bypassing the ABE.
 fn run_audio_legacy() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         glass_launcher::audio::legacy_play(&mut |line: &str| {
@@ -531,7 +554,7 @@ fn run_audio_legacy() -> Result<(), String> {
         });
         Ok(())
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support: rebuild with --features sound on Linux".into())
     }
@@ -543,7 +566,7 @@ fn run_audio_legacy() -> Result<(), String> {
 /// and the write stalls / fails early (EIO) — so the elapsed time and OK/FAIL are
 /// themselves a McPDM-transfer verdict. The init reads the McPDM/DAPM/PCM state meanwhile.
 fn run_audio_tone_long() -> Result<(), String> {
-    #[cfg(all(feature = "sound", target_os = "linux"))]
+    #[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
     {
         use std::io::Write;
         use std::time::Instant;
@@ -579,7 +602,7 @@ fn run_audio_tone_long() -> Result<(), String> {
             }
         }
     }
-    #[cfg(not(all(feature = "sound", target_os = "linux")))]
+    #[cfg(not(all(feature = "sound", any(target_os = "linux", target_os = "android"))))]
     {
         Err("this build has no sound support: rebuild with --features sound on Linux".into())
     }
@@ -589,7 +612,7 @@ fn run_audio_tone_long() -> Result<(), String> {
 /// Volume — each a clearly-labelled ~2 s tone, rendering the combo on the framebuffer and
 /// logging it, so the owner can tell us which combo is clean + audible. The digital path
 /// is known-good; this finds a non-clipping analog level.
-#[cfg(all(feature = "fb", target_os = "linux"))]
+#[cfg(all(feature = "fb", any(target_os = "linux", target_os = "android")))]
 fn run_audio_sweep(args: &Args) -> Result<(), String> {
     use glass_launcher::panel::Panel;
     use glass_ui::i18n::Locale;
@@ -678,7 +701,7 @@ fn run_audio_sweep(args: &Args) -> Result<(), String> {
     }
 }
 
-#[cfg(not(all(feature = "fb", target_os = "linux")))]
+#[cfg(not(all(feature = "fb", any(target_os = "linux", target_os = "android"))))]
 fn run_audio_sweep(_args: &Args) -> Result<(), String> {
     Err("this build has no framebuffer support: rebuild with --features fb on Linux".into())
 }
@@ -687,7 +710,7 @@ fn run_audio_sweep(_args: &Args) -> Result<(), String> {
 /// framebuffer, drives the [`selftest::SelfTest`] machine from glassd frames, plays the
 /// audio cues, and logs one `OMGB-SELFTEST:` line per step to stderr (the image's init
 /// tees that to /dev/console and /dev/kmsg).
-#[cfg(all(feature = "fb", target_os = "linux"))]
+#[cfg(all(feature = "fb", any(target_os = "linux", target_os = "android")))]
 fn run_self_test(args: &Args) -> Result<(), String> {
     use glass_api::proto::{
         client_frame, screen_request, service_frame, HeadRequest, ScreenRequest, SetSettings,
@@ -978,7 +1001,7 @@ fn run_self_test(args: &Args) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(not(all(feature = "fb", target_os = "linux")))]
+#[cfg(not(all(feature = "fb", any(target_os = "linux", target_os = "android"))))]
 fn run_self_test(_args: &Args) -> Result<(), String> {
     Err("this build has no framebuffer support: rebuild with --features fb on Linux".into())
 }
@@ -987,7 +1010,10 @@ fn run_glassd(args: &Args) -> Result<(), String> {
     let path = glassd::socket(args.glassd.clone().flatten());
     let clock = clock_for(args);
     let ctx = clock(0.0);
-    let compositor = compositor_for(args.renderer)?;
+    let compositor = match &args.fbwin {
+        Some(lib) => renderer::fbwin_compositor(lib)?,
+        None => compositor_for(args.renderer)?,
+    };
     let mut app = App::with_compositor(demo::timeline_at(ctx.now_s), ctx, compositor);
     install_feedback(&mut app, args);
     if args.setup {
@@ -1002,7 +1028,7 @@ fn run_glassd(args: &Args) -> Result<(), String> {
         return glassd_window(&path, &mut app, clock, options);
     }
     if args.fb.is_some() {
-        #[cfg(all(feature = "fb", target_os = "linux"))]
+        #[cfg(all(feature = "fb", any(target_os = "linux", target_os = "android")))]
         {
             let dev = args.fb.clone().unwrap();
             let mut display =
@@ -1019,7 +1045,7 @@ fn run_glassd(args: &Args) -> Result<(), String> {
             )
             .map_err(|e| e.to_string());
         }
-        #[cfg(not(all(feature = "fb", target_os = "linux")))]
+        #[cfg(not(all(feature = "fb", any(target_os = "linux", target_os = "android"))))]
         {
             return Err(
                 "this build has no framebuffer support: rebuild with --features fb on Linux".into(),
