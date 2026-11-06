@@ -98,8 +98,10 @@ pub struct RenderContext {
     pub locale: Locale,
     /// A 24-hour home clock, else 12-hour.
     pub time_24h: bool,
-    /// The battery charge shown small above the home clock, when known.
+    /// The battery charge shown small at the top left of the home card, when known.
     pub battery_percent: Option<u8>,
+    /// The Glass is on external power: a dot follows the battery charge.
+    pub on_power: bool,
 }
 
 impl Default for RenderContext {
@@ -111,6 +113,7 @@ impl Default for RenderContext {
             locale: Locale::DEFAULT,
             time_24h: true,
             battery_percent: None,
+            on_power: false,
         }
     }
 }
@@ -164,6 +167,7 @@ pub fn render_key(card: &Card, ctx: &RenderContext) -> u64 {
             0u8.hash(&mut h);
             clock_text_in(ctx).hash(&mut h);
             ctx.battery_percent.hash(&mut h);
+            ctx.on_power.hash(&mut h);
         }
         CardContent::Text {
             body,
@@ -252,6 +256,13 @@ pub fn paint_card(card: &Card, ctx: &RenderContext, f: &mut dyn Painter) {
                 let line = format!("{p}%");
                 let (run, _) = text::layout_line(font, size, style::MARGIN, baseline, &line);
                 f.draw_glyph_run(&run, style::SECONDARY);
+                if ctx.on_power {
+                    const DOT: f32 = 10.0;
+                    let digit = font.metrics('0', size).height as f32;
+                    let x = style::MARGIN + text::measure(font, size, &line) + 10.0;
+                    let y = baseline - (digit + DOT) / 2.0;
+                    f.fill_rounded_rect(Rect::new(x, y, DOT, DOT), DOT / 2.0, style::TEXT);
+                }
             }
         }
         CardContent::Text {

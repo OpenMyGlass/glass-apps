@@ -25,6 +25,7 @@ fn ctx(locale: Locale) -> RenderContext {
         locale,
         time_24h: true,
         battery_percent: None,
+        on_power: false,
     }
 }
 
