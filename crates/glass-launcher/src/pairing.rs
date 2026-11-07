@@ -28,6 +28,9 @@ pub const KEEP_ON_MS: u32 = WINDOW_MS + 10_000;
 /// the question comes back at the next wake.
 pub const QUESTION_KEEP_ON_MS: u32 = 60_000;
 
+/// glassd's message for an opening refused because its phone link is down (api.md contract).
+pub const LINK_DISABLED: &str = "the companion link is disabled";
+
 /// A pairing request to glassd, to tell its error answers apart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PairRequest {
@@ -57,13 +60,15 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    /// The refusal of `request` with `code` and glassd's `message` (for logs, but the only
-    /// thing that tells the two `ERROR_CODE_UNAVAILABLE` of an opening apart).
+    /// The refusal of `request` with `code` and glassd's `message`. The message is for logs,
+    /// except one: glass-services docs/api.md ("Pairing mode") makes "the companion link is
+    /// disabled" the contract that tells that `ERROR_CODE_UNAVAILABLE` of an opening from the
+    /// "already bonded" one, and glassd pins it with a test (`LINK_DISABLED`).
     pub fn of(request: PairRequest, code: ErrorCode, message: &str) -> Refusal {
         match code {
             ErrorCode::Unsupported => Refusal::Unsupported,
             ErrorCode::Denied => Refusal::Denied,
-            ErrorCode::Unavailable if message.contains("disabled") => Refusal::LinkDisabled,
+            ErrorCode::Unavailable if message.contains(LINK_DISABLED) => Refusal::LinkDisabled,
             ErrorCode::Unavailable if request == PairRequest::Forget => Refusal::NotErased,
             ErrorCode::Unavailable if request == PairRequest::Open => Refusal::AlreadyPaired,
             _ => Refusal::Other,

@@ -7,6 +7,7 @@
 //! [`glass_ui::Action::RequestSleep`], the screen following `ScreenState`), a mock script
 //! ([`script`]) or the host keyboard.
 
+pub mod bond_store;
 pub mod clock;
 pub mod demo;
 pub mod dictation;
@@ -153,8 +154,14 @@ pub struct App {
     /// A phone bonded and the owner has not said whether it is theirs: its name. The question
     /// is shown until answered, again at each wake.
     bond_question: Option<String>,
-    /// The `pairing_until_us` of a mode found open with no pairing screen, already closed.
-    closed_stray_until: u64,
+    /// A `CompanionForgetBond` sent for the question and not yet answered: the question stays
+    /// pending (it is cleared only by a state with `paired` false) but is not shown again.
+    forget_in_flight: bool,
+    /// Show a pending question at the next `CompanionState` (loaded from the disk, or after a
+    /// reconnection that may have lost a forget).
+    ask_at_next_state: bool,
+    /// Where `last_bond` and `bond_question` are kept across restarts ([`bond_store`]).
+    bond_file: Option<PathBuf>,
     /// `CLOCK_MONOTONIC` in µs, the clock of glassd's times (replaceable for tests).
     monotonic: Box<dyn Fn() -> u64>,
 }
@@ -200,7 +207,9 @@ impl App {
             pairing_unsupported: false,
             last_bond: None,
             bond_question: None,
-            closed_stray_until: 0,
+            forget_in_flight: false,
+            ask_at_next_state: false,
+            bond_file: None,
             monotonic: Box::new(clock::monotonic_us),
         };
         app.refresh_settings_cards();
@@ -371,13 +380,15 @@ impl App {
     /// glassd's `CompanionState`: whether a phone is connected through the companion, and
     /// the bond and pairing mode.
     ///
-    /// - Any new bond after the first state seen (in the pairing screen, over a QR dial, or
-    ///   while the launcher was away from glassd) asks the owner whether the phone is theirs.
-    /// - A mode open with no pairing screen to show it (the screen was closed while glassd
-    ///   was out of reach, so the close was lost) is closed.
+    /// Any new bond after the first state seen (in the pairing screen, over a QR dial, while
+    /// the launcher was away from glassd, or while it was not running at all: the last bond
+    /// seen is kept on the disk, see [`App::set_state_dir`]) asks the owner whether the phone
+    /// is theirs. The question stays until answered: "Not my phone" clears it only once glassd
+    /// reports the bond gone.
     pub fn companion_changed(&mut self, c: Companion) {
         let bond = (c.paired, c.paired_name.clone());
         let new_bond = c.paired && self.last_bond.as_ref().is_some_and(|last| *last != bond);
+        let bond_changed = self.last_bond.as_ref() != Some(&bond);
         self.last_bond = Some(bond);
         self.companion = c.clone();
         let out = match self.overlay.as_mut() {
@@ -391,29 +402,61 @@ impl App {
         self.refresh_note_card();
         self.refresh_settings_cards();
         self.pairing_out(out);
-        let shown_open = matches!(&self.overlay, Some(Overlay::Pairing(p, _)) if p.is_open());
-        if c.pairing_until_us > 0 && !shown_open && c.pairing_until_us != self.closed_stray_until {
-            self.log
-                .push("pairing: the mode is open with no screen: closing it".into());
-            self.closed_stray_until = c.pairing_until_us;
-            self.requests.push(Request::PairingWindow {
-                open: false,
-                duration_ms: 0,
-            });
-        }
+        let ask_again = std::mem::take(&mut self.ask_at_next_state);
         if new_bond {
             self.log
                 .push(format!("pairing: bonded with {:?}", c.paired_name));
             self.bond_question = Some(c.paired_name.clone());
+            self.forget_in_flight = false;
             self.ask_bond();
-        } else if !c.paired && self.bond_question.take().is_some() {
-            // Forgotten meanwhile (another client): nothing left to ask.
-            if matches!(
-                self.overlay,
-                Some(Overlay::Menu(_, settings::ids::BOND_QUESTION))
-            ) {
-                self.close_overlay();
+        } else if !c.paired {
+            self.forget_in_flight = false;
+            if self.bond_question.take().is_some() {
+                // Forgotten (by the owner's answer or another client): nothing left to ask.
+                if matches!(
+                    self.overlay,
+                    Some(Overlay::Menu(_, settings::ids::BOND_QUESTION))
+                ) {
+                    self.close_overlay();
+                }
+                self.save_bond();
             }
+        } else if ask_again {
+            self.ask_bond_if_pending();
+        }
+        if bond_changed || new_bond {
+            self.save_bond();
+        }
+    }
+
+    /// Keeps the last bond seen and a pending question in `dir` (next to the setup marker on
+    /// Android), and loads what an earlier run left there: a bond made while the launcher was
+    /// not running, or a question it never got an answer to, is asked at the first state.
+    pub fn set_state_dir(&mut self, dir: PathBuf) {
+        let path = bond_store::path_in(&dir);
+        match bond_store::load(&path) {
+            Ok(st) => {
+                self.last_bond = st.seen.or(self.last_bond.take());
+                if st.question.is_some() {
+                    self.bond_question = st.question;
+                    self.ask_at_next_state = true;
+                }
+            }
+            Err(e) => self.log.push(format!("bond: {}: {e}", path.display())),
+        }
+        self.bond_file = Some(path);
+    }
+
+    fn save_bond(&mut self) {
+        let Some(path) = &self.bond_file else {
+            return;
+        };
+        let st = bond_store::BondState {
+            seen: self.last_bond.clone(),
+            question: self.bond_question.clone(),
+        };
+        if let Err(e) = bond_store::save(path, &st) {
+            self.log.push(format!("bond: {}: {e}", path.display()));
         }
     }
 
@@ -434,13 +477,14 @@ impl App {
         }
     }
 
-    /// The question about a bond is pending and not on screen: show it.
+    /// The question about a bond is pending, not on screen, and no forget for it is in
+    /// flight: show it.
     fn ask_bond_if_pending(&mut self) {
         let shown = matches!(
             self.overlay,
             Some(Overlay::Menu(_, settings::ids::BOND_QUESTION))
         );
-        if self.bond_question.is_some() && !shown {
+        if self.bond_question.is_some() && !shown && !self.forget_in_flight {
             self.ask_bond();
         }
     }
@@ -487,7 +531,11 @@ impl App {
     fn pairing_out(&mut self, out: Option<PairingOut>) {
         match out {
             None => {}
-            Some(PairingOut::Close) => self.close_overlay(),
+            Some(PairingOut::Close) => {
+                self.close_overlay();
+                // After "Phone not forgotten", say, the question about a bond comes back.
+                self.ask_bond_if_pending();
+            }
             Some(PairingOut::Reopen) => {
                 self.requests.push(Request::PairingWindow {
                     open: true,
@@ -522,6 +570,7 @@ impl App {
                 self.pairing_out(out);
             }
             PairRequest::Forget => {
+                self.forget_in_flight = false;
                 let p = Pairing::failed(request, r);
                 let panel = Panel::new(p.card(self.locale, 0), self.ctx);
                 self.show_overlay(Overlay::Pairing(p, panel));
@@ -989,12 +1038,15 @@ impl App {
             }
             Choice::Forget => {
                 self.log.push("pairing: forget the phone".into());
-                self.bond_question = None;
+                // A pending question stays until glassd reports the bond gone: a refused or
+                // lost forget asks again.
+                self.forget_in_flight = self.bond_question.is_some();
                 self.requests.push(Request::ForgetBond);
             }
             Choice::KeepPhone => {
                 self.log.push("pairing: the owner keeps the phone".into());
                 self.bond_question = None;
+                self.save_bond();
             }
             Choice::AskBond => self.ask_bond(),
             Choice::Dismiss => {}
@@ -1150,6 +1202,11 @@ impl App {
     /// The connection to glassd is gone: its settings are unknown again and requests made
     /// for it are dropped (a new session sends a fresh snapshot).
     pub fn glassd_disconnected(&mut self) {
+        // A forget sent may be lost with the connection: if the next state still shows the
+        // bond, the question is asked again.
+        if std::mem::take(&mut self.forget_in_flight) {
+            self.ask_at_next_state = true;
+        }
         // An open dictation ended with the connection (glassd forgets it, no state will come).
         let open = match &self.overlay {
             Some(Overlay::Dictation(d, _)) if d.is_open() => Some(d.request_id()),

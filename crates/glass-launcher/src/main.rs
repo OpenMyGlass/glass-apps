@@ -47,6 +47,10 @@ usage:
                   failing EGL is an error; on a host without EGL the default is software
   --setup         start with the first-boot setup flow (mock platform: Bluetooth is
                   simulated; with --glassd the phone step follows glassd's companion)
+  --state-dir DIR keep the launcher's state in DIR: the phone bond last seen and an
+                  unanswered question about a new bond, so a restart or a reboot still asks
+                  (with --glassd; default $GLASS_LAUNCHER_STATE_DIR, else
+                  /var/lib/glass-launcher when run as root, else none)
   --no-sound      do not play UI audio feedback (sound-enabled device builds only)
   --audio-selftest
                   set the TWL6040 bone-conduction (Earphone/EP) mixer route and play a
@@ -68,6 +72,7 @@ struct Args {
     window: bool,
     script: Option<PathBuf>,
     out: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
     fps: Option<u32>,
     time: Option<(u8, u8)>,
     now: Option<i64>,
@@ -158,6 +163,7 @@ fn parse_args() -> Result<Args, String> {
             "--window" => a.window = true,
             "--script" => a.script = Some(value("--script")?.into()),
             "--out" => a.out = Some(value("--out")?.into()),
+            "--state-dir" => a.state_dir = Some(value("--state-dir")?.into()),
             "--fps" => {
                 let v = value("--fps")?;
                 a.fps = Some(
@@ -985,6 +991,23 @@ fn run_self_test(_args: &Args) -> Result<(), String> {
     Err("this build has no framebuffer support: rebuild with --features fb on Linux".into())
 }
 
+/// The launcher's state directory: `--state-dir`, else `$GLASS_LAUNCHER_STATE_DIR`, else
+/// `/var/lib/glass-launcher` when run as root (on the device), else none (a host run).
+fn state_dir(args: &Args) -> Option<PathBuf> {
+    if let Some(d) = &args.state_dir {
+        return Some(d.clone());
+    }
+    if let Some(d) = std::env::var_os("GLASS_LAUNCHER_STATE_DIR") {
+        return Some(d.into());
+    }
+    #[cfg(unix)]
+    // SAFETY: getuid cannot fail.
+    if unsafe { libc::getuid() } == 0 {
+        return Some(PathBuf::from("/var/lib/glass-launcher"));
+    }
+    None
+}
+
 fn run_glassd(args: &Args) -> Result<(), String> {
     let path = glassd::socket(args.glassd.clone().flatten());
     let clock = clock_for(args);
@@ -992,6 +1015,9 @@ fn run_glassd(args: &Args) -> Result<(), String> {
     let compositor = compositor_for(args.renderer)?;
     let mut app = App::with_compositor(demo::timeline_at(ctx.now_s), ctx, compositor);
     install_feedback(&mut app, args);
+    if let Some(dir) = state_dir(args) {
+        app.set_state_dir(dir);
+    }
     if args.setup {
         app.start_setup(None);
     }

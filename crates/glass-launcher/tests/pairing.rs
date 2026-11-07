@@ -267,8 +267,13 @@ fn a_bond_in_the_pairing_screen_is_questioned_and_can_be_refused() {
         vec![Request::KeepScreenOn(false), Request::ForgetBond]
     );
     assert_eq!(a.overlay(), None);
-    assert_eq!(a.bond_question(), None);
+    // Pending until glassd says the bond is gone, but not asked while the forget is out.
+    assert_eq!(a.bond_question(), Some("Pixel 8"));
+    a.screen_off();
+    a.screen_wake(false);
+    assert_eq!(a.overlay(), None);
     a.companion_changed(state(false, "", 0));
+    assert_eq!(a.bond_question(), None);
     assert_eq!(card_subtitle(&a, ids::PHONE), "Tap to pair");
 }
 
@@ -397,10 +402,11 @@ fn a_failed_forget_is_shown() {
         }
         other => panic!("{other:?}"),
     }
-    g(&mut a, GestureKind::Tap);
-    assert_eq!(a.overlay(), None);
-    assert!(a.take_requests().is_empty(), "nothing was open");
     assert_eq!(card_subtitle(&a, ids::PHONE), "Paired with Pixel 8");
+    // Closing it closes nothing at glassd, and the stranger is asked about again.
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.take_requests(), vec![hold_question()]);
+    assert_eq!(a.menu_labels(), QUESTION);
 }
 
 #[test]
@@ -433,21 +439,85 @@ fn each_refusal_of_an_opening_says_why() {
 }
 
 #[test]
-fn a_mode_open_with_no_screen_is_closed() {
-    // The screen closed while glassd was out of reach: the close was lost with the connection.
+fn a_refused_or_lost_forget_asks_again() {
+    // Refused: "Phone not forgotten", then the question again.
     let (mut a, _) = app_with(radios(true, false));
-    goto(&mut a, ids::PHONE);
+    a.companion_changed(state(true, "Pixel 8", 0));
+    g(&mut a, GestureKind::SwipeForward);
+    g(&mut a, GestureKind::SwipeForward);
+    g(&mut a, GestureKind::Tap); // "Not my phone"
+    a.pairing_refused(
+        PairRequest::Forget,
+        ErrorCode::Unavailable,
+        "the bond is still on disk",
+    );
+    assert_eq!(a.overlay(), Some(OverlayKind::Pairing));
     g(&mut a, GestureKind::Tap);
+    assert_eq!(a.menu_labels(), QUESTION);
+    assert_eq!(a.bond_question(), Some("Pixel 8"));
+
+    // Lost with the connection: asked at the first state that still shows the bond.
+    let (mut a, _) = app_with(radios(true, false));
+    a.companion_changed(state(true, "Pixel 8", 0));
+    g(&mut a, GestureKind::SwipeForward);
+    g(&mut a, GestureKind::SwipeForward);
     g(&mut a, GestureKind::Tap);
     a.glassd_disconnected();
-    assert!(a.take_requests().is_empty());
-    // The same glassd answers again, the mode still open.
-    let open = state(false, "", START_US + 50_000_000);
-    a.companion_changed(open.clone());
-    assert_eq!(a.take_requests(), vec![CLOSE]);
-    // Once is enough for that opening.
-    a.companion_changed(open);
-    assert!(a.take_requests().is_empty());
+    assert_eq!(a.overlay(), None);
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.menu_labels(), QUESTION);
+}
+
+/// A state directory of its own under the build's target directory.
+fn state_dir(name: &str) -> std::path::PathBuf {
+    let d = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name);
+    let _ = std::fs::remove_dir_all(&d);
+    d
+}
+
+#[test]
+fn a_restart_still_asks() {
+    let dir = state_dir("bond-restart");
+    // A bond the owner did not answer, then the launcher restarts (or the Glass reboots).
+    let (mut a, _) = app_with(radios(true, false));
+    a.set_state_dir(dir.clone());
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.bond_question(), Some("Pixel 8"));
+    drop(a);
+    let mut a = App::new(demo::timeline(), ctx());
+    a.follow_glassd();
+    a.set_state_dir(dir.clone());
+    assert_eq!(a.bond_question(), Some("Pixel 8"));
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.menu_labels(), QUESTION, "asked at the first state");
+    // Answered: the next run asks nothing.
+    g(&mut a, GestureKind::SwipeForward);
+    g(&mut a, GestureKind::Tap);
+    let mut a = App::new(demo::timeline(), ctx());
+    a.follow_glassd();
+    a.set_state_dir(dir.clone());
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.overlay(), None);
+
+    // A phone bonded while the launcher was not running is asked about at its first state.
+    let mut a = App::new(demo::timeline(), ctx());
+    a.follow_glassd();
+    a.set_state_dir(dir.clone());
+    a.companion_changed(state(true, "Moto G", 0));
+    assert_eq!(a.bond_question(), Some("Moto G"));
+    assert_eq!(a.menu_labels()[0], "Paired with Moto G");
+
+    // Forgotten while the launcher was away: nothing left to ask, on the disk too.
+    let mut a = App::new(demo::timeline(), ctx());
+    a.follow_glassd();
+    a.set_state_dir(dir.clone());
+    a.companion_changed(state(false, "", 0));
+    assert_eq!(a.bond_question(), None);
+    let mut a = App::new(demo::timeline(), ctx());
+    a.follow_glassd();
+    a.set_state_dir(dir.clone());
+    assert_eq!(a.bond_question(), None);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
