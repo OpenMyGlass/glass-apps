@@ -33,4 +33,3 @@ glass-launcher = { path = "crates/glass-launcher" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
-

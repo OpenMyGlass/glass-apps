@@ -78,6 +78,8 @@ impl Refusal {
     fn text(self, request: PairRequest, locale: Locale) -> &'static str {
         match self {
             Refusal::Unsupported => Msg::PairingNotAvailable,
+            // Forgetting a stranger matters most: say what fixes it.
+            Refusal::Denied if request == PairRequest::Forget => Msg::PrivilegedUidHint,
             Refusal::Denied => Msg::PairingNotAllowed,
             Refusal::AlreadyPaired => Msg::AlreadyPaired,
             Refusal::LinkDisabled => Msg::PhoneLinkDisabled,
@@ -447,6 +449,14 @@ mod tests {
         assert_eq!(
             card(Open, Refusal::Denied).1,
             "The launcher is not allowed to do this"
+        );
+        // A refused forget points at the fix.
+        assert_eq!(
+            card(Forget, Refusal::Denied),
+            (
+                "Phone not forgotten".to_string(),
+                "glassd must allow the launcher's uid with --privileged-uid".to_string()
+            )
         );
         // All different, in every language.
         for l in Locale::ALL {
