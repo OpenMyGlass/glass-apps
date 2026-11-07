@@ -12,6 +12,7 @@ pub mod demo;
 pub mod dictation;
 pub mod feedback;
 pub mod glassd;
+pub mod pairing;
 pub mod panel;
 pub mod script;
 pub mod selftest;
@@ -35,12 +36,14 @@ use glass_ui::{
     Action, Adjuster, CardId, GestureKind, InputEvent, Menu, Outcome, RenderContext, Timeline,
 };
 use glass_ui::{Card, CardContent};
+use pairing::{Pairing, PairingOut, Refusal};
 use panel::Panel;
 use platform::PlatformEvent;
 use platform::{MockPlatform, Platform};
-use settings::{Choice, ServiceInfo, SettingsView};
+use settings::{Choice, PhoneView, ServiceInfo, SettingsView};
 use setup::{Companion, Setup, SetupEffect};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// What is shown over the timeline.
 /// What an adjuster sub-screen changes.
@@ -57,6 +60,8 @@ enum Overlay {
     Adjust(Adjuster, Adjusting),
     /// Taking a note by dictation.
     Dictation(Dictation, Panel),
+    /// The pairing mode is open (or opening, or just ended).
+    Pairing(Pairing, Panel),
 }
 
 /// Which overlay is open (for tests and logs).
@@ -68,6 +73,7 @@ pub enum OverlayKind {
     },
     Adjust,
     Dictation,
+    Pairing,
 }
 
 /// A request for `glassd`, made by the app (the caller sends it).
@@ -80,6 +86,16 @@ pub enum Request {
     /// Keep the screen on while dictating (`ScreenRequest{ACTION_KEEP_ON}`, true) or let it
     /// time out again (`ACTION_RELEASE_KEEP_ON`, false): glassd's timeout counts touches only.
     KeepScreenOn(bool),
+    /// Keep the screen, and so the Glass, awake for this many ms (`ACTION_KEEP_ON`): while the
+    /// pairing mode is open. Released with `KeepScreenOn(false)`.
+    KeepScreenOnFor(u32),
+    /// `CompanionPairingWindow{open, duration_ms}`.
+    PairingWindow {
+        open: bool,
+        duration_ms: u32,
+    },
+    /// `CompanionForgetBond{}`.
+    ForgetBond,
 }
 
 /// The first note card's id; later notes count up.
@@ -129,6 +145,10 @@ pub struct App {
     feedback: Box<dyn Feedback>,
     /// The centred card last seen, to tick only when it actually changes.
     last_index: usize,
+    /// glassd answered `ERROR_CODE_UNSUPPORTED` to a pairing request (until it reconnects).
+    pairing_unsupported: bool,
+    /// `CLOCK_MONOTONIC` in µs, the clock of glassd's times (replaceable for tests).
+    monotonic: Box<dyn Fn() -> u64>,
 }
 
 impl App {
@@ -169,6 +189,8 @@ impl App {
             next_note: FIRST_NOTE_ID,
             feedback: Box::new(Silent),
             last_index,
+            pairing_unsupported: false,
+            monotonic: Box::new(clock::monotonic_us),
         };
         app.refresh_settings_cards();
         app
@@ -334,14 +356,105 @@ impl App {
         }
     }
 
-    /// glassd's `CompanionState`: whether a phone is connected through the companion.
+    /// glassd's `CompanionState`: whether a phone is connected through the companion, and
+    /// the bond and pairing mode.
     pub fn companion_changed(&mut self, c: Companion) {
         self.companion = c.clone();
+        let out = match self.overlay.as_mut() {
+            Some(Overlay::Pairing(p, _)) => p.on_companion(&c),
+            _ => None,
+        };
         if let Some((s, _)) = self.setup.as_mut() {
             s.set_companion(c);
         }
         self.refresh_setup_card();
         self.refresh_note_card();
+        self.refresh_settings_cards();
+        self.pairing_out(out);
+    }
+
+    /// Replaces the clock compared with glassd's times (`CLOCK_MONOTONIC` µs), for tests.
+    pub fn set_monotonic_clock(&mut self, clock: Box<dyn Fn() -> u64>) {
+        self.monotonic = clock;
+    }
+
+    /// Opens glassd's pairing mode and shows its screen, held on while it is open.
+    fn open_pairing(&mut self) {
+        self.requests.push(Request::PairingWindow {
+            open: true,
+            duration_ms: pairing::WINDOW_MS,
+        });
+        self.requests
+            .push(Request::KeepScreenOnFor(pairing::KEEP_ON_MS));
+        let p = Pairing::new();
+        let panel = Panel::new(p.card(self.locale, (self.monotonic)()), self.ctx);
+        self.show_overlay(Overlay::Pairing(p, panel));
+    }
+
+    fn refresh_pairing_screen(&mut self) {
+        let now = (self.monotonic)();
+        let locale = self.locale;
+        if let Some(Overlay::Pairing(p, panel)) = self.overlay.as_mut() {
+            panel.set(p.card(locale, now));
+        }
+    }
+
+    fn pairing_out(&mut self, out: Option<PairingOut>) {
+        match out {
+            None => {}
+            Some(PairingOut::Close) => self.close_overlay(),
+            Some(PairingOut::Reopen) => {
+                self.requests.push(Request::PairingWindow {
+                    open: true,
+                    duration_ms: pairing::WINDOW_MS,
+                });
+                self.requests
+                    .push(Request::KeepScreenOnFor(pairing::KEEP_ON_MS));
+            }
+            Some(PairingOut::ReleaseScreen) => self.requests.push(Request::KeepScreenOn(false)),
+            Some(PairingOut::Paired(name)) => {
+                self.log.push(format!("pairing: bonded with {name:?}"));
+                // The mode closed with the bond: nothing to close, the screen is released.
+                self.requests.push(Request::KeepScreenOn(false));
+                self.close_overlay();
+                if let Some(menu) = Menu::new(settings::paired_question(self.locale, &name)) {
+                    self.show_overlay(Overlay::Menu(menu, settings::ids::PHONE_QUESTION));
+                }
+            }
+        }
+        self.refresh_pairing_screen();
+    }
+
+    /// glassd refused a `CompanionPairingWindow` or `CompanionForgetBond` with `code`.
+    pub fn pairing_refused(&mut self, code: ErrorCode) {
+        let r = Refusal::from_code(code);
+        self.log.push(format!("pairing: refused ({code:?})"));
+        if r == Refusal::Unsupported {
+            self.pairing_unsupported = true;
+            self.refresh_settings_cards();
+        }
+        let out = match self.overlay.as_mut() {
+            Some(Overlay::Pairing(p, _)) => p.refused(r),
+            _ => None,
+        };
+        self.pairing_out(out);
+    }
+
+    /// The pairing screen's card, while it is shown (tests, logs).
+    pub fn pairing_screen(&self) -> Option<&CardContent> {
+        match &self.overlay {
+            Some(Overlay::Pairing(_, panel)) => Some(panel.content()),
+            _ => None,
+        }
+    }
+
+    /// How long until something on screen changes by itself (the pairing time left), so the
+    /// loop wakes then; `None` when nothing does.
+    pub fn next_change(&self) -> Option<Duration> {
+        match &self.overlay {
+            Some(Overlay::Pairing(p, _)) if self.screen_on => p.next_change((self.monotonic)()),
+            _ => None,
+        }
     }
 
     pub fn companion(&self) -> &Companion {
@@ -473,6 +586,11 @@ impl App {
             platform: self.platform.name(),
             renderer: self.compositor.name(),
             locale: self.locale,
+            phone: PhoneView {
+                paired: self.companion.paired,
+                paired_name: self.companion.paired_name.clone(),
+                unsupported: self.pairing_unsupported,
+            },
         }
     }
 
@@ -555,10 +673,10 @@ impl App {
     pub fn set_service(&mut self, info: Option<ServiceInfo>) {
         self.service = info;
         // The card was offered before glassd said what it can do.
-        if self.main_timeline.is_some()
-            && !settings::applies(settings::ids::POWER_OFF, &self.settings_view())
-        {
-            self.timeline.remove_card(settings::ids::POWER_OFF);
+        for id in [settings::ids::POWER_OFF, settings::ids::PHONE] {
+            if self.main_timeline.is_some() && !settings::applies(id, &self.settings_view()) {
+                self.timeline.remove_card(id);
+            }
         }
         self.refresh_settings_cards();
         self.refresh_note_card();
@@ -581,6 +699,7 @@ impl App {
             Some(Overlay::Menu(m, _)) => Some(OverlayKind::Menu { index: m.index() }),
             Some(Overlay::Adjust(..)) => Some(OverlayKind::Adjust),
             Some(Overlay::Dictation(..)) => Some(OverlayKind::Dictation),
+            Some(Overlay::Pairing(..)) => Some(OverlayKind::Pairing),
         }
     }
 
@@ -682,6 +801,18 @@ impl App {
                 self.requests.push(Request::KeepScreenOn(false));
                 panel.release(self.compositor.as_mut());
             }
+            Some(Overlay::Pairing(p, mut panel)) => {
+                // Backing out closes the mode: no phone may bond once the owner left. Once
+                // the mode is closed the screen was already released.
+                if p.is_open() {
+                    self.requests.push(Request::PairingWindow {
+                        open: false,
+                        duration_ms: 0,
+                    });
+                    self.requests.push(Request::KeepScreenOn(false));
+                }
+                panel.release(self.compositor.as_mut());
+            }
             None => return,
         }
         self.shown = false;
@@ -746,6 +877,24 @@ impl App {
                 self.log.push(format!("delete: card {id}"));
                 self.timeline.remove_card(id);
             }
+            Choice::Pair { radios } => {
+                if let Some(p) = radios {
+                    self.log.push(format!("pairing: radios {p:?}"));
+                    self.request_settings(p);
+                }
+                self.log.push("pairing: open".into());
+                self.open_pairing();
+            }
+            Choice::AskForget => {
+                if let Some(menu) = Menu::new(settings::forget_question(self.locale)) {
+                    self.show_overlay(Overlay::Menu(menu, settings::ids::PHONE_QUESTION));
+                }
+            }
+            Choice::Forget => {
+                self.log.push("pairing: forget the phone".into());
+                self.requests.push(Request::ForgetBond);
+            }
+            Choice::KeepPhone => {}
         }
     }
 
@@ -774,6 +923,11 @@ impl App {
             }
             Some(Overlay::Dictation(..)) => {
                 self.with_dictation(|d| d.input(event));
+                React::Done
+            }
+            Some(Overlay::Pairing(p, _)) => {
+                let out = p.input(event);
+                self.pairing_out(out);
                 React::Done
             }
             Some(Overlay::Adjust(a, what)) => {
@@ -904,6 +1058,11 @@ impl App {
                 error: "link-lost".into(),
             });
         }
+        // glassd closes its pairing mode when it restarts.
+        if matches!(self.overlay, Some(Overlay::Pairing(..))) {
+            self.close_overlay();
+        }
+        self.pairing_unsupported = false;
         self.companion = Companion::default();
         if let Some((s, _)) = self.setup.as_mut() {
             s.set_companion(Companion::default());
@@ -1032,6 +1191,11 @@ impl App {
             Some(Overlay::Menu(m, _)) => m.tick(dt),
             Some(Overlay::Adjust(a, _)) => a.set_context(ctx),
             Some(Overlay::Dictation(_, p)) => p.set_context(ctx),
+            Some(Overlay::Pairing(p, panel)) => {
+                panel.set_context(ctx);
+                let out = p.tick((self.monotonic)());
+                self.pairing_out(out);
+            }
             None => {}
         }
         if let Some((_, p)) = self.setup.as_mut() {
@@ -1059,7 +1223,7 @@ impl App {
             return Ok(true);
         }
         match &mut self.overlay {
-            Some(Overlay::Dictation(_, p)) => {
+            Some(Overlay::Dictation(_, p)) | Some(Overlay::Pairing(_, p)) => {
                 if self.shown && !p.needs_redraw() {
                     return Ok(false);
                 }

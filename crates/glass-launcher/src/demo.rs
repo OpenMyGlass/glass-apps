@@ -36,6 +36,7 @@ pub fn timeline_at(now_s: i64) -> Timeline {
         platform: "mock",
         renderer: "software",
         locale: Locale::DEFAULT,
+        phone: Default::default(),
     };
     let mut backward = vec![text(2, "Partly cloudy, 14°", "Weather", 20 * 60)];
     backward.push(settings::root_card(view.locale));
@@ -79,6 +80,7 @@ pub fn device_timeline(now_s: i64, platform: &'static str, renderer: &'static st
         platform,
         renderer,
         locale: Locale::DEFAULT,
+        phone: Default::default(),
     };
     Timeline::new(
         vec![settings::root_card(view.locale)],

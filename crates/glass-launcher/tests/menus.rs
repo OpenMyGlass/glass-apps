@@ -81,7 +81,12 @@ fn settings_are_one_card_that_opens_a_submenu() {
     g(&mut a, GestureKind::Tap);
     assert!(a.settings_open());
     let cards: Vec<CardId> = a.timeline().cards().iter().map(|c| c.id).collect();
-    assert_eq!(&cards[..], &glass_launcher::settings::ORDER);
+    // Every card but the phone, which needs glassd's own phone link.
+    let want: Vec<CardId> = glass_launcher::settings::ORDER
+        .into_iter()
+        .filter(|&id| id != ids::PHONE)
+        .collect();
+    assert_eq!(cards, want);
     g(&mut a, GestureKind::SwipeForward);
     g(&mut a, GestureKind::SwipeDown);
     assert!(!a.settings_open());

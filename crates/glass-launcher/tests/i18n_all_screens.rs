@@ -4,7 +4,7 @@
 
 use glass_gfx::{Frame, Rect};
 use glass_launcher::platform::RadioStatus;
-use glass_launcher::settings::{self, SettingsView};
+use glass_launcher::settings::{self, ids, PhoneView, ServiceInfo, SettingsView};
 use glass_launcher::setup::Setup;
 use glass_ui::card::{render_card, text_is_cut};
 use glass_ui::i18n::{Locale, Msg};
@@ -19,6 +19,7 @@ fn view(locale: Locale) -> SettingsView {
         platform: "mock",
         renderer: "software",
         locale,
+        phone: Default::default(),
     }
 }
 
@@ -42,7 +43,60 @@ fn screens(locale: Locale) -> Vec<CardContent> {
             }
         }
     }
+    // The phone card (only with glassd's companion-link) in each of its states, with its menus.
+    let mut airplane = settings::settings_defaults();
+    airplane.airplane_mode = Some(true);
+    let phones = [
+        (airplane, PhoneView::default()),
+        (settings::settings_defaults(), PhoneView::default()),
+        (
+            settings::settings_defaults(),
+            PhoneView {
+                paired: true,
+                paired_name: "Galaxy S24 Ultra".into(),
+                unsupported: false,
+            },
+        ),
+        (
+            settings::settings_defaults(),
+            PhoneView {
+                unsupported: true,
+                ..Default::default()
+            },
+        ),
+    ];
+    for (s, phone) in phones {
+        let mut v = view(locale);
+        v.settings = Some(s);
+        v.service = Some(ServiceInfo {
+            version: "x".into(),
+            capabilities: vec!["companion-link".into()],
+        });
+        v.phone = phone;
+        let content = settings::card_content(ids::PHONE, &v).unwrap();
+        out.push(content.clone());
+        if let Some((items, _)) = settings::menu_for(&Card::new(ids::PHONE, content), &v) {
+            push_menu(&mut out, items);
+        }
+    }
+    push_menu(&mut out, settings::forget_question(locale));
+    push_menu(
+        &mut out,
+        settings::paired_question(locale, "Galaxy S24 Ultra"),
+    );
     out
+}
+
+fn push_menu(out: &mut Vec<CardContent>, items: Vec<glass_ui::MenuItem<settings::Choice>>) {
+    let count = items.len();
+    for (index, it) in items.into_iter().enumerate() {
+        out.push(CardContent::MenuItem {
+            label: it.label,
+            detail: it.detail,
+            index,
+            count,
+        });
+    }
 }
 
 #[test]

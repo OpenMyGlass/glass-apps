@@ -38,6 +38,7 @@ fn view(locale: Locale) -> SettingsView {
         platform: "mock",
         renderer: "software",
         locale,
+        phone: Default::default(),
     }
 }
 

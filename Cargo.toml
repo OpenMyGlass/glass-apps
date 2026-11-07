@@ -33,3 +33,10 @@ glass-launcher = { path = "crates/glass-launcher" }
 [profile.release]
 lto = "thin"
 codegen-units = 1
+
+# DEVELOPMENT ONLY: glass-api from the local glass-services `glassd-ble-hardening` checkout, for the
+# pairing-mode messages (CompanionPairingWindow, CompanionForgetBond, CompanionState.pairing_until_us
+# and paired_name). Once that branch merges in glass-services: delete this section, set the `rev` of
+# glass-api above to the merge commit, and run `cargo update -p glass-api`.
+[patch."https://github.com/OpenMyGlass/glass-services"]
+glass-api = { path = "../wip-glassd-hardening/crates/glass-api" }
