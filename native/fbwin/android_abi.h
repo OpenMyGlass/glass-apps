@@ -1,7 +1,25 @@
 /* SPDX-License-Identifier: Apache-2.0
+ *
+ * Copyright (C) 2008 The Android Open Source Project
+ * Copyright (C) 2011 The Android Open Source Project
+ * Copyright (C) 2026 The OpenMyGlass contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
  * The few Android 4.4 HAL structs the framebuffer window needs. The NDK does not ship
- * hardware/gralloc.h, hardware/fb.h or system/window.h. Layouts follow AOSP android-4.4.4
- * (Apache-2.0); the stock blobs are built against them. */
+ * hardware/gralloc.h, hardware/fb.h or system/window.h. Layouts follow AOSP android-4.4.4;
+ * the stock blobs are built against them. The XE24 padding below is ours.
+ */
 #ifndef GLASS_ANDROID_ABI_H
 #define GLASS_ANDROID_ABI_H
 #include <stdint.h>

@@ -1,7 +1,23 @@
 /* SPDX-License-Identifier: Apache-2.0
+ *
+ * Copyright 2007 The Android Open Source Project
+ * Copyright (C) 2026 The OpenMyGlass contributors
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
  * libglass_fbwin: an ANativeWindow over the gralloc framebuffer HAL, for a plain bionic
  * process with no SurfaceFlinger (Model B). Modelled on AOSP 4.4
- * frameworks/native/libs/ui/FramebufferNativeWindow.cpp (Apache-2.0).
+ * frameworks/native/libs/ui/FramebufferNativeWindow.cpp.
  *
  * Exports the provider ABI of glass-gfx-gles' gles_probe:
  *   glass_gfx_create_native_window(u32 w, u32 h, i32 format) -> ANativeWindow*
@@ -68,7 +84,10 @@ static int queue(struct glass_ANativeWindow *w, struct ANativeWindowBuffer *b, i
 static int cancel(struct glass_ANativeWindow *w, struct ANativeWindowBuffer *b, int fence)
 {
     struct fbwin *f = (struct fbwin *)w;
-    (void)b; (void)fence;
+    (void)fence;
+    if (b < f->bufs || b >= f->bufs + f->nbufs)
+        return -EINVAL;
+    f->head = (int)(b - f->bufs); /* the cancelled buffer is the next one out */
     f->nfree++;
     return 0;
 }
@@ -180,7 +199,7 @@ static struct fbwin *open_window(void)
     if (f->nbufs > MAX_BUFS)
         f->nbufs = MAX_BUFS;
     if (f->nbufs < 1)
-        f->nbufs = MAX_BUFS; /* the IMG HAL reports 0; its kernel side keeps 3 TILER buffers */
+        f->nbufs = MAX_BUFS; /* the IMG HAL reports 0: the allocation loop finds out, 2 on XE24 */
     for (i = 0; i < f->nbufs; i++) {
         struct ANativeWindowBuffer *b = &f->bufs[i];
         int stride = 0;

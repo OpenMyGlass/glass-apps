@@ -168,8 +168,11 @@ static void fb_report(const char *tag)
         perror("fb0");
         return;
     }
-    ioctl(fd, FBIOGET_VSCREENINFO, &v);
-    ioctl(fd, FBIOGET_FSCREENINFO, &x);
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &v) || ioctl(fd, FBIOGET_FSCREENINFO, &x)) {
+        perror("fb0 ioctl");
+        close(fd);
+        return;
+    }
     printf("%s fb: %ux%u virt %ux%u off %u,%u bpp=%u line=%u smem=%u@0x%lx r@%u g@%u b@%u\n", tag,
            v.xres, v.yres, v.xres_virtual, v.yres_virtual, v.xoffset, v.yoffset, v.bits_per_pixel,
            x.line_length, x.smem_len, (unsigned long)x.smem_start, v.red.offset, v.green.offset,
@@ -267,6 +270,10 @@ static int run(int window, int frames, int interval)
         }
         fmt_fn = (int (*)(void))dlsym(fbwin, "glass_gfx_native_window_format");
         create = (void *(*)(unsigned, unsigned, int))dlsym(fbwin, "glass_gfx_create_native_window");
+        if (!fmt_fn || !create) {
+            printf("dlsym fbwin: %s\n", dlerror());
+            return 1;
+        }
         want = fmt_fn();
         printf("window format=%d\n", want);
         if (want < 0)
@@ -294,7 +301,12 @@ static int run(int window, int frames, int interval)
         return 1;
     }
     if (window) {
-        s = eglCreateWindowSurface(d, cfg, (EGLNativeWindowType)create(W, H, want), NULL);
+        void *win = create(W, H, want);
+        if (!win) {
+            printf("no native window\n");
+            return 1;
+        }
+        s = eglCreateWindowSurface(d, cfg, (EGLNativeWindowType)win, NULL);
     } else {
         EGLint pa[] = {EGL_WIDTH, W, EGL_HEIGHT, H, EGL_NONE};
         s = eglCreatePbufferSurface(d, cfg, pa);
@@ -321,7 +333,15 @@ static int run(int window, int frames, int interval)
     if (interval >= 0) {
         printf("swap interval %d: %d\n", interval, eglSwapInterval(d, interval));
     }
+    if (frames < 1) {
+        printf("no frames asked for\n");
+        return 1;
+    }
     double *tot = calloc(frames, sizeof(double)), *dcpu = calloc(frames, sizeof(double));
+    if (!tot || !dcpu) {
+        printf("out of memory\n");
+        return 1;
+    }
     double run0 = now_ms(), cpu0 = cpu_ms();
     for (i = 0; i < frames; i++) {
         double t = now_ms(), c = cpu_ms();
