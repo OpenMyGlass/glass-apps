@@ -43,6 +43,10 @@ STATE=${GLASS_LAUNCHER_STATE:-/var/lib/glass-launcher}
 RUN=${GLASS_LAUNCHER_RUN:-/run/glass-launcher}
 REBOOT=${GLASS_REBOOT:-reboot -f}
 KILL=${GLASS_KILL:-kill -KILL}
+# Tools by name, for the tests: a busybox built to prefer its applets ignores PATH for these.
+INSMOD=${GLASS_INSMOD:-insmod}
+MKNOD=${GLASS_MKNOD:-mknod}
+SYNC=${GLASS_SYNC:-sync}
 ALLOW_VOLATILE=${GLASS_GPU_ALLOW_VOLATILE_STATE:-0}
 POLL_S=${GLASS_SUPERVISOR_POLL_S:-5}
 KILL_POLLS=${GLASS_SUPERVISOR_KILL_POLLS:-3}   # polls of POLL_S after the kill: SGX can take seconds to let go
@@ -94,7 +98,7 @@ count() {
 # False unless the value reads back: a read-only or full disk must not pass for a count.
 set_count() {
     echo "$2" > "$STATE/$1.new" && mv "$STATE/$1.new" "$STATE/$1" &&
-        [ "$(cat "$STATE/$1" 2>/dev/null)" = "$2" ] && sync
+        [ "$(cat "$STATE/$1" 2>/dev/null)" = "$2" ] && $SYNC
 }
 
 # A clean stop while an attempt is open says nothing about the GPU: the count goes back. A healthy
@@ -194,7 +198,7 @@ state_persistent() {
 
 write_marker() {
     true > "$STATE/no-gpu"
-    sync
+    $SYNC
 }
 
 # Counts the attempt before it starts; false when the limit is reached or it cannot be counted.
@@ -274,14 +278,14 @@ gpu_up() {
     ln -sf "$FB" "$DEV/graphics/fb0" || return 1
     property_area || { log "property area failed"; return 1; }
     if ! grep -q '^pvrsrvkm' "$PROC/modules" 2>/dev/null; then
-        run_tool insmod insmod "$MODULE" || return 1
+        run_tool insmod $INSMOD "$MODULE" || return 1
     fi
     _maj=$(awk '$2 == "pvrsrvkm" { print $1; exit }' "$PROC/devices" 2>/dev/null)
     if [ -z "$_maj" ]; then
         log "pvrsrvkm is not in $PROC/devices"
         return 1
     fi
-    if [ ! -e "$DEV/pvrsrvkm" ] && ! mknod -m 666 "$DEV/pvrsrvkm" c "$_maj" 0; then
+    if [ ! -e "$DEV/pvrsrvkm" ] && ! $MKNOD -m 666 "$DEV/pvrsrvkm" c "$_maj" 0; then
         log "mknod pvrsrvkm failed"
         return 1
     fi
@@ -301,7 +305,7 @@ wedge_reboot() {
     _w=$(count gpu-wedges)
     # If this fails the next boot cannot write its own counter either, and refuses the GPU.
     set_count gpu-wedges $((_w + 1)) || log "could not count the reboot"
-    sync
+    $SYNC
     if ! still_stuck "$1"; then
         log "the GPU launcher went after all: no reboot"
         if [ "$_w" = 0 ]; then rm -f "$STATE/gpu-wedges"; else set_count gpu-wedges "$_w"; fi
@@ -335,7 +339,7 @@ watch_beat() {
             fi
             if [ "$_good" = "$WEDGE_CLEAR_POLLS" ] && [ -e "$STATE/gpu-wedges" ]; then
                 rm -f "$STATE/gpu-wedges"
-                sync
+                $SYNC
                 log "GPU launcher healthy for a long time: stuck-driver reboots forgotten"
             fi
             continue
@@ -417,7 +421,7 @@ run_software() {
 
 if [ "${1:-}" = --clear-gpu-state ]; then
     rm -f "$STATE/no-gpu" "$STATE/gpu-failures" "$STATE/gpu-wedges" || exit 1
-    sync
+    $SYNC
     log "GPU state cleared: the next start tries the GPU"
     exit 0
 fi

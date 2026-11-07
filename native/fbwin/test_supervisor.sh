@@ -73,6 +73,7 @@ launch() { # in a subshell: it becomes the supervisor, and a signal to its PID r
     exec env PATH="$T/fake:$PATH" GLASS_SYSTEM="$W/system" GLASS_GPU_MODULE="$W/lib/module.ko" \
         GLASS_GLES_LAUNCHER="$W/gles" GLASS_SOFT_LAUNCHER="$W/soft" GLASS_FBWIN="$W/lib/libglass_fbwin.so" \
         GLASS_FB="$W/dev/fb0" GLASS_DEV="$W/dev" GLASS_PROC="$W/proc" GLASS_LAUNCHER_STATE="$W/state" \
+        GLASS_INSMOD="$T/fake/insmod" GLASS_MKNOD="$T/fake/mknod" GLASS_SYNC="$T/fake/sync" \
         GLASS_LAUNCHER_RUN="$W/run" GLASS_REBOOT="touch $W/rebooted" GLASS_SUPERVISOR_POLL_S=0.2 \
         GLASS_SUPERVISOR_KILL_POLLS=1 GLASS_SUPERVISOR_REBOOT_WAIT_S=0.2 GLASS_SUPERVISOR_BOUND_S=5 \
         $SUP_ENV ${SHELL_UNDER_TEST:-sh} "$SUP" $SUP_ARGS
