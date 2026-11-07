@@ -201,17 +201,22 @@ static int scan(unsigned long ba, unsigned long pitch, const char *dump)
     int fd = open("/dev/mem", O_RDONLY | O_SYNC);
     size_t len = pitch * H;
     unsigned long page = ba & ~0xfffUL;
-    unsigned char *m;
+    unsigned char *base, *m;
+    if (pitch < W * 4) {
+        printf("pitch %lu is below %d, one line of %d pixels\n", pitch, W * 4, W);
+        return 2;
+    }
     if (fd < 0) {
         perror("/dev/mem");
         return 1;
     }
-    m = mmap(NULL, len + (ba - page), PROT_READ, MAP_SHARED, fd, page);
-    if (m == MAP_FAILED) {
+    base = mmap(NULL, len + (ba - page), PROT_READ, MAP_SHARED, fd, page);
+    if (base == MAP_FAILED) {
         perror("mmap /dev/mem");
+        close(fd);
         return 1;
     }
-    m += ba - page;
+    m = base + (ba - page);
 #define S(xx, yy) *(unsigned *)(m + (yy) * pitch + (xx) * 4)
     printf("scan ba=%08lx pitch=%lu TL=%08x TR=%08x BL=%08x BR=%08x mid=%08x\n", ba, pitch, S(160, 90),
            S(480, 90), S(160, 270), S(480, 270), S(320, 180));
@@ -223,6 +228,8 @@ static int scan(unsigned long ba, unsigned long pitch, const char *dump)
         if (f)
             fclose(f);
     }
+    munmap(base, len + (ba - page));
+    close(fd);
     return 0;
 }
 

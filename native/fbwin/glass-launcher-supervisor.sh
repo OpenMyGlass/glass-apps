@@ -17,8 +17,11 @@
 #   can be and left behind if not, and this boot goes on in software.
 # - A launcher that stops beating for 20 s of awake time is killed and this boot goes on in
 #   software. If it cannot be killed the driver is stuck and only a reboot brings the UI back: that
-#   reboot is counted, two in a row write the marker, and an hour of beats clears the count. If
-#   the reboot does not happen the software launcher starts anyway.
+#   reboot is counted, two in a row write the marker, and an hour of beats clears the count. A
+#   launcher that dies within 30 s of the kill, or before the reboot, is not stuck. If the reboot
+#   does not happen the software launcher starts anyway.
+# - The launchers write their output to a relay, never to the init's pipe: if whoever reads the
+#   log dies, the relay goes on into /dev/kmsg (GLASS_LOG_FALLBACK) and no launcher sees EPIPE.
 # - A launcher that crashes after a healthy start is restarted, up to 5 starts per boot.
 # - The marker stays until --clear-gpu-state or a reinstall.
 #
@@ -40,7 +43,8 @@ REBOOT=${GLASS_REBOOT:-reboot -f}
 KILL=${GLASS_KILL:-kill -KILL}
 ALLOW_VOLATILE=${GLASS_GPU_ALLOW_VOLATILE_STATE:-0}
 POLL_S=${GLASS_SUPERVISOR_POLL_S:-5}
-KILL_WAIT_S=${GLASS_SUPERVISOR_KILL_WAIT_S:-5}
+KILL_POLLS=${GLASS_SUPERVISOR_KILL_POLLS:-6}   # polls of POLL_S after the kill: SGX can take seconds to let go
+LOG_FALLBACK=${GLASS_LOG_FALLBACK:-/dev/kmsg}
 REBOOT_WAIT_S=${GLASS_SUPERVISOR_REBOOT_WAIT_S:-15}
 BOUND_S=${GLASS_SUPERVISOR_BOUND_S:-30}
 WEDGE_CLEAR_POLLS=${GLASS_SUPERVISOR_WEDGE_CLEAR_POLLS:-720}   # an hour of beats
@@ -55,6 +59,8 @@ OWNER=$RUN/launcher-pid
 STARTS=$RUN/gpu-starts
 TOOL_OUT=$RUN/tool.out
 TOOL_PID=$RUN/tool.pid
+COUNTED=$RUN/counted     # the counter's value before the open attempt, to put back on a clean stop
+LOG_FIFO=$RUN/log
 MAX_FAILURES=2
 MAX_WEDGES=2
 MAX_STARTS=5
@@ -66,7 +72,6 @@ log() { echo "OMGB-GPU: $*" >&2; }
 child=
 watcher=
 timer=
-attempted=
 wake=
 
 count() {
@@ -81,13 +86,13 @@ set_count() {
         [ "$(cat "$STATE/$1" 2>/dev/null)" = "$2" ] && sync
 }
 
-# A clean stop while an attempt is open says nothing about the GPU. After a healthy start the
-# counter is 0 and stays so.
+# A clean stop while an attempt is open says nothing about the GPU: the count goes back. A healthy
+# start or a failure closes the attempt.
 undo_attempt() {
-    _n=$(count gpu-failures)
-    if [ "$_n" -gt 0 ]; then
-        set_count gpu-failures $((_n - 1)) || log "could not take the count back"
-    fi
+    _n=$(cat "$COUNTED" 2>/dev/null) || return 0
+    rm -f "$COUNTED"
+    case "$_n" in ''|*[!0-9]*) return 0 ;; esac
+    set_count gpu-failures "$_n" || log "could not take the count back"
 }
 
 kill_tool() {
@@ -102,7 +107,7 @@ on_term() {
     done
     rm -f "$OWNER"
     kill_tool
-    [ -n "$attempted" ] && undo_attempt
+    undo_attempt
     exit 143
 }
 trap on_term TERM INT
@@ -182,7 +187,10 @@ attempt() {
         write_marker
         return 1
     fi
+    # Written first, so that a stop at any point after this can put the count back.
+    echo "$_n" > "$COUNTED"
     if ! set_count gpu-failures $((_n + 1)); then
+        rm -f "$COUNTED"
         log "cannot write $STATE/gpu-failures, so a crash could not be counted: software renderer"
         return 1
     fi
@@ -259,12 +267,22 @@ gpu_up() {
     log "GPU services up"
 }
 
+# True while the launcher $1 lives and is still the one this supervisor watches.
+still_stuck() {
+    kill -0 "$1" 2>/dev/null && [ "$(cat "$OWNER" 2>/dev/null)" = "$1" ]
+}
+
 # Everything here may block on the stuck driver, so it runs apart from the fallback in watch_beat.
 wedge_reboot() {
     _w=$(count gpu-wedges)
     # If this fails the next boot cannot write its own counter either, and refuses the GPU.
     set_count gpu-wedges $((_w + 1)) || log "could not count the reboot"
     sync
+    if ! still_stuck "$1"; then
+        log "the GPU launcher went after all: no reboot"
+        if [ "$_w" = 0 ]; then rm -f "$STATE/gpu-wedges"; else set_count gpu-wedges "$_w"; fi
+        return 0
+    fi
     $REBOOT
 }
 
@@ -288,6 +306,7 @@ watch_beat() {
             _good=$((_good + 1))
             if [ "$_good" = "$GOOD_POLLS" ]; then
                 set_count gpu-failures 0 || log "cannot reset $STATE/gpu-failures"
+                rm -f "$COUNTED"
                 log "GPU launcher healthy"
             fi
             if [ "$_good" = "$WEDGE_CLEAR_POLLS" ] && [ -e "$STATE/gpu-wedges" ]; then
@@ -302,14 +321,19 @@ watch_beat() {
         log "GPU launcher silent for $STALE_POLLS polls of ${POLL_S}s: killing it"
         true > "$HUNG"
         $KILL "$_pid" 2>/dev/null
-        sleep "$KILL_WAIT_S"
-        if kill -0 "$_pid" 2>/dev/null; then
-            log "GPU launcher cannot be killed, the driver is stuck: rebooting"
-            wedge_reboot &
-            sleep "$REBOOT_WAIT_S"
-            log "no reboot after ${REBOOT_WAIT_S}s: going on without it"
-            kill -USR1 "$$" 2>/dev/null
-        fi
+        # Once it is gone the supervisor reaps it and stops this watcher.
+        _k=0
+        while [ "$_k" -lt "$KILL_POLLS" ]; do
+            sleep "$POLL_S"
+            still_stuck "$_pid" || return 0
+            _k=$((_k + 1))
+        done
+        log "GPU launcher cannot be killed, the driver is stuck: rebooting"
+        wedge_reboot "$_pid" &
+        sleep "$REBOOT_WAIT_S"
+        still_stuck "$_pid" || return 0
+        log "no reboot after ${REBOOT_WAIT_S}s: going on without it"
+        kill -USR1 "$$" 2>/dev/null
         return 0
     done
 }
@@ -334,7 +358,7 @@ run_gles() {
     rm -f "$OWNER"
     child=
     watcher=
-    attempted=
+    rm -f "$COUNTED"
     if [ -n "$_stuck" ]; then
         log "leaving the stuck GPU launcher behind"
         return 1
@@ -371,17 +395,39 @@ if [ "${1:-}" = --clear-gpu-state ]; then
     exit 0
 fi
 
+# Copies the launchers' output to the init, or to the fallback once that fails. It only ends when
+# every writer is gone.
+relay() {
+    trap - TERM INT
+    _to=
+    while IFS= read -r _l; do
+        if [ -z "$_to" ]; then
+            printf '%s\n' "$_l" >&2 && continue
+            _to=$LOG_FALLBACK
+            [ -w "$_to" ] || _to=/dev/null
+            printf 'OMGB-GPU: the log reader is gone: output goes to %s\n' "$_to" >> "$_to"
+        fi
+        printf '%s\n' "$_l" >> "$_to" 2>/dev/null
+    done
+}
+
 mkdir -p "$RUN"
+rm -f "$COUNTED" "$LOG_FIFO"
+if mkfifo "$LOG_FIFO" 2>/dev/null; then
+    relay < "$LOG_FIFO" &
+    # Read-write: the open cannot block, and while this shell lives the relay sees no end of file.
+    exec 1<> "$LOG_FIFO" 2>&1
+else
+    log "no log relay: a dead log reader would stop the launchers"
+fi
 if bounded "$BOUND_S" may_try_gpu; then
-    attempted=1
     if bounded "$BOUND_S" gpu_up; then
         while run_gles "$@" && restart_allowed && bounded "$BOUND_S" attempt; do
-            attempted=1
             sleep 1
         done
     else
         log "GPU bring-up failed: software renderer"
     fi
-    attempted=
+    rm -f "$COUNTED"
 fi
 run_software "$@"

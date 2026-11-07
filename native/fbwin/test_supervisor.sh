@@ -22,12 +22,16 @@ for t in insmod mknod; do
 done
 printf '#!/bin/sh\nwhile :; do sleep 1; done\n' > "$T/fake/hang"
 # A real sync can take longer than the short limits here when the host is busy.
-printf '#!/bin/sh\nexit 0\n' > "$T/fake/sync"
-chmod 755 "$T/fake/hang" "$T/fake/sync"
+# A real sync can also be slow on purpose: $T/sync-slow.
+printf '#!/bin/sh\n[ -e "%s/sync-slow" ] && sleep 0.6\nexit 0\n' "$T" > "$T/fake/sync"
+# A launcher that takes half a second to die after SIGKILL, as SGX may when it lets go.
+printf '#!/bin/sh\n(sleep 0.5; kill -KILL "$1") &\n' > "$T/fake/slowkill"
+chmod 755 "$T/fake/hang" "$T/fake/sync" "$T/fake/slowkill"
 
 # A fresh world, with $W/state on a persistent filesystem. $1: what the GPU launcher does.
 world() {
-    W=$T/w; pkill -KILL -f "$S/" 2>/dev/null; pkill -KILL -f "$T/" 2>/dev/null; rm -rf "$W"; rm -f "$T/calls" "$T/log" "$T"/*-hangs
+    W=$T/w; pkill -KILL -f "$S/" 2>/dev/null; pkill -KILL -f "$T/" 2>/dev/null; rm -rf "$W"; rm -f "$T/calls" "$T/log" "$T"/*-hangs "$T/sync-slow"
+    wait_forever='while :; do sleep 1; done'
     SUP_ENV=; SUP_SIGNAL=TERM; SUP_ARGS='--glassd sock'; sup_lingered=
     mkdir -p "$W/system/bin" "$W/system/vendor/bin" "$W/system/vendor/lib/hw" "$W/lib" "$W/dev" "$W/proc" "$W/state" "$W/run"
     : > "$W/system/bin/linker"; : > "$W/system/vendor/lib/hw/gralloc.omap4430.so"; : > "$W/lib/libglass_fbwin.so"; : > "$W/lib/module.ko"; : > "$W/dev/fb0"
@@ -35,13 +39,22 @@ world() {
     W_REAL=$(cd "$W" && pwd -P)
     printf 'rootfs / rootfs rw 0 0\n/dev/mmcblk0p1 %s/state ext4 rw 0 0\n' "$W_REAL" > "$W/proc/mounts"
     printf '#!/bin/sh\necho "ctl $*" >> "%s/calls"\necho "LD=$LD_LIBRARY_PATH" >> "%s/calls"\n' "$T" "$T" > "$W/system/vendor/bin/pvrsrvctl_SGX540_120"
-    printf '#!/bin/sh\necho "soft $*" >> "%s/calls"\necho soft > "%s/started"\nwhile :; do sleep 1; done\n' "$T" "$W" > "$W/soft"
-    wait_forever='while :; do sleep 1; done'
+    # With $W/soft-talks it writes to stderr, and notes a failed write the way a Rust launcher would panic.
+    cat > "$W/soft" <<G
+#!/bin/sh
+echo "soft \$*" >> "$T/calls"
+echo soft > "$W/started"
+if [ -e "$W/soft-talks" ]; then
+    while :; do echo tick >&2 || { echo epipe >> "$T/calls"; exit 1; }; sleep 0.1; done
+fi
+$wait_forever
+G
     case $1 in
         beat) body='i=0; while :; do i=$((i+1)); echo $i > "$BEATF"; sleep 0.05; done' ;;
         crash) body='exit 3' ;;
         silent) body=$wait_forever ;;
         crash-after-beats) body='i=0; while [ $i -lt 30 ]; do i=$((i+1)); echo $i > "$BEATF"; sleep 0.05; done; exit 3' ;;
+        beat-then-slowsync) body="i=0; while [ \$i -lt 30 ]; do i=\$((i+1)); echo \$i > \"\$BEATF\"; sleep 0.05; done; : > \"$T/sync-slow\"; $wait_forever" ;;
         beat-then-silent) body="i=0; while [ \$i -lt 30 ]; do i=\$((i+1)); echo \$i > \"\$BEATF\"; sleep 0.05; done; $wait_forever" ;;
         crash-and-break-counter) body="mkdir -p \"$W/state/gpu-failures.new\"; exit 3" ;;
         replaced) body="echo 99999 > \"$W/run/launcher-pid\"; $wait_forever" ;;
@@ -60,7 +73,7 @@ launch() { # in a subshell: it becomes the supervisor, and a signal to its PID r
         GLASS_GLES_LAUNCHER="$W/gles" GLASS_SOFT_LAUNCHER="$W/soft" GLASS_FBWIN="$W/lib/libglass_fbwin.so" \
         GLASS_FB="$W/dev/fb0" GLASS_DEV="$W/dev" GLASS_PROC="$W/proc" GLASS_LAUNCHER_STATE="$W/state" \
         GLASS_LAUNCHER_RUN="$W/run" GLASS_REBOOT="touch $W/rebooted" GLASS_SUPERVISOR_POLL_S=0.2 \
-        GLASS_SUPERVISOR_KILL_WAIT_S=0.2 GLASS_SUPERVISOR_REBOOT_WAIT_S=0.2 GLASS_SUPERVISOR_BOUND_S=5 \
+        GLASS_SUPERVISOR_KILL_POLLS=1 GLASS_SUPERVISOR_REBOOT_WAIT_S=0.2 GLASS_SUPERVISOR_BOUND_S=5 \
         $SUP_ENV ${SHELL_UNDER_TEST:-sh} "$SUP" $SUP_ARGS
 }
 
@@ -199,6 +212,13 @@ if ! [ -e "$W/state/gpu-wedges" ] && called '^gles'; then ok "long healthy run f
 world beat; echo 1 > "$W/state/gpu-wedges"; sup 2
 if [ "$(counter gpu-wedges)" = 1 ]; then ok "a short healthy run does not forget them"; else bad "wedges kept"; fi
 
+# A launcher that dies late after the kill is not stuck.
+world beat-then-silent; SUP_ENV="GLASS_KILL=$T/fake/slowkill GLASS_SUPERVISOR_KILL_POLLS=4"; sup 4
+if ! [ -e "$W/rebooted" ] && ! [ -e "$W/state/gpu-wedges" ] && called '^soft' && [ "$(count '^gles')" = 1 ]; then ok "launcher dies 0.5 s after the kill: no reboot, software"; else bad "slow death"; fi
+
+world beat-then-slowsync; SUP_ENV="GLASS_KILL=$T/fake/slowkill"; sup 5
+if ! [ -e "$W/rebooted" ] && ! [ -e "$W/state/gpu-wedges" ] && called '^soft'; then ok "launcher dies while the reboot is prepared: no reboot, not counted"; else bad "death before the reboot ($(counter gpu-wedges))"; fi
+
 # The watcher never outlives its launcher.
 world silent; sup 0.3; sleep 1.5
 if ! [ -e "$W/run/hung" ] && ! [ -e "$W/rebooted" ] && [ -z "$sup_lingered" ]; then ok "SIGTERM: the watcher goes too"; else bad "SIGTERM and the watcher"; fi
@@ -215,6 +235,9 @@ if [ "$(counter gpu-failures)" = 0 ] && ! [ -e "$W/state/no-gpu" ] && called '^g
 
 world beat; echo 1 > "$W/state/gpu-failures"; sup 0.3
 if [ "$(counter gpu-failures)" = 1 ]; then ok "clean stop: an earlier failure stays"; else bad "earlier failure ($(counter gpu-failures))"; fi
+
+world beat; : > "$T/sync-slow"; sup 0.3
+if [ "$(counter gpu-failures)" = 0 ] || ! [ -e "$W/state/gpu-failures" ]; then ok "clean stop while the attempt is being counted: taken back"; else bad "stop during the count ($(counter gpu-failures))"; fi
 
 world beat; SUP_SIGNAL=KILL; sup 0.3
 if [ "$(counter gpu-failures)" = 1 ]; then ok "power cut: counted"; else bad "power cut ($(counter gpu-failures))"; fi
@@ -238,6 +261,15 @@ world crash; ( (launch) 2>&1; echo "supervisor ended" > "$T/ended") | true &
 sleep 2.5
 if called '^soft' && ! [ -e "$T/ended" ]; then ok "log reader gone: the supervisor goes on"; else bad "log reader gone"; fi
 pkill -KILL -f "$S/" 2>/dev/null
+wait 2>/dev/null
+
+world beat; rm "$W/system/vendor/bin/pvrsrvctl_SGX540_120"; : > "$W/soft-talks"; : > "$W/kmsg"; SUP_ENV="GLASS_LOG_FALLBACK=$W/kmsg"
+( (launch) 2>&1 ) | { IFS= read -r _; } &
+sleep 2
+if [ "$(count '^soft')" = 1 ] && ! called epipe && grep -q tick "$W/kmsg" && grep -q 'log reader is gone' "$W/kmsg"; then
+    ok "log reader gone: the launcher's writes go on, into the fallback"; else bad "launcher after the log reader ($(count '^soft'))"; fi
+pkill -KILL -f "$S/" 2>/dev/null
+pkill -KILL -f "$T/" 2>/dev/null
 wait 2>/dev/null
 
 [ "$fails" = 0 ] && echo "supervisor tests passed" || { echo "$fails failed"; exit 1; }

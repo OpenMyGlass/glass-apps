@@ -39,8 +39,8 @@ struct fbwin {
     struct alloc_device_t *gr;
     struct ANativeWindowBuffer bufs[MAX_BUFS];
     int nbufs;
-    int head;  /* next buffer to hand out */
-    int nfree;
+    int head;  /* where the search for the next free buffer starts */
+    int out[MAX_BUFS];  /* dequeued, not yet queued or cancelled */
     int frames;
 };
 
@@ -54,27 +54,46 @@ static int set_interval(struct glass_ANativeWindow *w, int interval)
     return f->fb->setSwapInterval ? f->fb->setSwapInterval(f->fb, interval) : 0;
 }
 
+/* The index of a buffer the client holds, or -1 for one it does not. */
+static int held(const struct fbwin *f, const struct ANativeWindowBuffer *b)
+{
+    int i;
+    for (i = 0; i < f->nbufs; i++)
+        if (b == &f->bufs[i])
+            return f->out[i] ? i : -1;
+    return -1;
+}
+
 static int dequeue(struct glass_ANativeWindow *w, struct ANativeWindowBuffer **out, int *fence)
 {
     struct fbwin *f = (struct fbwin *)w;
-    if (f->nfree <= 0) {
-        LOG("dequeue with no free buffer");
-        return -EBUSY;
+    int i;
+    for (i = 0; i < f->nbufs; i++) {
+        int k = (f->head + i) % f->nbufs;
+        if (f->out[k])
+            continue;
+        f->out[k] = 1;
+        f->head = (k + 1) % f->nbufs;
+        *out = &f->bufs[k];
+        if (fence)
+            *fence = -1;
+        return 0;
     }
-    *out = &f->bufs[f->head];
-    f->head = (f->head + 1) % f->nbufs;
-    f->nfree--;
-    if (fence)
-        *fence = -1;
-    return 0;
+    LOG("dequeue with no free buffer");
+    return -EBUSY;
 }
 
 static int queue(struct glass_ANativeWindow *w, struct ANativeWindowBuffer *b, int fence)
 {
     struct fbwin *f = (struct fbwin *)w;
-    int rc = f->fb->post(f->fb, b->handle);
+    int i = held(f, b), rc;
     (void)fence;
-    f->nfree++;
+    if (i < 0) {
+        LOG("queue of a buffer not dequeued");
+        return -EINVAL;
+    }
+    rc = f->fb->post(f->fb, b->handle);
+    f->out[i] = 0;
     f->frames++;
     if (rc)
         LOG("post failed: %d (frame %d)", rc, f->frames);
@@ -84,11 +103,14 @@ static int queue(struct glass_ANativeWindow *w, struct ANativeWindowBuffer *b, i
 static int cancel(struct glass_ANativeWindow *w, struct ANativeWindowBuffer *b, int fence)
 {
     struct fbwin *f = (struct fbwin *)w;
+    int i = held(f, b);
     (void)fence;
-    if (b < f->bufs || b >= f->bufs + f->nbufs)
+    if (i < 0) {
+        LOG("cancel of a buffer not dequeued");
         return -EINVAL;
-    f->head = (int)(b - f->bufs); /* the cancelled buffer is the next one out */
-    f->nfree++;
+    }
+    f->out[i] = 0;
+    f->head = i; /* the cancelled buffer is the next one out */
     return 0;
 }
 
@@ -159,14 +181,18 @@ static struct fbwin *open_window(void)
     struct hw_device_t *dev = NULL;
     struct fbwin *f;
     int rc, i;
-    void *hw = dlopen("libhardware.so", RTLD_NOW);
-    hw_get_module_fn get = hw ? (hw_get_module_fn)dlsym(hw, "hw_get_module") : NULL;
+    void *hw;
+    hw_get_module_fn get;
 
     if (the_window || tried)
         return the_window;
     tried = 1;
+    hw = dlopen("libhardware.so", RTLD_NOW);
+    get = hw ? (hw_get_module_fn)dlsym(hw, "hw_get_module") : NULL;
     if (!get) {
         LOG("libhardware: %s", dlerror());
+        if (hw)
+            dlclose(hw);
         return NULL;
     }
     rc = get("gralloc", &mod);
@@ -188,6 +214,7 @@ static struct fbwin *open_window(void)
     rc = mod->methods->open(mod, "gpu0", &dev);
     if (rc) {
         LOG("gralloc open: %d", rc);
+        f->fb->common.close(&f->fb->common);
         free(f);
         return NULL;
     }
@@ -215,6 +242,8 @@ static struct fbwin *open_window(void)
         if (rc) {
             LOG("alloc buffer %d: %d", i, rc);
             if (i == 0) {
+                f->gr->common.close(&f->gr->common);
+                f->fb->common.close(&f->fb->common);
                 free(f);
                 return NULL;
             }
@@ -224,7 +253,6 @@ static struct fbwin *open_window(void)
         b->stride = stride;
         LOG("buffer %d: handle=%p stride=%d", i, b->handle, stride);
     }
-    f->nfree = f->nbufs;
     f->win.common.magic = ANDROID_NATIVE_WINDOW_MAGIC;
     f->win.common.version = sizeof(f->win);
     f->win.common.incRef = noref;
