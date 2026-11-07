@@ -123,12 +123,57 @@ pub fn fstype_of(dir: &Path, mounts: &str) -> Option<String> {
         let (Some(m), Some(t)) = (f.get(1), f.get(2)) else {
             continue;
         };
-        let inside = *m == "/" || d == *m || d.starts_with(&format!("{m}/"));
+        let m = &unescape_mount(m);
+        let inside = m == "/" || d == m.as_str() || d.starts_with(&format!("{m}/"));
         if inside && best.as_ref().map_or(true, |(len, _)| m.len() >= *len) {
             best = Some((m.len(), t.to_string()));
         }
     }
     best.map(|(_, t)| t)
+}
+
+/// A mount point as `/proc/mounts` writes it, with a space, tab, newline or backslash as an
+/// octal escape (`\040`, `\011`, `\012`, `\134`), decoded.
+pub fn unescape_mount(m: &str) -> String {
+    let b = m.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let octal = b.get(i + 1..i + 4).filter(|o| {
+            b[i] == b'\\' && o.iter().all(|c| (b'0'..=b'7').contains(c)) && o[0] <= b'3'
+        });
+        match octal {
+            Some(o) => {
+                out.push((o[0] - b'0') * 64 + (o[1] - b'0') * 8 + (o[2] - b'0'));
+                i += 4;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The launcher's state directory: `cli` (`--state-dir`), else the first of
+/// `GLASS_LAUNCHER_STATE_DIR` and `GLASS_LAUNCHER_STATE` (the name the GPU supervisor
+/// exports) that is set and not empty, as the supervisor's `${VAR:-default}` reads it, else
+/// `/var/lib/glass-launcher` when `root`, else none (a host run).
+pub fn state_dir(
+    cli: Option<PathBuf>,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+    root: bool,
+) -> Option<PathBuf> {
+    if let Some(d) = cli.filter(|d| !d.as_os_str().is_empty()) {
+        return Some(d);
+    }
+    for var in ["GLASS_LAUNCHER_STATE_DIR", "GLASS_LAUNCHER_STATE"] {
+        if let Some(d) = env(var).filter(|d| !d.is_empty()) {
+            return Some(d.into());
+        }
+    }
+    root.then(|| PathBuf::from("/var/lib/glass-launcher"))
 }
 
 /// A warning when `dir` is on a filesystem not known to survive a reboot (rootfs, tmpfs,
@@ -188,6 +233,71 @@ mod tests {
         assert_eq!(t("/varnish").as_deref(), Some("rootfs"), "not under /var");
         assert_eq!(t("/run").as_deref(), Some("tmpfs"));
         assert!(PERSISTENT_FS.contains(&"ext4") && !PERSISTENT_FS.contains(&"tmpfs"));
+        // A mount point with a space in it, as the kernel escapes it.
+        let mounts = "rootfs / rootfs rw 0 0\n/dev/sda1 /media/my\\040disk ext4 rw 0 0\n";
+        assert_eq!(
+            fstype_of(Path::new("/media/my disk/state"), mounts).as_deref(),
+            Some("ext4")
+        );
+        assert_eq!(
+            fstype_of(Path::new("/media/my\\040disk"), mounts).as_deref(),
+            Some("rootfs"),
+            "the escape is not the name"
+        );
+    }
+
+    #[test]
+    fn mount_points_are_unescaped() {
+        assert_eq!(
+            unescape_mount("/a\\040b\\011c\\012d\\134e"),
+            "/a b\tc\nd\\e"
+        );
+        assert_eq!(unescape_mount("/plain"), "/plain");
+        // Not an escape: kept as it is.
+        assert_eq!(unescape_mount("/x\\9z\\4"), "/x\\9z\\4");
+    }
+
+    #[test]
+    fn the_state_dir_comes_from_the_flag_then_the_environment_then_root() {
+        use std::ffi::OsString;
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(*v))
+            }
+        };
+        let both = env(&[
+            ("GLASS_LAUNCHER_STATE_DIR", "/a"),
+            ("GLASS_LAUNCHER_STATE", "/b"),
+        ]);
+        assert_eq!(
+            state_dir(Some("/cli".into()), both, true),
+            Some(PathBuf::from("/cli"))
+        );
+        assert_eq!(state_dir(None, both, false), Some(PathBuf::from("/a")));
+        let supervisor = env(&[("GLASS_LAUNCHER_STATE", "/b")]);
+        assert_eq!(
+            state_dir(None, supervisor, false),
+            Some(PathBuf::from("/b"))
+        );
+        // Empty counts as unset, as ${VAR:-...} in the supervisor.
+        let empty = env(&[
+            ("GLASS_LAUNCHER_STATE_DIR", ""),
+            ("GLASS_LAUNCHER_STATE", "/b"),
+        ]);
+        assert_eq!(state_dir(None, empty, false), Some(PathBuf::from("/b")));
+        let all_empty = env(&[
+            ("GLASS_LAUNCHER_STATE_DIR", ""),
+            ("GLASS_LAUNCHER_STATE", ""),
+        ]);
+        assert_eq!(
+            state_dir(None, all_empty, true),
+            Some(PathBuf::from("/var/lib/glass-launcher"))
+        );
+        assert_eq!(state_dir(None, all_empty, false), None);
+        assert_eq!(state_dir(Some("".into()), env(&[]), false), None);
     }
 
     #[test]

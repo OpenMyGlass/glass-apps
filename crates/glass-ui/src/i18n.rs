@@ -210,6 +210,7 @@ messages! {
     AlreadyPaired         => { it: "Un telefono è già associato", en: "A phone is already paired", fr: "Un téléphone est déjà associé", es: "Ya hay un teléfono vinculado" },
     PairingCouldNotOpen   => { it: "Non è stato possibile aprirla", en: "It could not be opened", fr: "Impossible de l'ouvrir", es: "No se pudo abrir" },
     PairingNotAllowed     => { it: "Il launcher non ha il permesso di farlo", en: "The launcher is not allowed to do this", fr: "Le lanceur n'a pas le droit de le faire", es: "El lanzador no tiene permiso para hacerlo" },
+    PrivilegedUidHint     => { it: "glassd deve ammettere l'uid del launcher con --privileged-uid", en: "glassd must allow the launcher's uid with --privileged-uid", fr: "glassd doit autoriser l'uid du lanceur avec --privileged-uid", es: "glassd debe permitir el uid del lanzador con --privileged-uid" },
     PhoneLinkDisabled     => { it: "Il collegamento al telefono è disattivato", en: "The phone link is disabled", fr: "La liaison au téléphone est désactivée", es: "El enlace con el teléfono está desactivado" },
     PhoneNotForgotten     => { it: "Telefono non dimenticato", en: "Phone not forgotten", fr: "Téléphone non oublié", es: "Teléfono no olvidado" },
     BondNotErased         => { it: "Non è stato possibile cancellare l'associazione", en: "The pairing could not be erased", fr: "L'association n'a pas pu être effacée", es: "No se pudo borrar la vinculación" },
