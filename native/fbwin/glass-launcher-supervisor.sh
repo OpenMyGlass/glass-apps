@@ -51,6 +51,8 @@ ALLOW_VOLATILE=${GLASS_GPU_ALLOW_VOLATILE_STATE:-0}
 POLL_S=${GLASS_SUPERVISOR_POLL_S:-5}
 KILL_POLLS=${GLASS_SUPERVISOR_KILL_POLLS:-3}   # polls of POLL_S after the kill: SGX can take seconds to let go
 LOG_FALLBACK=${GLASS_LOG_FALLBACK:-/dev/kmsg}
+TERM_WAIT_S=${GLASS_SUPERVISOR_TERM_WAIT_S:-5}         # a clean stop waits this long for the state
+RELAY_CHECK_S=${GLASS_SUPERVISOR_RELAY_CHECK_S:-30}    # while a launcher runs, how often the relay is checked
 REBOOT_WAIT_S=${GLASS_SUPERVISOR_REBOOT_WAIT_S:-15}
 BOUND_S=${GLASS_SUPERVISOR_BOUND_S:-30}
 WEDGE_CLEAR_POLLS=${GLASS_SUPERVISOR_WEDGE_CLEAR_POLLS:-720}   # an hour of beats
@@ -88,6 +90,7 @@ wake=
 keeper=
 relay_on=
 bwait=
+tick=
 
 count() {
     _c=$(cat "$STATE/$1" 2>/dev/null)
@@ -120,23 +123,38 @@ on_term() {
     for _p in "$watcher" "$timer"; do
         [ -n "$_p" ] && kill "$_p" 2>/dev/null
     done
-    # A count being written is let finish, or its mv could land after the undo.
-    if [ -n "$child" ] && [ -n "$bwait" ]; then
-        wait "$child"
-    elif [ -n "$child" ]; then
-        kill "$child" 2>/dev/null
-    fi
+    [ -n "$child" ] && [ -z "$bwait" ] && kill "$child" 2>/dev/null
     rm -f "$OWNER"
     kill_tool
-    undo_attempt
-    [ -n "$keeper" ] && kill "$keeper" 2>/dev/null
-    _p=$(cat "$RELAY_PID" 2>/dev/null)
-    [ -n "$_p" ] && kill "$_p" 2>/dev/null
+    # A count being written is let finish, or its mv could land after the undo; then the count
+    # goes back. Each within TERM_WAIT_S, then killed: a stuck disk must not hold the shutdown. A
+    # trap cannot run inside this one in every shell, so the timer kills instead of signalling.
+    _late=
+    if [ -n "$child" ] && [ -n "$bwait" ]; then
+        term_bounded "$child" || _late=1
+    fi
+    if [ -z "$_late" ]; then
+        undo_attempt &
+        term_bounded "$!" || _late=1
+    fi
+    [ -n "$_late" ] && log "stopping: the state did not answer in ${TERM_WAIT_S}s, the count stays"
+    stop_relay
     exit 143
 }
+# Waits for $1 for TERM_WAIT_S at most; false if it had to be killed.
+term_bounded() {
+    (sleep "$TERM_WAIT_S"; kill -KILL "$1" 2>/dev/null) &
+    _tt=$!
+    wait "$1"
+    _rt=$?
+    kill "$_tt" 2>/dev/null
+    [ "$_rt" != 137 ]
+}
+
 trap on_term TERM INT
 trap '' HUP          # the relay and the launchers inherit this
-trap 'wake=1' USR1   # interrupts a wait: see bounded and watch_beat
+trap 'wake=1' USR1   # interrupts a wait: see bounded, watch_beat and on_term
+trap 'tick=1' USR2   # interrupts a wait to check the relay: see wait_launcher
 trap '' PIPE         # whoever reads the log may die; the UI must not die with it
 
 # Runs a command in the background and returns its status, or 124 after $1 seconds. It does not
@@ -148,7 +166,7 @@ bounded() {
     case "$1" in may_try_gpu|attempt) bwait=1 ;; *) bwait= ;; esac
     "$@" &
     child=$!
-    (sleep "$_limit"; kill -USR1 $$) &
+    (sleep "$_limit"; kill -USR1 $$ 2>/dev/null) &
     timer=$!
     wait "$child"
     _rc=$?
@@ -380,12 +398,12 @@ run_gles() {
     watch_beat "$child" &
     watcher=$!
     wake=
-    wait "$child"
-    _rc=$?
+    wait_launcher "$child"
     _stuck=$wake
     ensure_relay
     kill "$watcher" 2>/dev/null   # no wait: nothing here may block the fallback
-    rm -f "$OWNER"
+    # A stuck launcher stays the owner, so that the reboot under way is not called off.
+    [ -n "$_stuck" ] || rm -f "$OWNER"
     child=
     watcher=
     rm -f "$COUNTED"
@@ -405,14 +423,35 @@ restart_allowed() {
     return 1
 }
 
+# Waits for the launcher $1 and sets _rc, or returns when USR1 sets wake. Every RELAY_CHECK_S
+# it looks at the relay: a launcher writing into a FIFO nobody reads would stop.
+wait_launcher() {
+    while :; do
+        tick=
+        (sleep "$RELAY_CHECK_S"; kill -USR2 $$ 2>/dev/null) &
+        _t=$!
+        wait "$1"
+        _rc=$?
+        kill "$_t" 2>/dev/null
+        [ -n "$wake" ] && return 0
+        [ -n "$tick" ] || return 0
+        ensure_relay
+        if ! kill -0 "$1" 2>/dev/null; then
+            wait "$1"
+            _rc=$?
+            return 0
+        fi
+    done
+}
+
 run_software() {
     while :; do
         ensure_relay
         log "starting the software launcher"
         "$SOFT_LAUNCHER" --renderer software --display fb "$FB" "$@" >&8 2>&8 8>&- &
         child=$!
-        wait "$child"
-        _rc=$?
+        wake=
+        wait_launcher "$child"
         child=
         log "software launcher ended, status $_rc"
         sleep 1
@@ -443,32 +482,64 @@ relay() {
 }
 
 # Starts the relay again whenever it ends: without it every writer blocks once the FIFO is full.
-# Ends with the supervisor.
+# Every POLL_S it looks at the supervisor, and when that is gone it stops the relay and ends.
 relay_keeper() {
     trap - TERM INT
     echo -1000 > /proc/self/oom_score_adj 2>/dev/null
     while kill -0 "$$" 2>/dev/null; do
         # Read-write, so the relay never sees end of file and only ends when killed.
         (echo -1000 > /proc/self/oom_score_adj 2>/dev/null; relay) <> "$LOG_FIFO" &
-        echo "$!" > "$RELAY_PID"
-        wait "$!"
-        sleep 1
+        _r=$!
+        echo "$_r" > "$RELAY_PID"
+        while kill -0 "$_r" 2>/dev/null; do
+            sleep "$POLL_S"
+            if ! kill -0 "$$" 2>/dev/null; then
+                kill -KILL "$_r" 2>/dev/null
+                return 0
+            fi
+        done
     done
+}
+
+# True if process $1 runs this script: a PID from a file may have been reused.
+ours() {
+    case "$(tr '\000' ' ' < "/proc/$1/cmdline" 2>/dev/null)" in
+        *glass-launcher-supervisor*) return 0 ;;
+    esac
+    return 1
+}
+
+# Kills every relay on $1, that is every process of this script whose stdin is that FIFO. A
+# relay whose PID never reached the file is found too, so there are never two readers.
+kill_relays() {
+    for _d in /proc/[0-9]*; do
+        [ "$_d/fd/0" -ef "$1" ] 2>/dev/null || continue
+        _p=${_d#/proc/}
+        [ "$_p" != "$$" ] && ours "$_p" && kill -KILL "$_p" 2>/dev/null
+    done
+}
+
+stop_relay() {
+    [ -n "$keeper" ] && kill -KILL "$keeper" 2>/dev/null
+    [ -n "$relay_on" ] && kill_relays "$LOG_FIFO"
 }
 
 # In this shell only, between waits: a keeper that was killed is started again.
 ensure_relay() {
     [ -n "$relay_on" ] || return 0
     [ -n "$keeper" ] && kill -0 "$keeper" 2>/dev/null && return 0
-    _p=$(cat "$RELAY_PID" 2>/dev/null)
-    [ -n "$_p" ] && kill -KILL "$_p" 2>/dev/null   # never two readers on the FIFO
+    kill_relays "$LOG_FIFO"
     relay_keeper 8>&- &
     keeper=$!
     echo "$keeper" > "$KEEPER_PID"
 }
 
 mkdir -p "$RUN"
-rm -f "$COUNTED" "$LOG_FIFO" "$RELAY_PID"
+# A relay and keeper left by an earlier supervisor go first.
+_p=$(cat "$KEEPER_PID" 2>/dev/null)
+[ -n "$_p" ] && [ "$_p" != "$$" ] && ours "$_p" && kill -KILL "$_p" 2>/dev/null
+[ -p "$LOG_FIFO" ] && kill_relays "$LOG_FIFO"
+rm -f "$COUNTED" "$LOG_FIFO" "$RELAY_PID" "$KEEPER_PID"
 if mkfifo "$LOG_FIFO" 2>/dev/null; then
     relay_on=1
     ensure_relay

@@ -76,6 +76,7 @@ launch() { # in a subshell: it becomes the supervisor, and a signal to its PID r
         GLASS_INSMOD="$T/fake/insmod" GLASS_MKNOD="$T/fake/mknod" GLASS_SYNC="$T/fake/sync" \
         GLASS_LAUNCHER_RUN="$W/run" GLASS_REBOOT="touch $W/rebooted" GLASS_SUPERVISOR_POLL_S=0.2 \
         GLASS_SUPERVISOR_KILL_POLLS=1 GLASS_SUPERVISOR_REBOOT_WAIT_S=0.2 GLASS_SUPERVISOR_BOUND_S=5 \
+        GLASS_SUPERVISOR_TERM_WAIT_S=2 GLASS_SUPERVISOR_RELAY_CHECK_S=0.5 \
         $SUP_ENV ${SHELL_UNDER_TEST:-sh} "$SUP" $SUP_ARGS
 }
 
@@ -95,6 +96,12 @@ sup() { # seconds, then $SUP_SIGNAL
     sleep 0.1
 }
 # The next boot: what is in RAM is gone, the state stays.
+# The processes reading the FIFO: there must never be more than one.
+readers() {
+    _n=0
+    for _d in /proc/[0-9]*; do [ "$_d/fd/0" -ef "$W/run/log" ] 2>/dev/null && _n=$((_n + 1)); done
+    echo "$_n"
+}
 reboot_world() { rm -rf "$W/run" "$W/rebooted" "$W/dev/__properties__"; mkdir -p "$W/run"; rm -f "$T/calls"; }
 called() { grep -q -- "$1" "$T/calls" 2>/dev/null; }
 count() { grep -c -- "$1" "$T/calls" 2>/dev/null; }
@@ -279,6 +286,36 @@ after=$(grep -c tick "$T/log")
 if [ "$after" -gt $((before + 5)) ] && [ "$(count '^soft')" = 1 ]; then ok "relay killed: started again, the launcher's lines go on"; else bad "relay restart ($before $after)"; fi
 kill "$sup_p" 2>/dev/null; sleep 0.2; kill -KILL "$sup_p" 2>/dev/null; wait "$sup_p" 2>/dev/null
 pkill -KILL -f "$S/" 2>/dev/null; pkill -KILL -f "$T/" 2>/dev/null
+
+# The keeper and the relay are killed while the software launcher writes: the supervisor starts
+# them again, and there is one reader.
+world beat; rm "$W/system/vendor/bin/pvrsrvctl_SGX540_120"; : > "$W/soft-talks"
+(launch) >> "$T/log" 2>&1 &
+sup_p=$!
+sleep 0.5
+kill -KILL "$(cat "$W/run/relay-keeper.pid")" "$(cat "$W/run/relay.pid")" 2>/dev/null
+sleep 0.2
+before=$(grep -c tick "$T/log")
+sleep 2
+after=$(grep -c tick "$T/log")
+if [ "$after" -gt $((before + 5)) ] && [ "$(readers)" = 1 ] && [ "$(count '^soft')" = 1 ]; then ok "keeper and relay killed under the software launcher: back, one reader"; else bad "keeper and relay killed ($before $after $(readers))"; fi
+kill "$sup_p" 2>/dev/null; sleep 0.2; kill -KILL "$sup_p" 2>/dev/null; wait "$sup_p" 2>/dev/null
+pkill -KILL -f "$S/" 2>/dev/null; pkill -KILL -f "$T/" 2>/dev/null
+
+# Keeper and relay end with a supervisor killed outright.
+world beat; rm "$W/system/vendor/bin/pvrsrvctl_SGX540_120"
+(launch) >> "$T/log" 2>&1 &
+sup_p=$!
+sleep 0.5
+kp=$(cat "$W/run/relay-keeper.pid"); rp=$(cat "$W/run/relay.pid")
+kill -KILL "$sup_p"; wait "$sup_p" 2>/dev/null
+sleep 1.5
+if ! kill -0 "$kp" 2>/dev/null && ! kill -0 "$rp" 2>/dev/null && [ "$(readers)" = 0 ]; then ok "supervisor killed: keeper and relay go"; else bad "keeper and relay outlive the supervisor"; fi
+pkill -KILL -f "$S/" 2>/dev/null; pkill -KILL -f "$T/" 2>/dev/null
+
+# A stuck disk does not hold a clean stop.
+world beat; mkfifo "$W/state/gpu-failures"; SUP_STOP_WAIT=3.5; sup 0.5; SUP_STOP_WAIT=
+if [ -z "$sup_lingered" ] && grep -q 'did not answer' "$T/log"; then ok "stop with a stuck disk: within the limit"; else bad "stop with a stuck disk"; fi
 
 # The relay is killed and the GPU launcher fills the FIFO, then hangs: it must still be killed,
 # and the software launcher must start.
