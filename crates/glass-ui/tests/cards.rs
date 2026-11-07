@@ -10,6 +10,7 @@ fn ctx(now_s: i64) -> RenderContext {
         locale: glass_ui::Locale::En,
         time_24h: true,
         battery_percent: None,
+        on_power: false,
     }
 }
 
@@ -229,15 +230,47 @@ fn a_very_long_text_is_cut_but_stays_inside_the_card() {
 }
 
 #[test]
-fn the_battery_is_shown_small_above_the_clock() {
-    let top_row_lit = |battery_percent| {
+fn the_battery_is_shown_small_at_the_top_left() {
+    let lit = |battery_percent, xs: std::ops::Range<u32>| {
         let ctx = RenderContext {
             battery_percent,
             ..RenderContext::default()
         };
         let f = render_card(&Card::new(10, CardContent::Home), &ctx, 640, 360);
-        (0..640).any(|x| (0..70).any(|y| f.pixel(x, y) != Color::BLACK))
+        xs.clone()
+            .any(|x| (0..70).any(|y| f.pixel(x, y) != Color::BLACK))
     };
-    assert!(top_row_lit(Some(87)));
-    assert!(!top_row_lit(None));
+    assert!(lit(Some(100), 40..160), "at the left margin");
+    assert!(!lit(Some(100), 0..40), "not past the margin");
+    assert!(
+        !lit(Some(100), 160..640),
+        "nothing in the middle or on the right"
+    );
+    assert!(!lit(None, 0..640), "nothing without a reading");
+}
+
+#[test]
+fn a_dot_follows_the_battery_only_on_external_power() {
+    let render = |on_power| {
+        let ctx = RenderContext {
+            battery_percent: Some(100),
+            on_power,
+            ..RenderContext::default()
+        };
+        render_card(&Card::new(10, CardContent::Home), &ctx, 640, 360)
+    };
+    let (off, on) = (render(false), render(true));
+    let changed: Vec<(u32, u32)> = (0..640)
+        .flat_map(|x| (0..360).map(move |y| (x, y)))
+        .filter(|&(x, y)| off.pixel(x, y) != on.pixel(x, y))
+        .collect();
+    assert!(!changed.is_empty(), "the dot is drawn");
+    let last_text_x = (0..640)
+        .filter(|&x| (0..70).any(|y| off.pixel(x, y) != Color::BLACK))
+        .max()
+        .expect("the battery text");
+    assert!(
+        changed.iter().all(|&(x, y)| x > last_text_x && y < 70),
+        "only to the right of the text, at its height"
+    );
 }

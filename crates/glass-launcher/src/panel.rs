@@ -29,6 +29,7 @@ impl Panel {
             locale: Locale::DEFAULT,
             time_24h: true,
             battery_percent: None,
+            on_power: false,
         };
         let same = glass_ui::card::render_key(self.screen.current_card(), &FIXED)
             == glass_ui::card::render_key(&Card::new(0, content.clone()), &FIXED);

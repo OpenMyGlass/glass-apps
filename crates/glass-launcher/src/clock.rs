@@ -12,11 +12,13 @@ pub fn now() -> RenderContext {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let (hour, minute) = local_hour_minute(now_s);
+    let battery = battery();
     RenderContext {
         now_s,
         hour,
         minute,
-        battery_percent: battery_percent(),
+        battery_percent: battery.percent,
+        on_power: battery.on_power,
         ..RenderContext::default()
     }
 }
@@ -37,13 +39,21 @@ pub fn set_timezone(posix_tz: &str) {
 #[cfg(not(unix))]
 pub fn set_timezone(_posix_tz: &str) {}
 
-/// How long a battery reading is reused.
-const BATTERY_MAX_AGE: Duration = Duration::from_secs(30);
+/// How long a battery reading is reused. Short enough that plugging the cable in shows soon.
+const BATTERY_MAX_AGE: Duration = Duration::from_secs(5);
 
-/// The battery charge, re-read at most every [`BATTERY_MAX_AGE`] (this runs on every frame).
-fn battery_percent() -> Option<u8> {
-    static LAST: Mutex<Option<(Instant, Option<u8>)>> = Mutex::new(None);
-    let mut last = LAST.lock().ok()?;
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Battery {
+    percent: Option<u8>,
+    on_power: bool,
+}
+
+/// The battery state, re-read at most every [`BATTERY_MAX_AGE`] (this runs on every frame).
+fn battery() -> Battery {
+    static LAST: Mutex<Option<(Instant, Battery)>> = Mutex::new(None);
+    let Ok(mut last) = LAST.lock() else {
+        return Battery::default();
+    };
     if let Some((at, v)) = *last {
         if at.elapsed() < BATTERY_MAX_AGE {
             return v;
@@ -54,18 +64,37 @@ fn battery_percent() -> Option<u8> {
     v
 }
 
-/// The `capacity` of the first supply of `type` Battery under `root`.
-fn read_battery(root: &Path) -> Option<u8> {
-    for entry in std::fs::read_dir(root).ok()?.flatten() {
+/// The `capacity` of the first supply of `type` Battery under `root`, and whether external
+/// power is there: a supply that reports `online` decides, since the gauge's `status` follows
+/// the current and says Discharging while the screen draws more than the cable gives. Without
+/// any such supply, the gauge's `status` is all there is.
+fn read_battery(root: &Path) -> Battery {
+    let mut percent = None;
+    let mut status = false;
+    let mut online = None;
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Battery::default();
+    };
+    for entry in entries.flatten() {
         let dir = entry.path();
-        let kind = std::fs::read_to_string(dir.join("type")).unwrap_or_default();
-        if kind.trim() != "Battery" {
-            continue;
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        if read("type").trim() == "Battery" {
+            if percent.is_none() {
+                percent = read("capacity")
+                    .trim()
+                    .parse::<u8>()
+                    .ok()
+                    .map(|p| p.min(100));
+                status = matches!(read("status").trim(), "Charging" | "Full");
+            }
+        } else if let Ok(v) = read("online").trim().parse::<u8>() {
+            online = Some(online.unwrap_or(false) || v != 0);
         }
-        let capacity = std::fs::read_to_string(dir.join("capacity")).ok()?;
-        return capacity.trim().parse::<u8>().ok().map(|p| p.min(100));
     }
-    None
+    Battery {
+        percent,
+        on_power: online.unwrap_or(status),
+    }
 }
 
 /// A fixed clock: `now_s` and the given wall-clock time. The locale is left at the default;
@@ -113,6 +142,43 @@ fn utc_hour_minute(now_s: i64) -> (u8, u8) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn supply(root: &Path, name: &str, files: &[(&str, &str)]) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (f, v) in files {
+            std::fs::write(dir.join(f), v).unwrap();
+        }
+    }
+
+    #[test]
+    fn the_cable_decides_external_power_and_the_gauge_is_the_fallback() {
+        let t = std::env::temp_dir().join(format!("omg-battery-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let gauge = |status: &'static str| {
+            [
+                ("type", "Battery"),
+                ("capacity", "42\n"),
+                ("status", status),
+            ]
+        };
+        supply(&t, "bat", &gauge("Discharging\n"));
+        assert_eq!(
+            read_battery(&t),
+            Battery {
+                percent: Some(42),
+                on_power: false
+            }
+        );
+        supply(&t, "bat", &gauge("Charging\n"));
+        assert!(read_battery(&t).on_power, "no other supply: the gauge says");
+        supply(&t, "usb", &[("type", "USB"), ("online", "0\n")]);
+        assert!(!read_battery(&t).on_power, "the cable is out");
+        supply(&t, "bat", &gauge("Discharging\n"));
+        supply(&t, "usb", &[("type", "USB"), ("online", "1\n")]);
+        assert!(read_battery(&t).on_power, "the cable is in");
+        let _ = std::fs::remove_dir_all(&t);
+    }
 
     #[test]
     fn parses_times() {

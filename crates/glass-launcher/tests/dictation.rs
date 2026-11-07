@@ -23,6 +23,7 @@ fn ctx() -> RenderContext {
         locale: glass_ui::Locale::En,
         time_24h: true,
         battery_percent: None,
+        on_power: false,
     }
 }
 
