@@ -7,6 +7,10 @@
 //! - **Dictation:** [`Request::DictationStart`] and `DictationCancel` go to glassd; its
 //!   `DictationState`, `Transcript` and an error answer to the start (matched by `seq`)
 //!   go to the app.
+//! - **Pairing:** [`Request::PairingWindow`] and [`Request::ForgetBond`] become
+//!   `CompanionPairingWindow` and `CompanionForgetBond`; an error answer to either (matched by
+//!   `seq`, `ERROR_CODE_UNSUPPORTED` from a glassd without the pairing mode) goes to the app,
+//!   and the result comes back on `TOPIC_COMPANION` (`pairing_until_us`, `paired`, `paired_name`).
 //! - **Input:** `Gesture` and `Scroll` become [`InputEvent`]s field by field
 //!   ([`to_input`]); they are ignored while the launcher does not hold the focus
 //!   (`FocusState{focused:false}`, an app is in front).
@@ -17,13 +21,14 @@
 //!   until the next minute (the home clock) at rest, without a timeout while the screen is
 //!   off. When `glassd` goes away it reconnects with a [`Backoff`].
 
+use crate::pairing::PairRequest;
 use crate::settings::ServiceInfo;
 use crate::setup::Companion;
 use crate::{App, Request};
 use glass_api::proto::{
-    client_frame, screen_request, service_frame, DictationCancel, DictationStart, ErrorCode,
-    GestureKind as ProtoKind, Screen, ScreenRequest, ScreenState, ServiceFrame, SetSettings,
-    Settings, Topic,
+    client_frame, screen_request, service_frame, CompanionForgetBond, CompanionPairingWindow,
+    DictationCancel, DictationStart, ErrorCode, GestureKind as ProtoKind, Screen, ScreenRequest,
+    ScreenState, ServiceFrame, SetSettings, Settings, Topic,
 };
 use glass_api::{Client, ClientError};
 use glass_gfx::{Display, GfxError};
@@ -172,6 +177,8 @@ pub struct Session {
     reacquire: bool,
     /// `seq` and request id of the last `DictationStart`, to match an error answer.
     dictation_seq: Option<(u32, u32)>,
+    /// `seq` and kind of the pairing requests sent, to match an error answer.
+    pairing_seqs: Vec<(u32, PairRequest)>,
     settings: Option<Settings>,
     log: Vec<String>,
 }
@@ -205,6 +212,7 @@ impl Session {
             wants_focus,
             reacquire,
             dictation_seq: None,
+            pairing_seqs: Vec::new(),
             settings: None,
             log: Vec::new(),
         })
@@ -224,6 +232,7 @@ impl Session {
             if self.focused {
                 app.cancel_touch();
             }
+            app.focus_lost();
             self.focused = false;
         }
         Ok(())
@@ -295,6 +304,9 @@ impl Session {
                 if self.focused && !f.focused {
                     app.cancel_touch();
                 }
+                if !f.focused {
+                    app.focus_lost();
+                }
                 self.focused = f.focused;
                 if !f.focused && self.wants_focus && self.reacquire {
                     self.client.acquire_focus()?;
@@ -306,6 +318,9 @@ impl Session {
                 provider: c.provider,
                 connected: c.phone_connected,
                 phone_name: c.phone_name,
+                paired: c.paired,
+                paired_name: c.paired_name,
+                pairing_until_us: c.pairing_until_us,
             }),
             service_frame::Body::DictationState(d) => app.dictation_state(&d),
             service_frame::Body::Transcript(t) => app.dictation_transcript(&t),
@@ -315,6 +330,15 @@ impl Session {
                 app.settings_changed(s);
             }
             service_frame::Body::Error(e) => {
+                let pairing = self.pairing_seqs.iter().position(|&(s, _)| s == e.seq);
+                if let (Some(i), true) = (pairing, e.seq != 0) {
+                    let (_, request) = self.pairing_seqs.remove(i);
+                    app.pairing_refused(
+                        request,
+                        ErrorCode::try_from(e.code).unwrap_or(ErrorCode::Unspecified),
+                        &e.message,
+                    );
+                }
                 if let Some((seq, request_id)) = self.dictation_seq {
                     if e.seq == seq && seq != 0 {
                         self.dictation_seq = None;
@@ -365,6 +389,35 @@ impl Session {
                         }))?;
                     self.log.push(format!("DictationCancel {request_id}"));
                 }
+                Request::PairingWindow { open, duration_ms } => {
+                    let seq = self
+                        .client
+                        .send(client_frame::Body::CompanionPairingWindow(
+                            CompanionPairingWindow { open, duration_ms },
+                        ))?;
+                    let kind = if open {
+                        PairRequest::Open
+                    } else {
+                        PairRequest::Close
+                    };
+                    self.track_pairing(seq, kind);
+                    self.log.push(format!(
+                        "CompanionPairingWindow open={open} {duration_ms} ms"
+                    ));
+                }
+                Request::ForgetBond => {
+                    let seq = self.client.send(client_frame::Body::CompanionForgetBond(
+                        CompanionForgetBond {},
+                    ))?;
+                    self.track_pairing(seq, PairRequest::Forget);
+                    self.log.push("CompanionForgetBond".into());
+                }
+                Request::KeepScreenOnFor(ms) => {
+                    self.client.send(client_frame::Body::Screen(ScreenRequest {
+                        action: screen_request::Action::KeepOn as i32,
+                        duration_ms: ms,
+                    }))?;
+                }
                 Request::KeepScreenOn(on) => {
                     let action = if on {
                         screen_request::Action::KeepOn
@@ -380,6 +433,14 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    fn track_pairing(&mut self, seq: u32, kind: PairRequest) {
+        // Only errors are answered: a request that succeeded must not stay here for ever.
+        if self.pairing_seqs.len() >= 8 {
+            self.pairing_seqs.remove(0);
+        }
+        self.pairing_seqs.push((seq, kind));
     }
 
     /// Sends pending requests, then waits up to `timeout` (`None`: no limit) for a frame,
@@ -447,7 +508,7 @@ impl Default for LoopOptions {
 }
 
 /// How long the loop may block: a frame while moving, until the next minute at rest (the
-/// home clock), forever while the screen is off; never more than `max_wait`.
+/// home clock) or the next second of the pairing countdown, forever while the screen is off; never more than `max_wait`.
 pub fn wait_time(app: &App, now_s: i64, fps: u32, max_wait: Option<Duration>) -> Option<Duration> {
     let wait = if !app.screen_on() {
         None
@@ -455,7 +516,12 @@ pub fn wait_time(app: &App, now_s: i64, fps: u32, max_wait: Option<Duration>) ->
         Some(Duration::from_micros(1_000_000 / fps.max(1) as u64))
     } else {
         let to_minute = 60 - now_s.rem_euclid(60) as u64;
-        Some(Duration::from_secs(to_minute) + Duration::from_millis(5))
+        let at_rest = Duration::from_secs(to_minute) + Duration::from_millis(5);
+        // The pairing countdown: wake when the time left shown changes.
+        Some(match app.next_change() {
+            Some(d) => at_rest.min(d + Duration::from_millis(5)),
+            None => at_rest,
+        })
     };
     match (wait, max_wait) {
         (Some(w), Some(m)) => Some(w.min(m)),

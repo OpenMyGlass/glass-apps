@@ -95,6 +95,8 @@ pub fn run(
     let timeline = demo::device_timeline(ctx.now_s, platform.name(), comp.name());
     let mut app = App::with_compositor(timeline, ctx, comp).with_platform(platform);
     app.follow_glassd();
+    // The phone bond seen and an unanswered question about it, next to the setup marker.
+    app.set_state_dir(cfg.files_dir.clone());
     if app.start_setup(Some(cfg.files_dir.join(SETUP_MARKER))) {
         native.log(false, "setup flow started");
     }

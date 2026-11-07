@@ -39,6 +39,28 @@ pub fn set_timezone(posix_tz: &str) {
 #[cfg(not(unix))]
 pub fn set_timezone(_posix_tz: &str) {}
 
+/// `CLOCK_MONOTONIC` in microseconds: the clock of glassd's `timestamp_us` (docs/api.md,
+/// "Time"), so a time glassd sends, such as `CompanionState.pairing_until_us`, compares with it.
+#[cfg(unix)]
+pub fn monotonic_us() -> u64 {
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `ts` is a valid timespec to write into; CLOCK_MONOTONIC always exists.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64)
+        .saturating_mul(1_000_000)
+        .saturating_add(ts.tv_nsec as u64 / 1_000)
+}
+
+/// Without `CLOCK_MONOTONIC`: the time since the first call (there is no glassd to compare with).
+#[cfg(not(unix))]
+pub fn monotonic_us() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
 /// How long a battery reading is reused. Short enough that plugging the cable in shows soon.
 const BATTERY_MAX_AGE: Duration = Duration::from_secs(5);
 

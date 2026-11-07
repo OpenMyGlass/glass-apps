@@ -59,6 +59,12 @@ pub struct Companion {
     pub provider: bool,
     pub connected: bool,
     pub phone_name: String,
+    /// A phone is bonded (glassd holds the link, Model B), whether connected or not.
+    pub paired: bool,
+    /// The bonded phone's name (empty if none or unknown).
+    pub paired_name: String,
+    /// The pairing mode is open until this `CLOCK_MONOTONIC` time, in µs; 0 when closed.
+    pub pairing_until_us: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +397,7 @@ mod tests {
             provider: true,
             connected: true,
             phone_name: "Pixel".into(),
+            ..Default::default()
         });
         let fx = s.input(&g(GestureKind::Tap));
         assert_eq!(

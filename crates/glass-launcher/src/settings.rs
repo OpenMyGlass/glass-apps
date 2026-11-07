@@ -1,7 +1,8 @@
 //! The settings cards and the card menus.
 //!
 //! Settings cards sit on the backward side of the timeline, after the "now" cards: Wi-Fi,
-//! Bluetooth, screen timeout, head wake, on-head detection, power off when removed, nudge to
+//! Bluetooth, the phone (pairing, with glassd's `companion-link`; see [`crate::pairing`]),
+//! screen timeout, head wake, on-head detection, power off when removed, nudge to
 //! sleep, device (wink is hidden until the glasshub firmware delivers wink events).
 //! What they show comes from [`SettingsView`]: the `Settings` that `glassd` applied (so a
 //! clamped value is shown as applied), the platform's radios, and the service's
@@ -32,6 +33,14 @@ pub mod ids {
     pub const TIME_FORMAT: CardId = 112;
     pub const TIMEZONE: CardId = 113;
     pub const POWER_OFF: CardId = 114;
+    /// "Pair phone", or the paired phone (only with glassd's `companion-link` capability).
+    pub const PHONE: CardId = 115;
+    /// The menus that ask before forgetting the phone and after a phone bonded. They belong
+    /// to no card of [`super::ORDER`], so a settings change does not rebuild them.
+    pub const PHONE_QUESTION: CardId = 116;
+    /// The question asked after any bond ([`super::paired_question`]); while it is unanswered
+    /// it comes back at each wake.
+    pub const BOND_QUESTION: CardId = 117;
 }
 
 /// The settings cards from the one next to the "now" cards to the farthest.
@@ -39,9 +48,10 @@ pub mod ids {
 /// The wink card ([`ids::WINK`]) is not shown: the Glass glasshub firmware (1.22) never
 /// delivers a wink event, so the toggle did nothing the owner could see. `glassd` keeps the
 /// setting; the card comes back here once the MCU wink threshold is tuned.
-pub const ORDER: [CardId; 12] = [
+pub const ORDER: [CardId; 13] = [
     ids::WIFI,
     ids::BLUETOOTH,
+    ids::PHONE,
     ids::VOLUME,
     ids::SCREEN_TIMEOUT,
     ids::HEAD_WAKE,
@@ -72,6 +82,15 @@ pub struct ServiceInfo {
     pub capabilities: Vec<String>,
 }
 
+/// The phone bond, as glassd reports it, for the "Pair phone" card.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PhoneView {
+    pub paired: bool,
+    pub paired_name: String,
+    /// glassd answered `ERROR_CODE_UNSUPPORTED` to a pairing request: it has no pairing mode.
+    pub unsupported: bool,
+}
+
 /// Everything the settings cards show.
 #[derive(Clone, Debug)]
 pub struct SettingsView {
@@ -85,6 +104,7 @@ pub struct SettingsView {
     pub renderer: &'static str,
     /// The language every card text is built in.
     pub locale: Locale,
+    pub phone: PhoneView,
 }
 
 /// What a menu item does.
@@ -100,6 +120,21 @@ pub enum Choice {
     SetLocale(Locale),
     /// Remove the card from the timeline.
     Delete(CardId),
+    /// Open the pairing mode; first, with `radios`, turn Bluetooth on and airplane mode off
+    /// with this patch (the menu item said so).
+    Pair {
+        radios: Option<Settings>,
+    },
+    /// Ask before forgetting the phone.
+    AskForget,
+    /// Forget the bonded phone (`CompanionForgetBond`).
+    Forget,
+    /// The owner says the phone that bonded is theirs (nothing to send).
+    KeepPhone,
+    /// Ask about the phone that bonded again (its name was tapped, not an answer).
+    AskBond,
+    /// Close the menu, nothing else.
+    Dismiss,
 }
 
 /// "15 seconds", "1 minute", "10 minutes" (in `locale`).
@@ -236,6 +271,22 @@ pub fn card_content(id: CardId, v: &SettingsView) -> Option<CardContent> {
             }),
         ),
         ids::LANGUAGE => entry(Msg::SettingsLanguage, loc.endonym().into()),
+        ids::PHONE => {
+            let p = &v.phone;
+            if p.paired {
+                entry(
+                    Msg::SettingsPhone,
+                    crate::pairing::paired_text(loc, &p.paired_name),
+                )
+            } else if p.unsupported {
+                entry(
+                    Msg::SettingsPairPhone,
+                    Msg::PairingNotAvailable.get(loc).into(),
+                )
+            } else {
+                entry(Msg::SettingsPairPhone, Msg::TapToPair.get(loc).into())
+            }
+        }
         ids::DEVICE => {
             let mut lines = vec![fmt2(
                 Msg::DeviceLauncherLine.get(loc),
@@ -285,11 +336,19 @@ pub fn cards(v: &SettingsView) -> Vec<Card> {
 
 /// Whether the setting does anything here. Only a glassd with the `power` capability powers
 /// off (not on Android, where the framework owns power), so a glassd without it gets no card.
+/// Only a glassd that holds the phone link itself (`companion-link`, Model B) has a pairing
+/// mode, so without glassd or without it there is no phone card (`glassd --mock` has none).
 pub fn applies(id: CardId, v: &SettingsView) -> bool {
-    id != ids::POWER_OFF
-        || v.service
+    let has = |cap: &str| {
+        v.service
             .as_ref()
-            .map_or(true, |s| s.capabilities.iter().any(|c| c == "power"))
+            .map(|s| s.capabilities.iter().any(|c| c == cap))
+    };
+    match id {
+        ids::POWER_OFF => has("power").unwrap_or(true),
+        ids::PHONE => has("companion-link").unwrap_or(false),
+        _ => true,
+    }
 }
 
 fn patch(f: impl FnOnce(&mut Settings)) -> Choice {
@@ -322,6 +381,7 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
             | ids::NUDGE
             | ids::TIME_FORMAT
             | ids::TIMEZONE
+            | ids::PHONE
     );
     if owned_by_glassd && v.settings.is_none() {
         // Unknown until glassd sends them: no menu, so nothing is written blind.
@@ -462,6 +522,7 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
             return Some((items, first));
         }
         ids::DEVICE => return None,
+        ids::PHONE => return phone_menu(v).map(|items| (items, 0)),
         _ => match card.content {
             CardContent::Text { .. } | CardContent::Image { .. } => {
                 vec![MenuItem::new(Choice::Delete(card.id), Msg::Delete.get(loc))]
@@ -470,6 +531,77 @@ pub fn menu_for(card: &Card, v: &SettingsView) -> Option<(Vec<MenuItem<Choice>>,
         },
     };
     Some((items, 0))
+}
+
+/// The phone card's menu: start pairing (saying first what changes in the radios), or forget
+/// the paired phone. `None` while glassd has no pairing mode.
+fn phone_menu(v: &SettingsView) -> Option<Vec<MenuItem<Choice>>> {
+    let loc = v.locale;
+    let p = &v.phone;
+    if p.paired {
+        let mut it = MenuItem::new(Choice::AskForget, Msg::ForgetPhone.get(loc));
+        if !p.paired_name.is_empty() {
+            it = it.with_detail(p.paired_name.clone());
+        }
+        return Some(vec![it]);
+    }
+    if p.unsupported {
+        return None;
+    }
+    let s = v.settings?;
+    let bluetooth_off = !s.bluetooth_enabled.unwrap_or(false);
+    let airplane = s.airplane_mode.unwrap_or(false);
+    let radios = Settings {
+        bluetooth_enabled: bluetooth_off.then_some(true),
+        airplane_mode: airplane.then_some(false),
+        ..Default::default()
+    };
+    let item = if airplane {
+        let it = MenuItem::new(
+            Choice::Pair {
+                radios: Some(radios),
+            },
+            Msg::AirplaneOffAndPair.get(loc),
+        );
+        if bluetooth_off {
+            it.with_detail(Msg::BluetoothTurnsOn.get(loc))
+        } else {
+            it
+        }
+    } else if bluetooth_off {
+        MenuItem::new(
+            Choice::Pair {
+                radios: Some(radios),
+            },
+            Msg::BluetoothOnAndPair.get(loc),
+        )
+    } else {
+        MenuItem::new(Choice::Pair { radios: None }, Msg::StartPairing.get(loc))
+            .with_detail(crate::pairing::window_text(loc))
+    };
+    Some(vec![item])
+}
+
+/// Asked before forgetting: cancel comes first, so a second tap by mistake forgets nothing.
+pub fn forget_question(loc: Locale) -> Vec<MenuItem<Choice>> {
+    vec![
+        MenuItem::new(Choice::Dismiss, Msg::Cancel.get(loc)),
+        MenuItem::new(Choice::Forget, Msg::ForgetYes.get(loc))
+            .with_detail(Msg::ForgetCutsOff.get(loc)),
+    ]
+}
+
+/// Asked whenever a phone has bonded: the first one in range wins and no code is compared,
+/// so the owner checks the name. The menu opens on the name, which answers nothing (a tap
+/// asks again): a reflex tap neither keeps a stranger nor forgets the owner's phone, and
+/// either answer takes a swipe and a tap. "This is my phone" comes next, as the usual answer.
+pub fn paired_question(loc: Locale, name: &str) -> Vec<MenuItem<Choice>> {
+    vec![
+        MenuItem::new(Choice::AskBond, crate::pairing::paired_text(loc, name))
+            .with_detail(Msg::SwipeToAnswer.get(loc)),
+        MenuItem::new(Choice::KeepPhone, Msg::ThisIsMyPhone.get(loc)),
+        MenuItem::new(Choice::Forget, Msg::NotMyPhone.get(loc)).with_detail(Msg::ForgetIt.get(loc)),
+    ]
 }
 
 fn radio_item(loc: Locale, r: &RadioStatus, choice: fn(bool) -> Choice) -> MenuItem<Choice> {
@@ -579,6 +711,7 @@ mod tests {
             platform: "mock",
             renderer: "software",
             locale,
+            phone: PhoneView::default(),
         }
     }
 
@@ -635,7 +768,9 @@ mod tests {
             Msg::WaitingGlassd.get(Locale::En)
         );
         assert!(card_content(10, &w).is_none());
-        assert_eq!(cards(&w).len(), ORDER.len());
+        // Without glassd there is no phone card: only its own link has a pairing mode.
+        assert_eq!(cards(&w).len(), ORDER.len() - 1);
+        assert!(cards(&w).iter().all(|c| c.id != ids::PHONE));
         // The language card shows the current language's own name.
         assert_eq!(
             subtitle(card_content(ids::LANGUAGE, &view_in(None, Locale::Fr)).unwrap()),
@@ -791,6 +926,141 @@ mod tests {
         assert!(shown(Some(&["screen", "power"])));
         assert!(!shown(Some(&["screen"])), "Android: no power capability");
         assert!(shown(None), "without glassd the change is only local");
+    }
+
+    fn phone_view(s: Settings, phone: PhoneView) -> SettingsView {
+        let mut v = view(Some(s));
+        v.service = Some(ServiceInfo {
+            version: "x".into(),
+            capabilities: vec!["companion-link".into()],
+        });
+        v.phone = phone;
+        v
+    }
+
+    fn phone_menu_of(v: &SettingsView) -> Option<Vec<MenuItem<Choice>>> {
+        let card = Card::new(ids::PHONE, card_content(ids::PHONE, v).unwrap());
+        menu_for(&card, v).map(|(items, _)| items)
+    }
+
+    #[test]
+    fn the_phone_card_needs_a_glassd_that_holds_the_link() {
+        let shown = |capabilities: Option<&[&str]>| {
+            let mut v = view(Some(settings_defaults()));
+            v.service = capabilities.map(|c| ServiceInfo {
+                version: "x".into(),
+                capabilities: c.iter().map(|s| s.to_string()).collect(),
+            });
+            cards(&v).iter().any(|c| c.id == ids::PHONE)
+        };
+        assert!(shown(Some(&["screen", "companion-link"])));
+        assert!(!shown(Some(&["mock", "screen"])), "glassd --mock, Android");
+        assert!(!shown(None), "without glassd nothing pairs");
+        // Right after Bluetooth.
+        assert_eq!(ORDER[2], ids::PHONE);
+    }
+
+    #[test]
+    fn pairing_asks_before_changing_the_radios() {
+        let mut s = settings_defaults();
+        // Defaults: Bluetooth off, airplane mode off.
+        let v = phone_view(s, PhoneView::default());
+        assert_eq!(
+            subtitle(card_content(ids::PHONE, &v).unwrap()),
+            "Tap to pair"
+        );
+        let items = phone_menu_of(&v).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "Turn on Bluetooth and pair");
+        assert_eq!(
+            items[0].value,
+            Choice::Pair {
+                radios: Some(Settings {
+                    bluetooth_enabled: Some(true),
+                    ..Default::default()
+                })
+            }
+        );
+        s.airplane_mode = Some(true);
+        let items = phone_menu_of(&phone_view(s, PhoneView::default())).unwrap();
+        assert_eq!(items[0].label, "Turn off airplane mode and pair");
+        assert_eq!(items[0].detail.as_deref(), Some("Bluetooth turns on too"));
+        assert_eq!(
+            items[0].value,
+            Choice::Pair {
+                radios: Some(Settings {
+                    bluetooth_enabled: Some(true),
+                    airplane_mode: Some(false),
+                    ..Default::default()
+                })
+            }
+        );
+        s.bluetooth_enabled = Some(true);
+        let items = phone_menu_of(&phone_view(s, PhoneView::default())).unwrap();
+        assert_eq!(items[0].detail, None);
+        assert_eq!(
+            items[0].value,
+            Choice::Pair {
+                radios: Some(Settings {
+                    airplane_mode: Some(false),
+                    ..Default::default()
+                })
+            }
+        );
+        s.airplane_mode = Some(false);
+        let items = phone_menu_of(&phone_view(s, PhoneView::default())).unwrap();
+        assert_eq!(items[0].label, "Start pairing");
+        assert_eq!(items[0].detail.as_deref(), Some("2 minutes"));
+        assert_eq!(items[0].value, Choice::Pair { radios: None });
+        // Not before glassd's settings are known.
+        let mut v = phone_view(s, PhoneView::default());
+        v.settings = None;
+        assert!(phone_menu_of(&v).is_none());
+    }
+
+    #[test]
+    fn a_paired_phone_is_named_and_forgetting_asks_first() {
+        let v = phone_view(
+            settings_defaults(),
+            PhoneView {
+                paired: true,
+                paired_name: "Pixel 8".into(),
+                unsupported: false,
+            },
+        );
+        let c = card_content(ids::PHONE, &v).unwrap();
+        assert_eq!(subtitle(c.clone()), "Paired with Pixel 8");
+        assert!(matches!(c, CardContent::Settings { title, .. } if title == "Phone"));
+        let items = phone_menu_of(&v).unwrap();
+        assert_eq!(items[0].label, "Forget the phone");
+        assert_eq!(items[0].detail.as_deref(), Some("Pixel 8"));
+        assert_eq!(items[0].value, Choice::AskForget);
+        let q = forget_question(Locale::En);
+        assert_eq!(q[0].value, Choice::Dismiss, "cancel comes first");
+        assert_eq!(q[1].value, Choice::Forget);
+        let q = paired_question(Locale::It, "Pixel 8");
+        assert_eq!(q[0].label, "Associato a Pixel 8");
+        assert_eq!(q[0].value, Choice::AskBond, "a reflex tap answers nothing");
+        assert_eq!(q[1].label, "È il mio telefono");
+        assert_eq!(q[1].value, Choice::KeepPhone);
+        assert_eq!(q[2].label, "Non è il mio telefono");
+        assert_eq!(q[2].value, Choice::Forget);
+    }
+
+    #[test]
+    fn a_glassd_without_the_pairing_mode_disables_the_card() {
+        let v = phone_view(
+            settings_defaults(),
+            PhoneView {
+                unsupported: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            subtitle(card_content(ids::PHONE, &v).unwrap()),
+            "Not available on this Glass"
+        );
+        assert!(phone_menu_of(&v).is_none());
     }
 
     #[test]

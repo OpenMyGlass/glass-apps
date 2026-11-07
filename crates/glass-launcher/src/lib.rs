@@ -7,11 +7,13 @@
 //! [`glass_ui::Action::RequestSleep`], the screen following `ScreenState`), a mock script
 //! ([`script`]) or the host keyboard.
 
+pub mod bond_store;
 pub mod clock;
 pub mod demo;
 pub mod dictation;
 pub mod feedback;
 pub mod glassd;
+pub mod pairing;
 pub mod panel;
 pub mod script;
 pub mod selftest;
@@ -35,12 +37,14 @@ use glass_ui::{
     Action, Adjuster, CardId, GestureKind, InputEvent, Menu, Outcome, RenderContext, Timeline,
 };
 use glass_ui::{Card, CardContent};
+use pairing::{PairRequest, Pairing, PairingOut, Refusal};
 use panel::Panel;
 use platform::PlatformEvent;
 use platform::{MockPlatform, Platform};
-use settings::{Choice, ServiceInfo, SettingsView};
+use settings::{Choice, PhoneView, ServiceInfo, SettingsView};
 use setup::{Companion, Setup, SetupEffect};
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// What is shown over the timeline.
 /// What an adjuster sub-screen changes.
@@ -57,6 +61,8 @@ enum Overlay {
     Adjust(Adjuster, Adjusting),
     /// Taking a note by dictation.
     Dictation(Dictation, Panel),
+    /// The pairing mode is open (or opening, or just ended).
+    Pairing(Pairing, Panel),
 }
 
 /// Which overlay is open (for tests and logs).
@@ -68,6 +74,7 @@ pub enum OverlayKind {
     },
     Adjust,
     Dictation,
+    Pairing,
 }
 
 /// A request for `glassd`, made by the app (the caller sends it).
@@ -80,6 +87,16 @@ pub enum Request {
     /// Keep the screen on while dictating (`ScreenRequest{ACTION_KEEP_ON}`, true) or let it
     /// time out again (`ACTION_RELEASE_KEEP_ON`, false): glassd's timeout counts touches only.
     KeepScreenOn(bool),
+    /// Keep the screen, and so the Glass, awake for this many ms (`ACTION_KEEP_ON`): while the
+    /// pairing mode is open. Released with `KeepScreenOn(false)`.
+    KeepScreenOnFor(u32),
+    /// `CompanionPairingWindow{open, duration_ms}`.
+    PairingWindow {
+        open: bool,
+        duration_ms: u32,
+    },
+    /// `CompanionForgetBond{}`.
+    ForgetBond,
 }
 
 /// The first note card's id; later notes count up.
@@ -129,6 +146,27 @@ pub struct App {
     feedback: Box<dyn Feedback>,
     /// The centred card last seen, to tick only when it actually changes.
     last_index: usize,
+    /// glassd answered `ERROR_CODE_UNSUPPORTED` to a pairing request (until it reconnects).
+    pairing_unsupported: bool,
+    /// The bond last reported by glassd (`paired`, `paired_name`); `None` before the first
+    /// `CompanionState`. Kept across reconnections, so a bond made meanwhile is noticed.
+    last_bond: Option<(bool, String)>,
+    /// A phone bonded and the owner has not said whether it is theirs: its name. The question
+    /// is shown until answered, again at each wake.
+    bond_question: Option<String>,
+    /// A `CompanionForgetBond` sent for the question and not yet answered: the question stays
+    /// pending (it is cleared only by a state with `paired` false) but is not shown again.
+    forget_in_flight: bool,
+    /// Show a pending question at the next `CompanionState` (loaded from the disk, or after a
+    /// reconnection that may have lost a forget).
+    ask_at_next_state: bool,
+    /// Where `last_bond` and `bond_question` are kept across restarts ([`bond_store`]).
+    bond_file: Option<PathBuf>,
+    /// A state directory is set but held no usable bond (no file, or one that cannot be
+    /// read): a bond in the first state is asked about once instead of taken as known.
+    bond_unknown: bool,
+    /// `CLOCK_MONOTONIC` in µs, the clock of glassd's times (replaceable for tests).
+    monotonic: Box<dyn Fn() -> u64>,
 }
 
 impl App {
@@ -169,6 +207,14 @@ impl App {
             next_note: FIRST_NOTE_ID,
             feedback: Box::new(Silent),
             last_index,
+            pairing_unsupported: false,
+            last_bond: None,
+            bond_question: None,
+            forget_in_flight: false,
+            ask_at_next_state: false,
+            bond_file: None,
+            bond_unknown: false,
+            monotonic: Box::new(clock::monotonic_us),
         };
         app.refresh_settings_cards();
         app
@@ -310,6 +356,7 @@ impl App {
                     }
                     self.timeline.show_home();
                     self.shown = false;
+                    self.ask_bond_if_pending();
                 }
             }
         }
@@ -334,14 +381,239 @@ impl App {
         }
     }
 
-    /// glassd's `CompanionState`: whether a phone is connected through the companion.
+    /// glassd's `CompanionState`: whether a phone is connected through the companion, and
+    /// the bond and pairing mode.
+    ///
+    /// Any new bond after the first state seen (in the pairing screen, over a QR dial, while
+    /// the launcher was away from glassd, or while it was not running at all: the last bond
+    /// seen is kept on the disk, see [`App::set_state_dir`]) asks the owner whether the phone
+    /// is theirs. The question stays until answered: "Not my phone" clears it only once glassd
+    /// reports the bond gone.
     pub fn companion_changed(&mut self, c: Companion) {
+        let bond = (c.paired, c.paired_name.clone());
+        // With nothing known (a state directory with no usable record), a bond is a new one.
+        let unknown = std::mem::take(&mut self.bond_unknown) && self.last_bond.is_none();
+        let new_bond =
+            c.paired && (unknown || self.last_bond.as_ref().is_some_and(|last| *last != bond));
+        let bond_changed = self.last_bond.as_ref() != Some(&bond);
+        self.last_bond = Some(bond);
         self.companion = c.clone();
+        let out = match self.overlay.as_mut() {
+            Some(Overlay::Pairing(p, _)) => p.on_companion(&c),
+            _ => None,
+        };
         if let Some((s, _)) = self.setup.as_mut() {
-            s.set_companion(c);
+            s.set_companion(c.clone());
         }
         self.refresh_setup_card();
         self.refresh_note_card();
+        self.refresh_settings_cards();
+        self.pairing_out(out);
+        let ask_again = std::mem::take(&mut self.ask_at_next_state);
+        if new_bond {
+            self.log
+                .push(format!("pairing: bonded with {:?}", c.paired_name));
+            self.bond_question = Some(c.paired_name.clone());
+            self.forget_in_flight = false;
+            self.ask_bond();
+        } else if !c.paired {
+            self.forget_in_flight = false;
+            if self.bond_question.take().is_some() {
+                // Forgotten (by the owner's answer or another client): nothing left to ask.
+                if matches!(
+                    self.overlay,
+                    Some(Overlay::Menu(_, settings::ids::BOND_QUESTION))
+                ) {
+                    self.close_overlay();
+                }
+                self.save_bond();
+            }
+        } else if ask_again {
+            self.ask_bond_if_pending();
+        }
+        if bond_changed || new_bond {
+            self.save_bond();
+        }
+    }
+
+    /// Keeps the last bond seen and a pending question in `dir` (next to the setup marker on
+    /// Android), and loads what an earlier run left there: a bond made while the launcher was
+    /// not running, or a question it never got an answer to, is asked at the first state.
+    /// With no usable record there (none yet, or one that cannot be read), a bond in the first
+    /// state is asked about once too: it cannot be told from a stranger's.
+    pub fn set_state_dir(&mut self, dir: PathBuf) {
+        if let Some(w) = bond_store::volatile_warning(&dir) {
+            self.log.push(format!("bond: {w}"));
+        }
+        let path = bond_store::path_in(&dir);
+        let seen = match bond_store::load(&path) {
+            Ok(st) => {
+                if st.question.is_some() {
+                    self.bond_question = st.question;
+                    self.ask_at_next_state = true;
+                }
+                st.seen
+            }
+            Err(e) => {
+                self.log.push(format!("bond: {}: {e}", path.display()));
+                None
+            }
+        };
+        match seen {
+            Some(seen) => self.last_bond = Some(seen),
+            None => self.bond_unknown = self.last_bond.is_none(),
+        }
+        self.bond_file = Some(path);
+    }
+
+    fn save_bond(&mut self) {
+        let Some(path) = &self.bond_file else {
+            return;
+        };
+        let st = bond_store::BondState {
+            seen: self.last_bond.clone(),
+            question: self.bond_question.clone(),
+        };
+        if let Err(e) = bond_store::save(path, &st) {
+            self.log.push(format!("bond: {}: {e}", path.display()));
+        }
+    }
+
+    /// Shows the question about the phone that bonded, held on until answered or timed out.
+    /// With the screen off or the setup flow running, it waits for the wake or the end of
+    /// setup; the hold also wakes the screen (glassd: only while on the head).
+    fn ask_bond(&mut self) {
+        let Some(name) = self.bond_question.clone() else {
+            return;
+        };
+        self.requests
+            .push(Request::KeepScreenOnFor(pairing::QUESTION_KEEP_ON_MS));
+        if !self.screen_on || self.setup.is_some() {
+            return;
+        }
+        if let Some(menu) = Menu::new(settings::paired_question(self.locale, &name)) {
+            self.show_overlay(Overlay::Menu(menu, settings::ids::BOND_QUESTION));
+        }
+    }
+
+    /// The question about a bond is pending, not on screen, and no forget for it is in
+    /// flight: show it.
+    fn ask_bond_if_pending(&mut self) {
+        let shown = matches!(
+            self.overlay,
+            Some(Overlay::Menu(_, settings::ids::BOND_QUESTION))
+        );
+        if self.bond_question.is_some() && !shown && !self.forget_in_flight {
+            self.ask_bond();
+        }
+    }
+
+    /// The question about a bond waiting for an answer, if any: the phone's name.
+    pub fn bond_question(&self) -> Option<&str> {
+        self.bond_question.as_deref()
+    }
+
+    /// glassd says another client took the input focus: the pairing mode closes with its
+    /// screen, since the owner is no longer looking at it.
+    pub fn focus_lost(&mut self) {
+        if matches!(self.overlay, Some(Overlay::Pairing(..))) {
+            self.close_overlay();
+        }
+    }
+
+    /// Replaces the clock compared with glassd's times (`CLOCK_MONOTONIC` µs), for tests.
+    pub fn set_monotonic_clock(&mut self, clock: Box<dyn Fn() -> u64>) {
+        self.monotonic = clock;
+    }
+
+    /// Opens glassd's pairing mode and shows its screen, held on while it is open.
+    fn open_pairing(&mut self) {
+        self.requests.push(Request::PairingWindow {
+            open: true,
+            duration_ms: pairing::WINDOW_MS,
+        });
+        self.requests
+            .push(Request::KeepScreenOnFor(pairing::KEEP_ON_MS));
+        let p = Pairing::new();
+        let panel = Panel::new(p.card(self.locale, (self.monotonic)()), self.ctx);
+        self.show_overlay(Overlay::Pairing(p, panel));
+    }
+
+    fn refresh_pairing_screen(&mut self) {
+        let now = (self.monotonic)();
+        let locale = self.locale;
+        if let Some(Overlay::Pairing(p, panel)) = self.overlay.as_mut() {
+            panel.set(p.card(locale, now));
+        }
+    }
+
+    fn pairing_out(&mut self, out: Option<PairingOut>) {
+        match out {
+            None => {}
+            Some(PairingOut::Close) => {
+                self.close_overlay();
+                // After "Phone not forgotten", say, the question about a bond comes back.
+                self.ask_bond_if_pending();
+            }
+            Some(PairingOut::Reopen) => {
+                self.requests.push(Request::PairingWindow {
+                    open: true,
+                    duration_ms: pairing::WINDOW_MS,
+                });
+                self.requests
+                    .push(Request::KeepScreenOnFor(pairing::KEEP_ON_MS));
+            }
+            Some(PairingOut::ReleaseScreen) => self.requests.push(Request::KeepScreenOn(false)),
+        }
+        self.refresh_pairing_screen();
+    }
+
+    /// glassd refused `request` with `code` and `message` (the message tells the two
+    /// `ERROR_CODE_UNAVAILABLE` of an opening apart). An opening shows why on its screen; a
+    /// failed forget gets a screen of its own, since the phone is still bonded.
+    pub fn pairing_refused(&mut self, request: PairRequest, code: ErrorCode, message: &str) {
+        let r = Refusal::of(request, code, message);
+        self.log.push(format!(
+            "pairing: {request:?} refused ({code:?}: {message})"
+        ));
+        if r == Refusal::Unsupported {
+            self.pairing_unsupported = true;
+            self.refresh_settings_cards();
+        }
+        match request {
+            PairRequest::Open => {
+                let out = match self.overlay.as_mut() {
+                    Some(Overlay::Pairing(p, _)) => p.refused(r),
+                    _ => None,
+                };
+                self.pairing_out(out);
+            }
+            PairRequest::Forget => {
+                self.forget_in_flight = false;
+                let p = Pairing::failed(request, r);
+                let panel = Panel::new(p.card(self.locale, 0), self.ctx);
+                self.show_overlay(Overlay::Pairing(p, panel));
+            }
+            // A close that failed leaves nothing to show: the mode ends with its time.
+            PairRequest::Close => {}
+        }
+    }
+
+    /// The pairing screen's card, while it is shown (tests, logs).
+    pub fn pairing_screen(&self) -> Option<&CardContent> {
+        match &self.overlay {
+            Some(Overlay::Pairing(_, panel)) => Some(panel.content()),
+            _ => None,
+        }
+    }
+
+    /// How long until something on screen changes by itself (the pairing time left), so the
+    /// loop wakes then; `None` when nothing does.
+    pub fn next_change(&self) -> Option<Duration> {
+        match &self.overlay {
+            Some(Overlay::Pairing(p, _)) if self.screen_on => p.next_change((self.monotonic)()),
+            _ => None,
+        }
     }
 
     pub fn companion(&self) -> &Companion {
@@ -473,6 +745,11 @@ impl App {
             platform: self.platform.name(),
             renderer: self.compositor.name(),
             locale: self.locale,
+            phone: PhoneView {
+                paired: self.companion.paired,
+                paired_name: self.companion.paired_name.clone(),
+                unsupported: self.pairing_unsupported,
+            },
         }
     }
 
@@ -555,10 +832,10 @@ impl App {
     pub fn set_service(&mut self, info: Option<ServiceInfo>) {
         self.service = info;
         // The card was offered before glassd said what it can do.
-        if self.main_timeline.is_some()
-            && !settings::applies(settings::ids::POWER_OFF, &self.settings_view())
-        {
-            self.timeline.remove_card(settings::ids::POWER_OFF);
+        for id in [settings::ids::POWER_OFF, settings::ids::PHONE] {
+            if self.main_timeline.is_some() && !settings::applies(id, &self.settings_view()) {
+                self.timeline.remove_card(id);
+            }
         }
         self.refresh_settings_cards();
         self.refresh_note_card();
@@ -581,6 +858,7 @@ impl App {
             Some(Overlay::Menu(m, _)) => Some(OverlayKind::Menu { index: m.index() }),
             Some(Overlay::Adjust(..)) => Some(OverlayKind::Adjust),
             Some(Overlay::Dictation(..)) => Some(OverlayKind::Dictation),
+            Some(Overlay::Pairing(..)) => Some(OverlayKind::Pairing),
         }
     }
 
@@ -673,13 +951,31 @@ impl App {
 
     fn close_overlay(&mut self) {
         match self.overlay.take() {
-            Some(Overlay::Menu(mut m, _)) => m.release(self.compositor.as_mut()),
+            Some(Overlay::Menu(mut m, id)) => {
+                m.release(self.compositor.as_mut());
+                if id == settings::ids::BOND_QUESTION {
+                    // Answered or not, the hold ends; unanswered, the question comes back.
+                    self.requests.push(Request::KeepScreenOn(false));
+                }
+            }
             Some(Overlay::Adjust(mut a, _)) => a.release(self.compositor.as_mut()),
             Some(Overlay::Dictation(d, mut panel)) => {
                 if d.is_open() {
                     self.requests.push(Request::DictationCancel(d.request_id()));
                 }
                 self.requests.push(Request::KeepScreenOn(false));
+                panel.release(self.compositor.as_mut());
+            }
+            Some(Overlay::Pairing(p, mut panel)) => {
+                // Backing out closes the mode: no phone may bond once the owner left. Once
+                // the mode is closed the screen was already released.
+                if p.is_open() {
+                    self.requests.push(Request::PairingWindow {
+                        open: false,
+                        duration_ms: 0,
+                    });
+                    self.requests.push(Request::KeepScreenOn(false));
+                }
                 panel.release(self.compositor.as_mut());
             }
             None => return,
@@ -746,6 +1042,33 @@ impl App {
                 self.log.push(format!("delete: card {id}"));
                 self.timeline.remove_card(id);
             }
+            Choice::Pair { radios } => {
+                if let Some(p) = radios {
+                    self.log.push(format!("pairing: radios {p:?}"));
+                    self.request_settings(p);
+                }
+                self.log.push("pairing: open".into());
+                self.open_pairing();
+            }
+            Choice::AskForget => {
+                if let Some(menu) = Menu::new(settings::forget_question(self.locale)) {
+                    self.show_overlay(Overlay::Menu(menu, settings::ids::PHONE_QUESTION));
+                }
+            }
+            Choice::Forget => {
+                self.log.push("pairing: forget the phone".into());
+                // A pending question stays until glassd reports the bond gone: a refused or
+                // lost forget asks again.
+                self.forget_in_flight = self.bond_question.is_some();
+                self.requests.push(Request::ForgetBond);
+            }
+            Choice::KeepPhone => {
+                self.log.push("pairing: the owner keeps the phone".into());
+                self.bond_question = None;
+                self.save_bond();
+            }
+            Choice::AskBond => self.ask_bond(),
+            Choice::Dismiss => {}
         }
     }
 
@@ -774,6 +1097,11 @@ impl App {
             }
             Some(Overlay::Dictation(..)) => {
                 self.with_dictation(|d| d.input(event));
+                React::Done
+            }
+            Some(Overlay::Pairing(p, _)) => {
+                let out = p.input(event);
+                self.pairing_out(out);
                 React::Done
             }
             Some(Overlay::Adjust(a, what)) => {
@@ -875,6 +1203,7 @@ impl App {
         }
         self.screen_on = true;
         self.shown = false;
+        self.ask_bond_if_pending();
     }
 
     /// Ends a touch whose end will not arrive (focus lost, glassd gone); see
@@ -892,6 +1221,11 @@ impl App {
     /// The connection to glassd is gone: its settings are unknown again and requests made
     /// for it are dropped (a new session sends a fresh snapshot).
     pub fn glassd_disconnected(&mut self) {
+        // A forget sent may be lost with the connection: if the next state still shows the
+        // bond, the question is asked again.
+        if std::mem::take(&mut self.forget_in_flight) {
+            self.ask_at_next_state = true;
+        }
         // An open dictation ended with the connection (glassd forgets it, no state will come).
         let open = match &self.overlay {
             Some(Overlay::Dictation(d, _)) if d.is_open() => Some(d.request_id()),
@@ -904,6 +1238,11 @@ impl App {
                 error: "link-lost".into(),
             });
         }
+        // glassd closes its pairing mode when it restarts.
+        if matches!(self.overlay, Some(Overlay::Pairing(..))) {
+            self.close_overlay();
+        }
+        self.pairing_unsupported = false;
         self.companion = Companion::default();
         if let Some((s, _)) = self.setup.as_mut() {
             s.set_companion(Companion::default());
@@ -1032,6 +1371,11 @@ impl App {
             Some(Overlay::Menu(m, _)) => m.tick(dt),
             Some(Overlay::Adjust(a, _)) => a.set_context(ctx),
             Some(Overlay::Dictation(_, p)) => p.set_context(ctx),
+            Some(Overlay::Pairing(p, panel)) => {
+                panel.set_context(ctx);
+                let out = p.tick((self.monotonic)());
+                self.pairing_out(out);
+            }
             None => {}
         }
         if let Some((_, p)) = self.setup.as_mut() {
@@ -1059,7 +1403,7 @@ impl App {
             return Ok(true);
         }
         match &mut self.overlay {
-            Some(Overlay::Dictation(_, p)) => {
+            Some(Overlay::Dictation(_, p)) | Some(Overlay::Pairing(_, p)) => {
                 if self.shown && !p.needs_redraw() {
                     return Ok(false);
                 }

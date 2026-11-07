@@ -63,6 +63,7 @@ fn setup_runs_once_and_shows_the_timeline_after() {
         provider: true,
         connected: true,
         phone_name: "Pixel".into(),
+        ..Default::default()
     });
     tap(&mut a);
     assert!(a.setup().is_none());

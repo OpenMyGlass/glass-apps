@@ -8,7 +8,7 @@
 use glass_gfx::golden::{self, Tolerance};
 use glass_gfx::Frame;
 use glass_launcher::platform::RadioStatus;
-use glass_launcher::settings::{self, ids, ServiceInfo, SettingsView};
+use glass_launcher::settings::{self, ids, PhoneView, ServiceInfo, SettingsView};
 use glass_ui::card::render_card;
 use glass_ui::{Card, CardContent, RenderContext};
 use std::path::PathBuf;
@@ -46,6 +46,7 @@ fn view() -> SettingsView {
         platform: "mock",
         renderer: "software",
         locale: glass_ui::Locale::En,
+        phone: Default::default(),
     }
 }
 
@@ -90,6 +91,63 @@ fn scenes() -> Vec<(String, Card, Tolerance)> {
             ids::POWER_OFF,
             settings::card_content(ids::POWER_OFF, &v).unwrap(),
         ),
+        Tolerance::Max(2),
+    ));
+    // Only a glassd that holds the phone link (`companion-link`) gets the phone card: to pair
+    // (Bluetooth off by default, so the menu asks to turn it on), and paired.
+    let mut phone_view = v.clone();
+    phone_view.service = Some(ServiceInfo {
+        version: "x".into(),
+        capabilities: vec!["companion-link".into()],
+    });
+    let pair = Card::new(
+        ids::PHONE,
+        settings::card_content(ids::PHONE, &phone_view).unwrap(),
+    );
+    let (items, _) = settings::menu_for(&pair, &phone_view).unwrap();
+    out.push(("settings-phone-pair".into(), pair, Tolerance::Max(2)));
+    let card = menu_card(&items[0].label, items[0].detail.clone(), 0, items.len());
+    out.push((
+        "settings-menu-pair".into(),
+        card.clone(),
+        gles_tolerance(&card),
+    ));
+    phone_view.phone = PhoneView {
+        paired: true,
+        paired_name: "Pixel 8".into(),
+        unsupported: false,
+    };
+    out.push((
+        "settings-phone-paired".into(),
+        Card::new(
+            ids::PHONE,
+            settings::card_content(ids::PHONE, &phone_view).unwrap(),
+        ),
+        Tolerance::Max(2),
+    ));
+    let q = settings::forget_question(glass_ui::Locale::En);
+    let card = menu_card(&q[1].label, q[1].detail.clone(), 1, q.len());
+    out.push((
+        "settings-menu-forget".into(),
+        card.clone(),
+        gles_tolerance(&card),
+    ));
+    let q = settings::paired_question(glass_ui::Locale::En, "Pixel 8");
+    let card = menu_card(&q[0].label, q[0].detail.clone(), 0, q.len());
+    out.push((
+        "settings-menu-paired".into(),
+        card.clone(),
+        gles_tolerance(&card),
+    ));
+    // The pairing screen with its countdown.
+    let mut p = glass_launcher::pairing::Pairing::new();
+    p.on_companion(&glass_launcher::setup::Companion {
+        pairing_until_us: 112_300_000,
+        ..Default::default()
+    });
+    out.push((
+        "pairing-open".into(),
+        Card::new(0, p.card(glass_ui::Locale::En, 0)),
         Tolerance::Max(2),
     ));
     // The head-wake menu's second item and the timeout menu's current choice.
