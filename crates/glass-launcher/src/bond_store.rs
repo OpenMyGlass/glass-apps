@@ -107,6 +107,57 @@ pub fn save(path: &Path, state: &BondState) -> io::Result<()> {
     Ok(())
 }
 
+/// Filesystems known to survive a reboot (the same list as the GPU supervisor's
+/// `state_persistent`, native/fbwin/glass-launcher-supervisor.sh).
+pub const PERSISTENT_FS: [&str; 11] = [
+    "ext2", "ext3", "ext4", "f2fs", "btrfs", "xfs", "vfat", "jffs2", "ubifs", "yaffs", "yaffs2",
+];
+
+/// The type of the filesystem `dir` is on, from a `/proc/mounts` text: the longest mount
+/// point that contains it, the last such mount winning (as the supervisor's `state_fstype`).
+pub fn fstype_of(dir: &Path, mounts: &str) -> Option<String> {
+    let d = dir.to_string_lossy();
+    let mut best: Option<(usize, String)> = None;
+    for line in mounts.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let (Some(m), Some(t)) = (f.get(1), f.get(2)) else {
+            continue;
+        };
+        let inside = *m == "/" || d == *m || d.starts_with(&format!("{m}/"));
+        if inside && best.as_ref().map_or(true, |(len, _)| m.len() >= *len) {
+            best = Some((m.len(), t.to_string()));
+        }
+    }
+    best.map(|(_, t)| t)
+}
+
+/// A warning when `dir` is on a filesystem not known to survive a reboot (rootfs, tmpfs,
+/// ramfs, ...): the bond seen and a pending question would be lost with it. `None` when it
+/// persists or `/proc/mounts` cannot be read.
+pub fn volatile_warning(dir: &Path) -> Option<String> {
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    // The nearest directory that exists, resolved: the state directory may not exist yet.
+    let mut at = dir.to_path_buf();
+    let real = loop {
+        if let Ok(r) = at.canonicalize() {
+            break r;
+        }
+        if !at.pop() {
+            return None;
+        }
+    };
+    let t = fstype_of(&real, &mounts);
+    match t.as_deref() {
+        Some(t) if PERSISTENT_FS.contains(&t) => None,
+        t => Some(format!(
+            "WARNING: the state directory {} is on {}, which does not survive a reboot: \
+             a phone that bonds before a reboot may not be asked about",
+            dir.display(),
+            t.unwrap_or("an unknown filesystem")
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -123,6 +174,20 @@ mod tests {
             BondState::decode("seen 2 41\nquestion zz\nother\n"),
             BondState::default()
         );
+    }
+
+    #[test]
+    fn finds_the_filesystem_like_the_supervisor() {
+        let mounts = "rootfs / rootfs rw 0 0\n\
+                      /dev/mmcblk0p9 /var ext4 rw 0 0\n\
+                      tmpfs /var/lib/volatile tmpfs rw 0 0\n\
+                      tmpfs /run tmpfs rw 0 0\n";
+        let t = |d: &str| fstype_of(Path::new(d), mounts);
+        assert_eq!(t("/var/lib/glass-launcher").as_deref(), Some("ext4"));
+        assert_eq!(t("/var/lib/volatile/x").as_deref(), Some("tmpfs"));
+        assert_eq!(t("/varnish").as_deref(), Some("rootfs"), "not under /var");
+        assert_eq!(t("/run").as_deref(), Some("tmpfs"));
+        assert!(PERSISTENT_FS.contains(&"ext4") && !PERSISTENT_FS.contains(&"tmpfs"));
     }
 
     #[test]

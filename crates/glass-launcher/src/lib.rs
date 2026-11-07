@@ -162,6 +162,9 @@ pub struct App {
     ask_at_next_state: bool,
     /// Where `last_bond` and `bond_question` are kept across restarts ([`bond_store`]).
     bond_file: Option<PathBuf>,
+    /// A state directory is set but held no usable bond (no file, or one that cannot be
+    /// read): a bond in the first state is asked about once instead of taken as known.
+    bond_unknown: bool,
     /// `CLOCK_MONOTONIC` in µs, the clock of glassd's times (replaceable for tests).
     monotonic: Box<dyn Fn() -> u64>,
 }
@@ -210,6 +213,7 @@ impl App {
             forget_in_flight: false,
             ask_at_next_state: false,
             bond_file: None,
+            bond_unknown: false,
             monotonic: Box::new(clock::monotonic_us),
         };
         app.refresh_settings_cards();
@@ -387,7 +391,10 @@ impl App {
     /// reports the bond gone.
     pub fn companion_changed(&mut self, c: Companion) {
         let bond = (c.paired, c.paired_name.clone());
-        let new_bond = c.paired && self.last_bond.as_ref().is_some_and(|last| *last != bond);
+        // With nothing known (a state directory with no usable record), a bond is a new one.
+        let unknown = std::mem::take(&mut self.bond_unknown) && self.last_bond.is_none();
+        let new_bond =
+            c.paired && (unknown || self.last_bond.as_ref().is_some_and(|last| *last != bond));
         let bond_changed = self.last_bond.as_ref() != Some(&bond);
         self.last_bond = Some(bond);
         self.companion = c.clone();
@@ -432,17 +439,29 @@ impl App {
     /// Keeps the last bond seen and a pending question in `dir` (next to the setup marker on
     /// Android), and loads what an earlier run left there: a bond made while the launcher was
     /// not running, or a question it never got an answer to, is asked at the first state.
+    /// With no usable record there (none yet, or one that cannot be read), a bond in the first
+    /// state is asked about once too: it cannot be told from a stranger's.
     pub fn set_state_dir(&mut self, dir: PathBuf) {
+        if let Some(w) = bond_store::volatile_warning(&dir) {
+            self.log.push(format!("bond: {w}"));
+        }
         let path = bond_store::path_in(&dir);
-        match bond_store::load(&path) {
+        let seen = match bond_store::load(&path) {
             Ok(st) => {
-                self.last_bond = st.seen.or(self.last_bond.take());
                 if st.question.is_some() {
                     self.bond_question = st.question;
                     self.ask_at_next_state = true;
                 }
+                st.seen
             }
-            Err(e) => self.log.push(format!("bond: {}: {e}", path.display())),
+            Err(e) => {
+                self.log.push(format!("bond: {}: {e}", path.display()));
+                None
+            }
+        };
+        match seen {
+            Some(seen) => self.last_bond = Some(seen),
+            None => self.bond_unknown = self.last_bond.is_none(),
         }
         self.bond_file = Some(path);
     }

@@ -475,6 +475,62 @@ fn state_dir(name: &str) -> std::path::PathBuf {
     d
 }
 
+fn fresh_app(dir: &std::path::Path) -> App {
+    let mut a = App::new(demo::timeline(), ctx());
+    a.follow_glassd();
+    a.set_state_dir(dir.to_path_buf());
+    a
+}
+
+#[test]
+fn a_bond_with_no_record_is_asked_about_once() {
+    // No phone-bond file yet (a first run with a state directory, or one lost): the bond in
+    // the first state cannot be told from a stranger's.
+    let dir = state_dir("bond-missing");
+    let mut a = fresh_app(&dir);
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.menu_labels(), QUESTION);
+    // Once: the next state, and the next run once answered, ask nothing.
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.menu_labels(), QUESTION);
+    g(&mut a, GestureKind::SwipeForward);
+    g(&mut a, GestureKind::Tap);
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.overlay(), None);
+    let mut a = fresh_app(&dir);
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.overlay(), None);
+    // No record and no bond: that is the baseline, and a later bond is asked about.
+    let dir2 = state_dir("bond-missing-unpaired");
+    let mut a = fresh_app(&dir2);
+    a.companion_changed(state(false, "", 0));
+    assert_eq!(a.overlay(), None);
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.bond_question(), Some("Pixel 8"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
+#[test]
+fn a_bond_with_an_unreadable_record_is_asked_about() {
+    let dir = state_dir("bond-unreadable");
+    // A directory where the file should be: it cannot be read (nor written).
+    std::fs::create_dir_all(glass_launcher::bond_store::path_in(&dir)).unwrap();
+    let mut a = fresh_app(&dir);
+    assert!(a.take_log().iter().any(|l| l.starts_with("bond: ")));
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.menu_labels(), QUESTION);
+    // A record it cannot understand counts as none too.
+    let dir2 = state_dir("bond-garbled");
+    std::fs::create_dir_all(&dir2).unwrap();
+    std::fs::write(glass_launcher::bond_store::path_in(&dir2), "garbage\n").unwrap();
+    let mut a = fresh_app(&dir2);
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.bond_question(), Some("Pixel 8"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&dir2);
+}
+
 #[test]
 fn a_restart_still_asks() {
     let dir = state_dir("bond-restart");

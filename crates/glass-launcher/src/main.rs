@@ -49,7 +49,8 @@ usage:
                   simulated; with --glassd the phone step follows glassd's companion)
   --state-dir DIR keep the launcher's state in DIR: the phone bond last seen and an
                   unanswered question about a new bond, so a restart or a reboot still asks
-                  (with --glassd; default $GLASS_LAUNCHER_STATE_DIR, else
+                  (with --glassd; default $GLASS_LAUNCHER_STATE_DIR or
+                  $GLASS_LAUNCHER_STATE, else
                   /var/lib/glass-launcher when run as root, else none)
   --no-sound      do not play UI audio feedback (sound-enabled device builds only)
   --audio-selftest
@@ -991,14 +992,18 @@ fn run_self_test(_args: &Args) -> Result<(), String> {
     Err("this build has no framebuffer support: rebuild with --features fb on Linux".into())
 }
 
-/// The launcher's state directory: `--state-dir`, else `$GLASS_LAUNCHER_STATE_DIR`, else
+/// The launcher's state directory: `--state-dir`, else `$GLASS_LAUNCHER_STATE_DIR` or
+/// `$GLASS_LAUNCHER_STATE`, else
 /// `/var/lib/glass-launcher` when run as root (on the device), else none (a host run).
 fn state_dir(args: &Args) -> Option<PathBuf> {
     if let Some(d) = &args.state_dir {
         return Some(d.clone());
     }
-    if let Some(d) = std::env::var_os("GLASS_LAUNCHER_STATE_DIR") {
-        return Some(d.into());
+    // The second name is the one the GPU supervisor exports (glass-launcher-supervisor.sh).
+    for var in ["GLASS_LAUNCHER_STATE_DIR", "GLASS_LAUNCHER_STATE"] {
+        if let Some(d) = std::env::var_os(var) {
+            return Some(d.into());
+        }
     }
     #[cfg(unix)]
     // SAFETY: getuid cannot fail.
