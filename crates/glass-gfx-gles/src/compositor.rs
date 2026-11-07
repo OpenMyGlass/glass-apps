@@ -152,6 +152,24 @@ impl GlesCompositor {
         Self::with_context(egl, width, height, options, true)
     }
 
+    /// [`GlesCompositor::for_window`] for a window whose buffer format is fixed (a
+    /// framebuffer): the EGL config's native visual must be `format`.
+    pub fn for_window_with_format(
+        width: u32,
+        height: u32,
+        options: GlesOptions,
+        format: i32,
+    ) -> Result<GlesCompositor, GfxError> {
+        let egl = EglContext::for_window_with_format(format).map_err(gl_err)?;
+        if !egl.is_current() {
+            return Err(GfxError::Renderer(
+                "the EGL window config has no pbuffers: cannot keep the context without a window"
+                    .into(),
+            ));
+        }
+        Self::with_context(egl, width, height, options, true)
+    }
+
     fn with_context(
         egl: EglContext,
         width: u32,
@@ -529,6 +547,10 @@ impl Compositor for GlesCompositor {
         if self.is_window() {
             // The frame is in the window's back buffer: show it, no read-back.
             self.current()?;
+            // The timeline paints the neighbouring cards after composing, so a layer's FBO
+            // can still be bound here. Swapping with it bound makes the SGX540 add that
+            // layer's last draw to the frame on screen.
+            self.bind_screen()?;
             return self.egl.swap_buffers().map_err(gl_err);
         }
         let frame = self.read_frame()?;

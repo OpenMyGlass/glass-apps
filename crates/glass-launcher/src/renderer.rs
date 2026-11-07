@@ -105,6 +105,33 @@ pub fn gles_compositor() -> Result<Box<dyn Compositor>, String> {
     Ok(Box::new(c))
 }
 
+/// The default provider of a framebuffer window (`--display fbwin`).
+pub const FBWIN_LIBRARY: &str = "libglass_fbwin.so";
+
+/// The GLES compositor drawing straight into the framebuffer window of the provider library
+/// `lib` (Model B: no SurfaceFlinger). The library stays loaded for the life of the process.
+#[cfg(feature = "gles")]
+pub fn fbwin_compositor(lib: &std::path::Path) -> Result<Box<dyn Compositor>, String> {
+    let (window, format) = glass_gfx_gles::load_framebuffer_window(lib, GLASS_WIDTH, GLASS_HEIGHT)?;
+    let mut c = glass_gfx_gles::GlesCompositor::for_window_with_format(
+        GLASS_WIDTH,
+        GLASS_HEIGHT,
+        glass_gfx_gles::GlesOptions::default(),
+        format,
+    )
+    .map_err(|e| format!("GLES renderer failed: {e}"))?;
+    // SAFETY: the provider's window lives as long as the process, the library is never unloaded.
+    unsafe { c.attach_window(window) }.map_err(|e| format!("GLES renderer failed: {e}"))?;
+    eprintln!("glass-launcher: gles: {}", c.info());
+    eprintln!("glass-launcher: renderer gles (framebuffer window, format {format})");
+    Ok(Box::new(c))
+}
+
+#[cfg(not(feature = "gles"))]
+pub fn fbwin_compositor(_lib: &std::path::Path) -> Result<Box<dyn Compositor>, String> {
+    Err("built without the `gles` feature".into())
+}
+
 #[cfg(not(feature = "gles"))]
 pub fn gles_compositor() -> Result<Box<dyn Compositor>, String> {
     Err("built without the `gles` feature".into())

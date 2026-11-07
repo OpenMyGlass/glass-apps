@@ -26,6 +26,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo clippy --workspace --all-targets --locked --features glass-launcher/window -- -D warnings
       - run: cargo test --workspace --locked
+      - name: Supervisor tests (dash, and busybox, the shell and applets on the Glass)
+        run: |
+          sh -n native/fbwin/glass-launcher-supervisor.sh
+          sh native/fbwin/test_supervisor.sh
+          sudo apt-get install -y --no-install-recommends busybox-static
+          mkdir -p "$RUNNER_TEMP/bb" && /bin/busybox --install -s "$RUNNER_TEMP/bb"
+          PATH="$RUNNER_TEMP/bb:$PATH" SHELL_UNDER_TEST="$RUNNER_TEMP/bb/sh" "$RUNNER_TEMP/bb/sh" native/fbwin/test_supervisor.sh
       - name: Golden images that did not match
         if: failure()
         uses: actions/upload-artifact@v4
@@ -161,6 +168,10 @@ jobs:
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-19" "build-tools;$BUILD_TOOLS" >/dev/null
           ls "$ANDROID_HOME/platforms/android-19/android.jar" "$ANDROID_HOME/build-tools/$BUILD_TOOLS/aapt2"
+      - name: Framebuffer window and GPU probe compile (NDK only, no stock blobs)
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: native/fbwin/build.sh fbwin-out
       - name: Clippy for Android (the JNI module)
         run: cargo clippy --locked --target armv7-linux-androideabi -p glass-android --all-targets -- -D warnings
       - name: JVM tests of the wrapper's pure Java

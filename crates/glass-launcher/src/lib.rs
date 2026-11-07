@@ -11,7 +11,9 @@ pub mod clock;
 pub mod demo;
 pub mod dictation;
 pub mod feedback;
+pub mod frame_stats;
 pub mod glassd;
+pub mod heartbeat;
 pub mod panel;
 pub mod script;
 pub mod selftest;
@@ -19,7 +21,7 @@ pub mod setup;
 
 /// The on-device ALSA sound player (bone-conduction UI feedback). Only on Linux with the
 /// `sound` feature; desktop, headless and CI builds use the silent default player.
-#[cfg(all(feature = "sound", target_os = "linux"))]
+#[cfg(all(feature = "sound", any(target_os = "linux", target_os = "android")))]
 pub mod audio;
 
 pub mod platform;
@@ -101,6 +103,7 @@ pub struct App {
     /// The main timeline, set aside while the settings cards are open in `timeline`.
     main_timeline: Option<Timeline>,
     compositor: Box<dyn Compositor>,
+    frame_stats: Option<frame_stats::FrameStats>,
     owner: ScreenOwner,
     screen_on: bool,
     shown: bool,
@@ -152,6 +155,7 @@ impl App {
             compositor,
             owner: ScreenOwner::Local,
             screen_on: true,
+            frame_stats: frame_stats::FrameStats::from_env(),
             shown: false,
             overlay: None,
             platform: Box::new(MockPlatform::default()),
@@ -1090,10 +1094,15 @@ impl App {
 
     /// Composes and presents a new frame if anything changed; true if one was presented.
     pub fn present_if_changed(&mut self, display: &mut dyn Display) -> Result<bool, GfxError> {
+        let t0 = std::time::Instant::now();
         if !self.render_if_changed()? {
             return Ok(false);
         }
+        let t1 = std::time::Instant::now();
         self.compositor.present(display)?;
+        if let Some(stats) = &mut self.frame_stats {
+            stats.record(t1 - t0, t1.elapsed());
+        }
         Ok(true)
     }
 
