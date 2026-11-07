@@ -54,6 +54,7 @@ G
         crash) body='exit 3' ;;
         silent) body=$wait_forever ;;
         crash-after-beats) body='i=0; while [ $i -lt 30 ]; do i=$((i+1)); echo $i > "$BEATF"; sleep 0.05; done; exit 3' ;;
+        flood) body="sleep 0.5; echo flooded >> \"$T/calls\"; i=0; while [ \$i -lt 2000 ]; do echo \"flood line \$i: ................................................................................\" >&2; i=\$((i+1)); done; $wait_forever" ;;
         beat-then-slowsync) body="i=0; while [ \$i -lt 30 ]; do i=\$((i+1)); echo \$i > \"\$BEATF\"; sleep 0.05; done; : > \"$T/sync-slow\"; $wait_forever" ;;
         beat-then-silent) body="i=0; while [ \$i -lt 30 ]; do i=\$((i+1)); echo \$i > \"\$BEATF\"; sleep 0.05; done; $wait_forever" ;;
         crash-and-break-counter) body="mkdir -p \"$W/state/gpu-failures.new\"; exit 3" ;;
@@ -82,7 +83,7 @@ sup() { # seconds, then $SUP_SIGNAL
     _p=$!
     sleep "$1"
     kill -"$SUP_SIGNAL" "$_p" 2>/dev/null
-    sleep 0.2
+    sleep "${SUP_STOP_WAIT:-0.2}"
     if kill -0 "$_p" 2>/dev/null; then
         sup_lingered=1
         kill -KILL "$_p" 2>/dev/null
@@ -227,7 +228,7 @@ world silent; SUP_SIGNAL=KILL; sup 0.3; sleep 1.5
 if ! [ -e "$W/run/hung" ] && ! [ -e "$W/rebooted" ]; then ok "supervisor killed: an orphan watcher does nothing"; else bad "orphan watcher"; fi
 
 world replaced; sup 2
-if ! [ -e "$W/run/hung" ] && ! called '^soft' && ! grep -q 'killing it' "$T/log"; then ok "launcher replaced: the old watcher does nothing"; else bad "old watcher"; fi
+if ! [ -e "$W/run/hung" ] && ! called '^soft' && ! grep -q 'killed$' "$T/log"; then ok "launcher replaced: the old watcher does nothing"; else bad "old watcher"; fi
 
 # Clean stops and power cuts.
 world beat; sup 0.3; reboot_world; sup 0.3; reboot_world; sup 0.3
@@ -236,8 +237,9 @@ if [ "$(counter gpu-failures)" = 0 ] && ! [ -e "$W/state/no-gpu" ] && called '^g
 world beat; echo 1 > "$W/state/gpu-failures"; sup 0.3
 if [ "$(counter gpu-failures)" = 1 ]; then ok "clean stop: an earlier failure stays"; else bad "earlier failure ($(counter gpu-failures))"; fi
 
-world beat; : > "$T/sync-slow"; sup 0.3
-if [ "$(counter gpu-failures)" = 0 ] || ! [ -e "$W/state/gpu-failures" ]; then ok "clean stop while the attempt is being counted: taken back"; else bad "stop during the count ($(counter gpu-failures))"; fi
+# The stop waits for the count to be written, then puts it back.
+world beat; : > "$T/sync-slow"; SUP_STOP_WAIT=2.5; sup 0.3; SUP_STOP_WAIT=
+if { [ "$(counter gpu-failures)" = 0 ] || ! [ -e "$W/state/gpu-failures" ]; } && [ -z "$sup_lingered" ] && ! [ -e "$W/state/gpu-failures.new" ]; then ok "clean stop while the attempt is being counted: taken back"; else bad "stop during the count ($(counter gpu-failures))"; fi
 
 world beat; SUP_SIGNAL=KILL; sup 0.3
 if [ "$(counter gpu-failures)" = 1 ]; then ok "power cut: counted"; else bad "power cut ($(counter gpu-failures))"; fi
@@ -262,6 +264,34 @@ sleep 2.5
 if called '^soft' && ! [ -e "$T/ended" ]; then ok "log reader gone: the supervisor goes on"; else bad "log reader gone"; fi
 pkill -KILL -f "$S/" 2>/dev/null
 wait 2>/dev/null
+
+# Only the relay is killed: its keeper starts it again and the launcher's lines go on.
+world beat; rm "$W/system/vendor/bin/pvrsrvctl_SGX540_120"; : > "$W/soft-talks"
+(launch) >> "$T/log" 2>&1 &
+sup_p=$!
+sleep 0.5
+kill -KILL "$(cat "$W/run/relay.pid")" 2>/dev/null
+sleep 0.1
+before=$(grep -c tick "$T/log")
+sleep 2
+after=$(grep -c tick "$T/log")
+if [ "$after" -gt $((before + 5)) ] && [ "$(count '^soft')" = 1 ]; then ok "relay killed: started again, the launcher's lines go on"; else bad "relay restart ($before $after)"; fi
+kill "$sup_p" 2>/dev/null; sleep 0.2; kill -KILL "$sup_p" 2>/dev/null; wait "$sup_p" 2>/dev/null
+pkill -KILL -f "$S/" 2>/dev/null; pkill -KILL -f "$T/" 2>/dev/null
+
+# The relay is killed and the GPU launcher fills the FIFO, then hangs: it must still be killed,
+# and the software launcher must start.
+world flood; SUP_ENV=GLASS_SUPERVISOR_KILL_POLLS=1
+(launch) >> "$T/log" 2>&1 &
+sup_p=$!
+sleep 0.3
+kill -KILL "$(cat "$W/run/relay-keeper.pid")" "$(cat "$W/run/relay.pid")" 2>/dev/null
+sleep 3
+if called '^soft' && [ -e "$W/run/hung" ] && [ "$(count '^gles')" = 1 ] && called flooded && grep -q 'starting the software launcher' "$T/log" \
+    && grep -q 'flood line 600:' "$T/log"; then
+    ok "relay killed, FIFO full: launcher killed, software, relay back"; else bad "relay killed"; fi
+kill "$sup_p" 2>/dev/null; sleep 0.2; kill -KILL "$sup_p" 2>/dev/null; wait "$sup_p" 2>/dev/null
+pkill -KILL -f "$S/" 2>/dev/null; pkill -KILL -f "$T/" 2>/dev/null
 
 world beat; rm "$W/system/vendor/bin/pvrsrvctl_SGX540_120"; : > "$W/soft-talks"; : > "$W/kmsg"; SUP_ENV="GLASS_LOG_FALLBACK=$W/kmsg"
 ( (launch) 2>&1 ) | { IFS= read -r _; } &

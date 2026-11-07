@@ -198,7 +198,7 @@ static void fb_report(const char *tag)
 /* Reads the scanned-out buffer through /dev/mem: base and pitch as DISPC reports them. */
 static int scan(unsigned long ba, unsigned long pitch, const char *dump)
 {
-    int fd = open("/dev/mem", O_RDONLY | O_SYNC);
+    int fd;
     size_t len = pitch * H;
     unsigned long page = ba & ~0xfffUL;
     unsigned char *base, *m;
@@ -206,6 +206,7 @@ static int scan(unsigned long ba, unsigned long pitch, const char *dump)
         printf("pitch %lu is below %d, one line of %d pixels\n", pitch, W * 4, W);
         return 2;
     }
+    fd = open("/dev/mem", O_RDONLY | O_SYNC);
     if (fd < 0) {
         perror("/dev/mem");
         return 1;

@@ -18,10 +18,12 @@
 # - A launcher that stops beating for 20 s of awake time is killed and this boot goes on in
 #   software. If it cannot be killed the driver is stuck and only a reboot brings the UI back: that
 #   reboot is counted, two in a row write the marker, and an hour of beats clears the count. A
-#   launcher that dies within 30 s of the kill, or before the reboot, is not stuck. If the reboot
+#   launcher that dies within 15 s of the kill, or before the reboot, is not stuck. If the reboot
 #   does not happen the software launcher starts anyway.
 # - The launchers write their output to a relay, never to the init's pipe: if whoever reads the
 #   log dies, the relay goes on into /dev/kmsg (GLASS_LOG_FALLBACK) and no launcher sees EPIPE.
+#   A relay that dies is started again within a second. This script's own lines go straight to
+#   the init, so none of them can wait for the relay.
 # - A launcher that crashes after a healthy start is restarted, up to 5 starts per boot.
 # - The marker stays until --clear-gpu-state or a reinstall.
 #
@@ -43,7 +45,7 @@ REBOOT=${GLASS_REBOOT:-reboot -f}
 KILL=${GLASS_KILL:-kill -KILL}
 ALLOW_VOLATILE=${GLASS_GPU_ALLOW_VOLATILE_STATE:-0}
 POLL_S=${GLASS_SUPERVISOR_POLL_S:-5}
-KILL_POLLS=${GLASS_SUPERVISOR_KILL_POLLS:-6}   # polls of POLL_S after the kill: SGX can take seconds to let go
+KILL_POLLS=${GLASS_SUPERVISOR_KILL_POLLS:-3}   # polls of POLL_S after the kill: SGX can take seconds to let go
 LOG_FALLBACK=${GLASS_LOG_FALLBACK:-/dev/kmsg}
 REBOOT_WAIT_S=${GLASS_SUPERVISOR_REBOOT_WAIT_S:-15}
 BOUND_S=${GLASS_SUPERVISOR_BOUND_S:-30}
@@ -61,18 +63,27 @@ TOOL_OUT=$RUN/tool.out
 TOOL_PID=$RUN/tool.pid
 COUNTED=$RUN/counted     # the counter's value before the open attempt, to put back on a clean stop
 LOG_FIFO=$RUN/log
+RELAY_PID=$RUN/relay.pid
+KEEPER_PID=$RUN/relay-keeper.pid
 MAX_FAILURES=2
 MAX_WEDGES=2
 MAX_STARTS=5
 STALE_POLLS=4   # 20 s of silence
 GOOD_POLLS=4    # 20 s of beats: the GPU works
 
-log() { echo "OMGB-GPU: $*" >&2; }
+# Straight to the init, never through the relay, so that no log line here can block. With the
+# reader gone the line goes to the fallback.
+log() {
+    echo "OMGB-GPU: $*" >&2 2>/dev/null || echo "OMGB-GPU: $*" >> "$LOG_FALLBACK" 2>/dev/null
+}
 
 child=
 watcher=
 timer=
 wake=
+keeper=
+relay_on=
+bwait=
 
 count() {
     _c=$(cat "$STATE/$1" 2>/dev/null)
@@ -102,15 +113,25 @@ kill_tool() {
 }
 
 on_term() {
-    for _p in "$watcher" "$timer" "$child"; do
+    for _p in "$watcher" "$timer"; do
         [ -n "$_p" ] && kill "$_p" 2>/dev/null
     done
+    # A count being written is let finish, or its mv could land after the undo.
+    if [ -n "$child" ] && [ -n "$bwait" ]; then
+        wait "$child"
+    elif [ -n "$child" ]; then
+        kill "$child" 2>/dev/null
+    fi
     rm -f "$OWNER"
     kill_tool
     undo_attempt
+    [ -n "$keeper" ] && kill "$keeper" 2>/dev/null
+    _p=$(cat "$RELAY_PID" 2>/dev/null)
+    [ -n "$_p" ] && kill "$_p" 2>/dev/null
     exit 143
 }
 trap on_term TERM INT
+trap '' HUP          # the relay and the launchers inherit this
 trap 'wake=1' USR1   # interrupts a wait: see bounded and watch_beat
 trap '' PIPE         # whoever reads the log may die; the UI must not die with it
 
@@ -120,6 +141,7 @@ bounded() {
     _limit=$1
     shift
     wake=
+    case "$1" in may_try_gpu|attempt) bwait=1 ;; *) bwait= ;; esac
     "$@" &
     child=$!
     (sleep "$_limit"; kill -USR1 $$) &
@@ -129,12 +151,14 @@ bounded() {
     kill "$timer" 2>/dev/null
     timer=
     if [ -n "$wake" ]; then
-        log "$1 is still running after ${_limit}s: leaving it behind"
         $KILL "$child" 2>/dev/null
         kill_tool
         _rc=124
     fi
     child=
+    bwait=
+    ensure_relay
+    [ "$_rc" = 124 ] && log "$1 is still running after ${_limit}s: leaving it behind"
     return "$_rc"
 }
 
@@ -318,9 +342,10 @@ watch_beat() {
         fi
         _stale=$((_stale + 1))
         [ "$_stale" -lt "$STALE_POLLS" ] && continue
-        log "GPU launcher silent for $STALE_POLLS polls of ${POLL_S}s: killing it"
+        # Kill first: a log line may wait for the relay.
         true > "$HUNG"
         $KILL "$_pid" 2>/dev/null
+        log "GPU launcher silent for $STALE_POLLS polls of ${POLL_S}s: killed"
         # Once it is gone the supervisor reaps it and stops this watcher.
         _k=0
         while [ "$_k" -lt "$KILL_POLLS" ]; do
@@ -345,7 +370,7 @@ run_gles() {
     case "$_s" in ''|*[!0-9]*) _s=0 ;; esac
     echo $((_s + 1)) > "$STARTS"
     log "starting the GPU launcher"
-    (gpu_env; exec "$GLES_LAUNCHER" --display fbwin "$FBWIN" --heartbeat "$BEAT" "$@") &
+    (gpu_env; exec "$GLES_LAUNCHER" --display fbwin "$FBWIN" --heartbeat "$BEAT" "$@" >&8 2>&8 8>&-) &
     child=$!
     echo "$child" > "$OWNER"
     watch_beat "$child" &
@@ -354,6 +379,7 @@ run_gles() {
     wait "$child"
     _rc=$?
     _stuck=$wake
+    ensure_relay
     kill "$watcher" 2>/dev/null   # no wait: nothing here may block the fallback
     rm -f "$OWNER"
     child=
@@ -377,8 +403,9 @@ restart_allowed() {
 
 run_software() {
     while :; do
+        ensure_relay
         log "starting the software launcher"
-        "$SOFT_LAUNCHER" --renderer software --display fb "$FB" "$@" &
+        "$SOFT_LAUNCHER" --renderer software --display fb "$FB" "$@" >&8 2>&8 8>&- &
         child=$!
         wait "$child"
         _rc=$?
@@ -411,14 +438,41 @@ relay() {
     done
 }
 
+# Starts the relay again whenever it ends: without it every writer blocks once the FIFO is full.
+# Ends with the supervisor.
+relay_keeper() {
+    trap - TERM INT
+    echo -1000 > /proc/self/oom_score_adj 2>/dev/null
+    while kill -0 "$$" 2>/dev/null; do
+        # Read-write, so the relay never sees end of file and only ends when killed.
+        (echo -1000 > /proc/self/oom_score_adj 2>/dev/null; relay) <> "$LOG_FIFO" &
+        echo "$!" > "$RELAY_PID"
+        wait "$!"
+        sleep 1
+    done
+}
+
+# In this shell only, between waits: a keeper that was killed is started again.
+ensure_relay() {
+    [ -n "$relay_on" ] || return 0
+    [ -n "$keeper" ] && kill -0 "$keeper" 2>/dev/null && return 0
+    _p=$(cat "$RELAY_PID" 2>/dev/null)
+    [ -n "$_p" ] && kill -KILL "$_p" 2>/dev/null   # never two readers on the FIFO
+    relay_keeper 8>&- &
+    keeper=$!
+    echo "$keeper" > "$KEEPER_PID"
+}
+
 mkdir -p "$RUN"
-rm -f "$COUNTED" "$LOG_FIFO"
+rm -f "$COUNTED" "$LOG_FIFO" "$RELAY_PID"
 if mkfifo "$LOG_FIFO" 2>/dev/null; then
-    relay < "$LOG_FIFO" &
-    # Read-write: the open cannot block, and while this shell lives the relay sees no end of file.
-    exec 1<> "$LOG_FIFO" 2>&1
+    relay_on=1
+    ensure_relay
+    # The launchers' end. Read-write: the open cannot block.
+    exec 8<> "$LOG_FIFO"
 else
     log "no log relay: a dead log reader would stop the launchers"
+    exec 8>&2
 fi
 if bounded "$BOUND_S" may_try_gpu; then
     if bounded "$BOUND_S" gpu_up; then

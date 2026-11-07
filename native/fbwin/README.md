@@ -24,7 +24,7 @@ Two GPU failures in a row, or two reboots for a stuck driver, write the `no-gpu`
 
 Limits of the bookkeeping: a kernel crash after the first 20 s is not counted, so one that recurs later than that on every boot still reboots each time. A bring-up process stuck in D state stays until the next boot and may keep the Glass out of deep sleep, because the freezer waits for it.
 
-The fallback is invisible: a Glass that runs in software after a refused or failed GPU looks the same as one on the GPU, only slower, and only the log says why. The launchers' output goes through a relay in the supervisor, so a dead log reader cannot hand them `EPIPE`; once the reader is gone the relay writes to `/dev/kmsg`. After a launcher stops beating it gets 30 s to die before the driver is taken for stuck, and the reboot is called off if it dies before then.
+The fallback is invisible: a Glass that runs in software after a refused or failed GPU looks the same as one on the GPU, only slower, and only the log says why. The launchers' output goes through a relay in the supervisor, so a dead log reader cannot hand them `EPIPE`; once the reader is gone the relay writes to `/dev/kmsg`, and a relay that dies is started again within a second. After a launcher stops beating it gets 15 s to die before the driver is taken for stuck, and the reboot is called off if it dies before then.
 
 The stock files come from the owner's own Glass and stay local, never in git or in a published image:
 
