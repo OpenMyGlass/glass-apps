@@ -38,6 +38,9 @@ pub mod ids {
     /// The menus that ask before forgetting the phone and after a phone bonded. They belong
     /// to no card of [`super::ORDER`], so a settings change does not rebuild them.
     pub const PHONE_QUESTION: CardId = 116;
+    /// The question asked after any bond ([`super::paired_question`]); while it is unanswered
+    /// it comes back at each wake.
+    pub const BOND_QUESTION: CardId = 117;
 }
 
 /// The settings cards from the one next to the "now" cards to the farthest.
@@ -126,8 +129,12 @@ pub enum Choice {
     AskForget,
     /// Forget the bonded phone (`CompanionForgetBond`).
     Forget,
-    /// Keep the phone that just bonded (nothing to send).
+    /// The owner says the phone that bonded is theirs (nothing to send).
     KeepPhone,
+    /// Ask about the phone that bonded again (its name was tapped, not an answer).
+    AskBond,
+    /// Close the menu, nothing else.
+    Dismiss,
 }
 
 /// "15 seconds", "1 minute", "10 minutes" (in `locale`).
@@ -578,18 +585,21 @@ fn phone_menu(v: &SettingsView) -> Option<Vec<MenuItem<Choice>>> {
 /// Asked before forgetting: cancel comes first, so a second tap by mistake forgets nothing.
 pub fn forget_question(loc: Locale) -> Vec<MenuItem<Choice>> {
     vec![
-        MenuItem::new(Choice::KeepPhone, Msg::Cancel.get(loc)),
+        MenuItem::new(Choice::Dismiss, Msg::Cancel.get(loc)),
         MenuItem::new(Choice::Forget, Msg::ForgetYes.get(loc))
             .with_detail(Msg::ForgetCutsOff.get(loc)),
     ]
 }
 
-/// Asked when a phone has bonded: the first one in range wins and no code is compared, so
-/// the owner checks the name and can forget it at once.
+/// Asked whenever a phone has bonded: the first one in range wins and no code is compared,
+/// so the owner checks the name. The menu opens on the name, which answers nothing (a tap
+/// asks again): a reflex tap neither keeps a stranger nor forgets the owner's phone, and
+/// either answer takes a swipe and a tap. "This is my phone" comes next, as the usual answer.
 pub fn paired_question(loc: Locale, name: &str) -> Vec<MenuItem<Choice>> {
     vec![
-        MenuItem::new(Choice::KeepPhone, crate::pairing::paired_text(loc, name))
-            .with_detail(Msg::ThisIsMyPhone.get(loc)),
+        MenuItem::new(Choice::AskBond, crate::pairing::paired_text(loc, name))
+            .with_detail(Msg::SwipeToAnswer.get(loc)),
+        MenuItem::new(Choice::KeepPhone, Msg::ThisIsMyPhone.get(loc)),
         MenuItem::new(Choice::Forget, Msg::NotMyPhone.get(loc)).with_detail(Msg::ForgetIt.get(loc)),
     ]
 }
@@ -1026,13 +1036,15 @@ mod tests {
         assert_eq!(items[0].detail.as_deref(), Some("Pixel 8"));
         assert_eq!(items[0].value, Choice::AskForget);
         let q = forget_question(Locale::En);
-        assert_eq!(q[0].value, Choice::KeepPhone, "cancel comes first");
+        assert_eq!(q[0].value, Choice::Dismiss, "cancel comes first");
         assert_eq!(q[1].value, Choice::Forget);
         let q = paired_question(Locale::It, "Pixel 8");
         assert_eq!(q[0].label, "Associato a Pixel 8");
-        assert_eq!(q[0].value, Choice::KeepPhone);
-        assert_eq!(q[1].label, "Non è il mio telefono");
-        assert_eq!(q[1].value, Choice::Forget);
+        assert_eq!(q[0].value, Choice::AskBond, "a reflex tap answers nothing");
+        assert_eq!(q[1].label, "È il mio telefono");
+        assert_eq!(q[1].value, Choice::KeepPhone);
+        assert_eq!(q[2].label, "Non è il mio telefono");
+        assert_eq!(q[2].value, Choice::Forget);
     }
 
     #[test]

@@ -23,8 +23,8 @@ minifb = "0.29"
 khronos-egl = { version = "6", features = ["dynamic"] }
 glow = "0.17"
 libloading = "0.8"
-# glassd client, types and in-process mock (glass-services, pinned: M3 interface on its m3-android-glue branch until merged).
-glass-api = { git = "https://github.com/OpenMyGlass/glass-services", rev = "6e7e7afd9f12fec0113ef03bc5b9983232677d6d" }
+# glassd client, types and in-process mock (glass-services, pinned to a main commit: the pairing mode, PR #41).
+glass-api = { git = "https://github.com/OpenMyGlass/glass-services", rev = "bdbbd221bde0b520da3ed4aaa98767428dec7f13" }
 glass-gfx = { path = "crates/glass-gfx" }
 glass-gfx-gles = { path = "crates/glass-gfx-gles" }
 glass-ui = { path = "crates/glass-ui" }
@@ -34,9 +34,3 @@ glass-launcher = { path = "crates/glass-launcher" }
 lto = "thin"
 codegen-units = 1
 
-# DEVELOPMENT ONLY: glass-api from the local glass-services `glassd-ble-hardening` checkout, for the
-# pairing-mode messages (CompanionPairingWindow, CompanionForgetBond, CompanionState.pairing_until_us
-# and paired_name). Once that branch merges in glass-services: delete this section, set the `rev` of
-# glass-api above to the merge commit, and run `cargo update -p glass-api`.
-[patch."https://github.com/OpenMyGlass/glass-services"]
-glass-api = { path = "../wip-glassd-hardening/crates/glass-api" }

@@ -5,9 +5,11 @@
 //! The launcher sends `CompanionPairingWindow{open: true}` and shows this screen: how to
 //! connect from the phone, and the time left, read from `CompanionState.pairing_until_us`
 //! (on `CLOCK_MONOTONIC`, like every glassd `timestamp_us`). The first phone that bonds wins
-//! and no code is compared, so when `paired` turns true the app shows `paired_name` and asks
-//! whether this is the owner's phone ([`PairingOut::Paired`]). `SWIPE_DOWN` backs out and
-//! closes the mode. When the time runs out the screen says so; `TAP` opens the mode again.
+//! and no code is compared, so whenever `paired` turns true (here or in any other way) the app
+//! shows `paired_name` and asks whether this is the owner's phone (`App::companion_changed`).
+//! `SWIPE_DOWN` backs out and closes the mode. When the time runs out the screen says so;
+//! `TAP` opens the mode again. The same screen tells why a request was refused, also a
+//! `CompanionForgetBond` ([`Pairing::failed`]).
 
 use crate::settings::timeout_text;
 use crate::setup::Companion;
@@ -22,29 +24,60 @@ pub const WINDOW_MS: u32 = 120_000;
 /// How long the screen is held on for one opening: the window and a margin for the answer.
 pub const KEEP_ON_MS: u32 = WINDOW_MS + 10_000;
 
-/// Why the mode could not be opened.
+/// How long the screen is held on for the question after a bond. Unanswered, it times out and
+/// the question comes back at the next wake.
+pub const QUESTION_KEEP_ON_MS: u32 = 60_000;
+
+/// A pairing request to glassd, to tell its error answers apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PairRequest {
+    /// `CompanionPairingWindow{open: true}`.
+    Open,
+    /// `CompanionPairingWindow{open: false}`.
+    Close,
+    /// `CompanionForgetBond`.
+    Forget,
+}
+
+/// Why a request was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// `ERROR_CODE_UNSUPPORTED`: this glassd has no pairing mode.
+    /// `ERROR_CODE_UNSUPPORTED`: this glassd does not hold the phone link.
     Unsupported,
-    /// `ERROR_CODE_UNAVAILABLE`: a phone is bonded already.
+    /// `ERROR_CODE_DENIED`: the launcher is not a privileged client of glassd.
+    Denied,
+    /// `ERROR_CODE_UNAVAILABLE` to an opening: a phone is bonded already.
     AlreadyPaired,
+    /// `ERROR_CODE_UNAVAILABLE`, "the companion link is disabled": glassd could not seed its
+    /// random numbers, so it holds no link at all.
+    LinkDisabled,
+    /// `ERROR_CODE_UNAVAILABLE` to a forget: the bond is still on the disk.
+    NotErased,
     Other,
 }
 
 impl Refusal {
-    pub fn from_code(code: ErrorCode) -> Refusal {
+    /// The refusal of `request` with `code` and glassd's `message` (for logs, but the only
+    /// thing that tells the two `ERROR_CODE_UNAVAILABLE` of an opening apart).
+    pub fn of(request: PairRequest, code: ErrorCode, message: &str) -> Refusal {
         match code {
             ErrorCode::Unsupported => Refusal::Unsupported,
-            ErrorCode::Unavailable => Refusal::AlreadyPaired,
+            ErrorCode::Denied => Refusal::Denied,
+            ErrorCode::Unavailable if message.contains("disabled") => Refusal::LinkDisabled,
+            ErrorCode::Unavailable if request == PairRequest::Forget => Refusal::NotErased,
+            ErrorCode::Unavailable if request == PairRequest::Open => Refusal::AlreadyPaired,
             _ => Refusal::Other,
         }
     }
 
-    fn text(self, locale: Locale) -> &'static str {
+    fn text(self, request: PairRequest, locale: Locale) -> &'static str {
         match self {
             Refusal::Unsupported => Msg::PairingNotAvailable,
+            Refusal::Denied => Msg::PairingNotAllowed,
             Refusal::AlreadyPaired => Msg::AlreadyPaired,
+            Refusal::LinkDisabled => Msg::PhoneLinkDisabled,
+            Refusal::NotErased => Msg::BondNotErased,
+            Refusal::Other if request == PairRequest::Forget => Msg::BondNotErased,
             Refusal::Other => Msg::PairingCouldNotOpen,
         }
         .get(locale)
@@ -61,9 +94,9 @@ pub enum Phase {
     },
     /// It closed by itself (its time ran out, or glassd restarted) with no phone bonded.
     Ended,
-    Refused(Refusal),
-    /// A phone bonded (the mode is closed by glassd).
-    Paired(String),
+    Refused(PairRequest, Refusal),
+    /// A phone bonded (the mode is closed by glassd); the app asks the owner about it.
+    Paired,
 }
 
 /// What the app must do.
@@ -73,8 +106,6 @@ pub enum PairingOut {
     Close,
     /// Open the mode again (the time starts again).
     Reopen,
-    /// A phone bonded: show its name and ask if it is the owner's.
-    Paired(String),
     /// The mode is no longer open: the screen need not be held on.
     ReleaseScreen,
 }
@@ -106,29 +137,32 @@ impl Pairing {
         matches!(self.phase, Phase::Opening | Phase::Open { .. })
     }
 
-    /// The mode was asked for again.
-    pub fn reopening(&mut self) {
-        self.phase = Phase::Opening;
+    /// The screen that tells why `request` was refused.
+    pub fn failed(request: PairRequest, r: Refusal) -> Pairing {
+        Pairing {
+            phase: Phase::Refused(request, r),
+        }
     }
 
-    /// glassd refused the `CompanionPairingWindow`.
+    /// glassd refused the `CompanionPairingWindow{open: true}`.
     pub fn refused(&mut self, r: Refusal) -> Option<PairingOut> {
         if !self.is_open() {
             return None;
         }
-        self.phase = Phase::Refused(r);
+        self.phase = Phase::Refused(PairRequest::Open, r);
         Some(PairingOut::ReleaseScreen)
     }
 
     /// glassd's `CompanionState`.
     pub fn on_companion(&mut self, c: &Companion) -> Option<PairingOut> {
-        if matches!(self.phase, Phase::Paired(_)) {
+        if self.phase == Phase::Paired {
             return None;
         }
         if c.paired {
-            // Also outside the window (a bond over TCP): either way, the owner checks it.
-            self.phase = Phase::Paired(c.paired_name.clone());
-            return Some(PairingOut::Paired(c.paired_name.clone()));
+            // The app asks the owner about the phone, however it bonded, and replaces this
+            // screen with the question; glassd closed the mode with the bond.
+            self.phase = Phase::Paired;
+            return None;
         }
         match (&self.phase, c.pairing_until_us) {
             (Phase::Opening | Phase::Open { .. }, until_us) if until_us > 0 => {
@@ -166,7 +200,7 @@ impl Pairing {
                 self.phase = Phase::Opening;
                 Some(PairingOut::Reopen)
             }
-            (GestureKind::Tap, Phase::Refused(_)) => Some(PairingOut::Close),
+            (GestureKind::Tap, Phase::Refused(..)) => Some(PairingOut::Close),
             _ => None,
         }
     }
@@ -215,13 +249,18 @@ impl Pairing {
                     Msg::TapRetrySwipeClose.get(locale),
                 ]),
             },
-            Phase::Refused(r) => CardContent::Info {
-                title: Msg::PairingNotStarted.get(locale).into(),
-                lines: lines(&[r.text(locale), Msg::TapToClose.get(locale)]),
+            Phase::Refused(request, r) => CardContent::Info {
+                title: match request {
+                    PairRequest::Forget => Msg::PhoneNotForgotten,
+                    _ => Msg::PairingNotStarted,
+                }
+                .get(locale)
+                .into(),
+                lines: lines(&[r.text(*request, locale), Msg::TapToClose.get(locale)]),
             },
             // Not shown: the app replaces the screen with the question at once.
-            Phase::Paired(name) => CardContent::Info {
-                title: paired_text(locale, name),
+            Phase::Paired => CardContent::Info {
+                title: Msg::Paired.get(locale).into(),
                 lines: Vec::new(),
             },
         }
@@ -314,15 +353,14 @@ mod tests {
     }
 
     #[test]
-    fn a_bond_asks_the_owner() {
+    fn a_bond_ends_the_screen() {
         let mut p = Pairing::new();
         p.on_companion(&companion(false, "", 10_000_000));
-        assert_eq!(
-            p.on_companion(&companion(true, "Pixel 8", 0)),
-            Some(PairingOut::Paired("Pixel 8".into()))
-        );
-        assert!(!p.is_open());
+        // The app asks the owner; this screen only stops being open.
         assert_eq!(p.on_companion(&companion(true, "Pixel 8", 0)), None);
+        assert_eq!(p.phase(), &Phase::Paired);
+        assert!(!p.is_open());
+        assert_eq!(p.on_companion(&companion(false, "", 0)), None);
         assert_eq!(paired_text(Locale::En, "Pixel 8"), "Paired with Pixel 8");
         assert_eq!(paired_text(Locale::Fr, ""), "Associé");
     }
@@ -334,8 +372,12 @@ mod tests {
             p.input(&InputEvent::gesture(GestureKind::SwipeDown)),
             Some(PairingOut::Close)
         );
-        p.refused(Refusal::from_code(ErrorCode::Unsupported));
-        assert_eq!(p.phase(), &Phase::Refused(Refusal::Unsupported));
+        let r = Refusal::of(PairRequest::Open, ErrorCode::Unsupported, "");
+        assert_eq!(p.refused(r), Some(PairingOut::ReleaseScreen));
+        assert_eq!(
+            p.phase(),
+            &Phase::Refused(PairRequest::Open, Refusal::Unsupported)
+        );
         assert!(!p.is_open());
         assert_eq!(
             lines(p.card(Locale::En, 0))[0],
@@ -345,10 +387,78 @@ mod tests {
             p.input(&InputEvent::gesture(GestureKind::Tap)),
             Some(PairingOut::Close)
         );
+    }
+
+    #[test]
+    fn each_refusal_says_what_happened() {
+        use PairRequest::{Forget, Open};
+        let busy = ErrorCode::Unavailable;
+        let cases = [
+            (
+                Open,
+                busy,
+                "already bonded: forget the bond first",
+                Refusal::AlreadyPaired,
+            ),
+            (
+                Open,
+                busy,
+                "the companion link is disabled",
+                Refusal::LinkDisabled,
+            ),
+            (
+                Forget,
+                busy,
+                "the bond is still on disk: EIO",
+                Refusal::NotErased,
+            ),
+            (Open, ErrorCode::Denied, "", Refusal::Denied),
+            (Forget, ErrorCode::Denied, "", Refusal::Denied),
+            (Forget, ErrorCode::Unsupported, "", Refusal::Unsupported),
+            (Open, ErrorCode::InvalidArgument, "", Refusal::Other),
+        ];
+        for (req, code, msg, want) in cases {
+            assert_eq!(Refusal::of(req, code, msg), want, "{req:?} {code:?} {msg}");
+        }
+        let card = |req, r| match Pairing::failed(req, r).card(Locale::En, 0) {
+            CardContent::Info { title, lines } => (title, lines[0].clone()),
+            c => panic!("{c:?}"),
+        };
         assert_eq!(
-            Refusal::from_code(ErrorCode::Unavailable),
-            Refusal::AlreadyPaired
+            card(Forget, Refusal::NotErased),
+            (
+                "Phone not forgotten".to_string(),
+                "The pairing could not be erased".to_string()
+            )
         );
+        assert_eq!(
+            card(Open, Refusal::AlreadyPaired).1,
+            "A phone is already paired"
+        );
+        assert_eq!(
+            card(Open, Refusal::LinkDisabled).1,
+            "The phone link is disabled"
+        );
+        assert_eq!(
+            card(Open, Refusal::Denied).1,
+            "The launcher is not allowed to do this"
+        );
+        // All different, in every language.
+        for l in Locale::ALL {
+            let mut texts: Vec<&str> = [
+                Refusal::Unsupported,
+                Refusal::Denied,
+                Refusal::AlreadyPaired,
+                Refusal::LinkDisabled,
+                Refusal::NotErased,
+            ]
+            .iter()
+            .map(|r| r.text(Open, l))
+            .collect();
+            texts.sort();
+            texts.dedup();
+            assert_eq!(texts.len(), 5, "{l:?}");
+        }
     }
 
     #[test]

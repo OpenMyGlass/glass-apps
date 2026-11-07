@@ -21,6 +21,7 @@
 //!   until the next minute (the home clock) at rest, without a timeout while the screen is
 //!   off. When `glassd` goes away it reconnects with a [`Backoff`].
 
+use crate::pairing::PairRequest;
 use crate::settings::ServiceInfo;
 use crate::setup::Companion;
 use crate::{App, Request};
@@ -176,8 +177,8 @@ pub struct Session {
     reacquire: bool,
     /// `seq` and request id of the last `DictationStart`, to match an error answer.
     dictation_seq: Option<(u32, u32)>,
-    /// `seq` of the pairing requests not yet answered, to match an error answer.
-    pairing_seqs: Vec<u32>,
+    /// `seq` and kind of the pairing requests sent, to match an error answer.
+    pairing_seqs: Vec<(u32, PairRequest)>,
     settings: Option<Settings>,
     log: Vec<String>,
 }
@@ -231,6 +232,7 @@ impl Session {
             if self.focused {
                 app.cancel_touch();
             }
+            app.focus_lost();
             self.focused = false;
         }
         Ok(())
@@ -302,6 +304,9 @@ impl Session {
                 if self.focused && !f.focused {
                     app.cancel_touch();
                 }
+                if !f.focused {
+                    app.focus_lost();
+                }
                 self.focused = f.focused;
                 if !f.focused && self.wants_focus && self.reacquire {
                     self.client.acquire_focus()?;
@@ -325,10 +330,13 @@ impl Session {
                 app.settings_changed(s);
             }
             service_frame::Body::Error(e) => {
-                if e.seq != 0 && self.pairing_seqs.contains(&e.seq) {
-                    self.pairing_seqs.retain(|&s| s != e.seq);
+                let pairing = self.pairing_seqs.iter().position(|&(s, _)| s == e.seq);
+                if let (Some(i), true) = (pairing, e.seq != 0) {
+                    let (_, request) = self.pairing_seqs.remove(i);
                     app.pairing_refused(
+                        request,
                         ErrorCode::try_from(e.code).unwrap_or(ErrorCode::Unspecified),
+                        &e.message,
                     );
                 }
                 if let Some((seq, request_id)) = self.dictation_seq {
@@ -387,7 +395,12 @@ impl Session {
                         .send(client_frame::Body::CompanionPairingWindow(
                             CompanionPairingWindow { open, duration_ms },
                         ))?;
-                    self.track_pairing(seq);
+                    let kind = if open {
+                        PairRequest::Open
+                    } else {
+                        PairRequest::Close
+                    };
+                    self.track_pairing(seq, kind);
                     self.log.push(format!(
                         "CompanionPairingWindow open={open} {duration_ms} ms"
                     ));
@@ -396,7 +409,7 @@ impl Session {
                     let seq = self.client.send(client_frame::Body::CompanionForgetBond(
                         CompanionForgetBond {},
                     ))?;
-                    self.track_pairing(seq);
+                    self.track_pairing(seq, PairRequest::Forget);
                     self.log.push("CompanionForgetBond".into());
                 }
                 Request::KeepScreenOnFor(ms) => {
@@ -422,12 +435,12 @@ impl Session {
         Ok(())
     }
 
-    fn track_pairing(&mut self, seq: u32) {
-        // A glassd that answers nothing (an old one, or the in-process mock) must not grow it.
+    fn track_pairing(&mut self, seq: u32, kind: PairRequest) {
+        // Only errors are answered: a request that succeeded must not stay here for ever.
         if self.pairing_seqs.len() >= 8 {
             self.pairing_seqs.remove(0);
         }
-        self.pairing_seqs.push(seq);
+        self.pairing_seqs.push((seq, kind));
     }
 
     /// Sends pending requests, then waits up to `timeout` (`None`: no limit) for a frame,

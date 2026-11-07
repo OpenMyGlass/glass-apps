@@ -5,10 +5,11 @@
 
 use glass_api::proto::{
     client_frame, screen_request, service_frame::Body, CompanionState, ErrorCode, Gesture,
-    GestureKind as PKind, ServiceError, ServiceFrame, Settings,
+    GestureKind as PKind, Settings,
 };
 use glass_api::MockService;
 use glass_launcher::glassd::{wait_time, Session};
+use glass_launcher::pairing::PairRequest;
 use glass_launcher::settings::{self, ids, ServiceInfo};
 use glass_launcher::setup::Companion;
 use glass_launcher::{demo, pairing, App, OverlayKind, Request};
@@ -40,8 +41,14 @@ fn service(capabilities: &[&str]) -> ServiceInfo {
     }
 }
 
-/// An app following glassd, which holds the phone link, with `settings` applied; and its clock.
+/// An app following glassd, which holds the phone link, with `settings` applied and no phone
+/// bonded (glassd's first `CompanionState`); and its clock.
 fn app_with(settings: Settings) -> (App, Rc<Cell<u64>>) {
+    app_bonded(settings, None)
+}
+
+/// The same with the phone `bonded` in glassd's first `CompanionState`.
+fn app_bonded(settings: Settings, bonded: Option<&str>) -> (App, Rc<Cell<u64>>) {
     let mut a = App::new(demo::timeline(), ctx());
     a.follow_glassd();
     let clock = Rc::new(Cell::new(START_US));
@@ -49,7 +56,9 @@ fn app_with(settings: Settings) -> (App, Rc<Cell<u64>>) {
     a.set_monotonic_clock(Box::new(move || c.get()));
     a.set_service(Some(service(&["screen", "radio", "companion-link"])));
     a.settings_changed(settings);
+    a.companion_changed(state(bonded.is_some(), bonded.unwrap_or(""), 0));
     a.render_if_changed().unwrap();
+    assert!(a.take_requests().is_empty());
     (a, clock)
 }
 
@@ -89,14 +98,11 @@ fn goto(a: &mut App, id: CardId) {
 }
 
 fn card_subtitle(a: &App, id: CardId) -> String {
-    match a.timeline().cards().iter().find(|c| c.id == id) {
-        Some(c) => match &c.content {
-            CardContent::Settings {
-                subtitle: Some(s), ..
-            } => s.clone(),
-            other => panic!("{other:?}"),
-        },
-        None => panic!("no card {id}"),
+    match settings::card_content(id, &a.settings_view()) {
+        Some(CardContent::Settings {
+            subtitle: Some(s), ..
+        }) => s,
+        other => panic!("{other:?}"),
     }
 }
 
@@ -223,8 +229,14 @@ fn with_the_radios_ready_it_opens_at_once_and_the_screen_going_off_closes_it() {
     assert_eq!(a.take_requests(), vec![CLOSE, Request::KeepScreenOn(false)]);
 }
 
+const QUESTION: [&str; 3] = ["Paired with Pixel 8", "This is my phone", "Not my phone"];
+
+fn hold_question() -> Request {
+    Request::KeepScreenOnFor(pairing::QUESTION_KEEP_ON_MS)
+}
+
 #[test]
-fn a_bonded_phone_is_shown_and_can_be_refused_at_once() {
+fn a_bond_in_the_pairing_screen_is_questioned_and_can_be_refused() {
     let (mut a, _) = app_with(radios(true, false));
     goto(&mut a, ids::PHONE);
     g(&mut a, GestureKind::Tap);
@@ -234,38 +246,115 @@ fn a_bonded_phone_is_shown_and_can_be_refused_at_once() {
     // The first phone in range bonds; glassd closes the mode itself.
     a.companion_changed(state(true, "Pixel 8", 0));
     assert_eq!(a.overlay(), Some(OverlayKind::Menu { index: 0 }));
-    assert_eq!(a.menu_labels(), vec!["Paired with Pixel 8", "Not my phone"]);
+    assert_eq!(a.menu_labels(), QUESTION);
+    assert_eq!(a.bond_question(), Some("Pixel 8"));
     assert_eq!(
         a.take_requests(),
-        vec![Request::KeepScreenOn(false)],
-        "the mode is not closed again"
+        vec![hold_question()],
+        "the screen stays held for the answer, and the mode is not closed again"
     );
     assert_eq!(card_subtitle(&a, ids::PHONE), "Paired with Pixel 8");
+    // A reflex tap on the name answers nothing: the question is asked again.
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.menu_labels(), QUESTION);
+    assert_eq!(a.bond_question(), Some("Pixel 8"));
+    a.take_requests();
+    g(&mut a, GestureKind::SwipeForward);
     g(&mut a, GestureKind::SwipeForward);
     g(&mut a, GestureKind::Tap);
-    assert_eq!(a.take_requests(), vec![Request::ForgetBond]);
+    assert_eq!(
+        a.take_requests(),
+        vec![Request::KeepScreenOn(false), Request::ForgetBond]
+    );
     assert_eq!(a.overlay(), None);
+    assert_eq!(a.bond_question(), None);
     a.companion_changed(state(false, "", 0));
     assert_eq!(card_subtitle(&a, ids::PHONE), "Tap to pair");
 }
 
 #[test]
-fn keeping_the_bonded_phone_sends_nothing() {
+fn keeping_the_bonded_phone_sends_nothing_but_the_release() {
     let (mut a, _) = app_with(radios(true, false));
     goto(&mut a, ids::PHONE);
     g(&mut a, GestureKind::Tap);
     g(&mut a, GestureKind::Tap);
     a.companion_changed(state(true, "Pixel 8", 0));
     a.take_requests();
+    g(&mut a, GestureKind::SwipeForward);
     g(&mut a, GestureKind::Tap);
     assert_eq!(a.overlay(), None);
-    assert!(a.take_requests().is_empty());
+    assert_eq!(a.bond_question(), None);
+    assert_eq!(a.take_requests(), vec![Request::KeepScreenOn(false)]);
+    // Nothing comes back at the next wake.
+    a.screen_off();
+    a.screen_wake(false);
+    assert_eq!(a.overlay(), None);
+}
+
+#[test]
+fn any_bond_is_questioned_whatever_is_on_screen() {
+    // A bond with no pairing screen (a QR dial, or a swipe down racing the bond), over a menu.
+    let (mut a, _) = app_with(radios(true, false));
+    goto(&mut a, ids::NUDGE);
+    g(&mut a, GestureKind::Tap);
+    assert!(matches!(a.overlay(), Some(OverlayKind::Menu { .. })));
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.menu_labels(), QUESTION);
+    assert_eq!(a.take_requests(), vec![hold_question()]);
+
+    // A bond made while the launcher was away from glassd shows on the snapshot after it.
+    let (mut a, _) = app_with(radios(true, false));
+    a.glassd_disconnected();
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.menu_labels(), QUESTION);
+
+    // So does another phone bonded meanwhile in place of the one seen.
+    let (mut a, _) = app_bonded(radios(true, false), Some("Pixel 8"));
+    assert_eq!(
+        a.overlay(),
+        None,
+        "the bond known at start is not questioned"
+    );
+    a.glassd_disconnected();
+    a.companion_changed(state(true, "Moto G", 0));
+    assert_eq!(a.bond_question(), Some("Moto G"));
+}
+
+#[test]
+fn an_unanswered_question_comes_back_at_the_next_wake() {
+    let (mut a, _) = app_with(radios(true, false));
+    a.companion_changed(state(true, "Pixel 8", 0));
+    a.take_requests();
+    // The hold times out and the screen goes off: the stranger is not kept silently.
+    a.screen_off();
+    assert_eq!(a.overlay(), None);
+    assert_eq!(a.take_requests(), vec![Request::KeepScreenOn(false)]);
+    a.screen_wake(true);
+    assert_eq!(a.menu_labels(), QUESTION);
+    assert_eq!(a.take_requests(), vec![hold_question()]);
+    // Swiped away, it comes back too.
+    g(&mut a, GestureKind::SwipeDown);
+    assert_eq!(a.overlay(), None);
+    a.screen_off();
+    a.screen_wake(false);
+    assert_eq!(a.menu_labels(), QUESTION);
+    // With the screen off when the phone bonds, the hold wakes it, and the question shows then.
+    let (mut a, _) = app_with(radios(true, false));
+    a.screen_off();
+    a.companion_changed(state(true, "Pixel 8", 0));
+    assert_eq!(a.take_requests(), vec![hold_question()]);
+    assert_eq!(a.overlay(), None);
+    a.screen_wake(false);
+    assert_eq!(a.menu_labels(), QUESTION);
+    // Forgotten by someone else meanwhile: nothing left to ask.
+    a.companion_changed(state(false, "", 0));
+    assert_eq!(a.overlay(), None);
+    assert_eq!(a.bond_question(), None);
 }
 
 #[test]
 fn forgetting_asks_first_and_cancel_is_the_default() {
-    let (mut a, _) = app_with(radios(true, false));
-    a.companion_changed(state(true, "Pixel 8", 0));
+    let (mut a, _) = app_bonded(radios(true, false), Some("Pixel 8"));
     goto(&mut a, ids::PHONE);
     assert_eq!(card_subtitle(&a, ids::PHONE), "Paired with Pixel 8");
     g(&mut a, GestureKind::Tap);
@@ -288,13 +377,99 @@ fn forgetting_asks_first_and_cancel_is_the_default() {
 }
 
 #[test]
+fn a_failed_forget_is_shown() {
+    let (mut a, _) = app_with(radios(true, false));
+    a.companion_changed(state(true, "Pixel 8", 0));
+    g(&mut a, GestureKind::SwipeForward);
+    g(&mut a, GestureKind::SwipeForward);
+    g(&mut a, GestureKind::Tap); // "Not my phone"
+    a.take_requests();
+    a.pairing_refused(
+        PairRequest::Forget,
+        ErrorCode::Unavailable,
+        "the bond is still on disk: EIO",
+    );
+    assert_eq!(a.overlay(), Some(OverlayKind::Pairing));
+    match a.pairing_screen() {
+        Some(CardContent::Info { title, lines }) => {
+            assert_eq!(title, "Phone not forgotten");
+            assert_eq!(lines[0], "The pairing could not be erased");
+        }
+        other => panic!("{other:?}"),
+    }
+    g(&mut a, GestureKind::Tap);
+    assert_eq!(a.overlay(), None);
+    assert!(a.take_requests().is_empty(), "nothing was open");
+    assert_eq!(card_subtitle(&a, ids::PHONE), "Paired with Pixel 8");
+}
+
+#[test]
+fn each_refusal_of_an_opening_says_why() {
+    for (code, message, line) in [
+        (
+            ErrorCode::Unavailable,
+            "already bonded: forget the bond first",
+            "A phone is already paired",
+        ),
+        (
+            ErrorCode::Unavailable,
+            "the companion link is disabled",
+            "The phone link is disabled",
+        ),
+        (
+            ErrorCode::Denied,
+            "",
+            "The launcher is not allowed to do this",
+        ),
+    ] {
+        let (mut a, _) = app_with(radios(true, false));
+        goto(&mut a, ids::PHONE);
+        g(&mut a, GestureKind::Tap);
+        g(&mut a, GestureKind::Tap);
+        a.pairing_refused(PairRequest::Open, code, message);
+        assert_eq!(screen_lines(&a)[0], line);
+        assert_eq!(card_subtitle(&a, ids::PHONE), "Tap to pair", "not disabled");
+    }
+}
+
+#[test]
+fn a_mode_open_with_no_screen_is_closed() {
+    // The screen closed while glassd was out of reach: the close was lost with the connection.
+    let (mut a, _) = app_with(radios(true, false));
+    goto(&mut a, ids::PHONE);
+    g(&mut a, GestureKind::Tap);
+    g(&mut a, GestureKind::Tap);
+    a.glassd_disconnected();
+    assert!(a.take_requests().is_empty());
+    // The same glassd answers again, the mode still open.
+    let open = state(false, "", START_US + 50_000_000);
+    a.companion_changed(open.clone());
+    assert_eq!(a.take_requests(), vec![CLOSE]);
+    // Once is enough for that opening.
+    a.companion_changed(open);
+    assert!(a.take_requests().is_empty());
+}
+
+#[test]
+fn losing_the_focus_closes_the_pairing_screen_and_the_mode() {
+    let (mut a, _) = app_with(radios(true, false));
+    goto(&mut a, ids::PHONE);
+    g(&mut a, GestureKind::Tap);
+    g(&mut a, GestureKind::Tap);
+    a.take_requests();
+    a.focus_lost();
+    assert_eq!(a.overlay(), None);
+    assert_eq!(a.take_requests(), vec![CLOSE, Request::KeepScreenOn(false)]);
+}
+
+#[test]
 fn a_glassd_without_the_pairing_mode_disables_the_card() {
     let (mut a, _) = app_with(radios(true, false));
     goto(&mut a, ids::PHONE);
     g(&mut a, GestureKind::Tap);
     g(&mut a, GestureKind::Tap);
     a.take_requests();
-    a.pairing_refused(ErrorCode::Unsupported);
+    a.pairing_refused(PairRequest::Open, ErrorCode::Unsupported, "");
     assert_eq!(screen_lines(&a)[0], "Not available on this Glass");
     assert_eq!(a.take_requests(), vec![Request::KeepScreenOn(false)]);
     g(&mut a, GestureKind::Tap);
@@ -352,9 +527,18 @@ fn the_texts_fit_in_every_language() {
         screens.push(p.card(locale, 0));
         p.tick(100_000_000);
         screens.push(p.card(locale, 0));
-        let mut p = Pairing::new();
-        p.refused(Refusal::AlreadyPaired);
-        screens.push(p.card(locale, 0));
+        for r in [
+            Refusal::Unsupported,
+            Refusal::Denied,
+            Refusal::AlreadyPaired,
+            Refusal::LinkDisabled,
+            Refusal::NotErased,
+            Refusal::Other,
+        ] {
+            for req in [PairRequest::Open, PairRequest::Forget] {
+                screens.push(Pairing::failed(req, r).card(locale, 0));
+            }
+        }
         let items = settings::forget_question(locale)
             .into_iter()
             .chain(settings::paired_question(locale, "Galaxy S24 Ultra"));
@@ -410,13 +594,14 @@ fn next_frame<R>(
     }
 }
 
-#[test]
-fn the_requests_go_to_glassd_and_an_unsupported_answer_disables_the_card() {
+/// The launcher on the mock glassd, with the phone card (the mock has no companion-link: it
+/// stands in for a Model B glassd here, and answers the pairing requests as one without the
+/// phone link does, `ERROR_CODE_UNSUPPORTED`) and Bluetooth on.
+fn on_mock() -> (MockService, Session, App) {
     let m = MockService::start().unwrap();
     let (mut a, _) = app_with(radios(true, false));
     let mut s = Session::connect(m.path()).unwrap();
     pump_until(&mut s, &mut a, |a| a.settings().is_some());
-    // The mock has no companion-link; stand in for a Model B glassd.
     a.set_service(Some(service(&["companion-link"])));
     let mut on = settings::settings_defaults();
     on.bluetooth_enabled = Some(true);
@@ -424,12 +609,18 @@ fn the_requests_go_to_glassd_and_an_unsupported_answer_disables_the_card() {
     pump_until(&mut s, &mut a, |a| {
         a.settings().and_then(|s| s.bluetooth_enabled) == Some(true)
     });
-    goto(&mut a, ids::PHONE);
     while m.next_client_frame(Duration::from_millis(50)).is_some() {}
+    (m, s, a)
+}
+
+#[test]
+fn opening_goes_to_glassd_and_its_unsupported_answer_disables_the_card() {
+    let (m, mut s, mut a) = on_mock();
+    goto(&mut a, ids::PHONE);
     m.publish_body(tap()); // the menu
     pump_until(&mut s, &mut a, |a| a.overlay().is_some());
     m.publish_body(tap()); // "Start pairing"
-    let (client, seq, w) = next_frame(&m, &mut s, &mut a, |b| match b {
+    let (_, _, w) = next_frame(&m, &mut s, &mut a, |b| match b {
         client_frame::Body::CompanionPairingWindow(w) => Some(*w),
         _ => None,
     });
@@ -441,29 +632,7 @@ fn the_requests_go_to_glassd_and_an_unsupported_answer_disables_the_card() {
     });
     assert_eq!(keep.action, screen_request::Action::KeepOn as i32);
     assert_eq!(keep.duration_ms, pairing::KEEP_ON_MS);
-
-    // glassd shows it open on TOPIC_COMPANION.
-    m.publish_body(Body::CompanionState(CompanionState {
-        pairing_until_us: START_US + 90_000_000,
-        ..Default::default()
-    }));
-    pump_until(&mut s, &mut a, |a| {
-        a.pairing_screen().is_some_and(|c| {
-            matches!(c, CardContent::Info { lines, .. } if lines.len() == 3 && lines[1] == "1:30 left")
-        })
-    });
-
-    // A glassd without the feature answers the request (matched by seq).
-    m.send_to(
-        client,
-        ServiceFrame {
-            body: Some(Body::Error(ServiceError {
-                code: ErrorCode::Unsupported as i32,
-                message: "unknown request".into(),
-                seq,
-            })),
-        },
-    );
+    // The answer is matched to the request by seq.
     pump_until(&mut s, &mut a, |a| {
         a.pairing_screen().is_some_and(|c| {
             matches!(c, CardContent::Info { lines, .. } if lines[0] == "Not available on this Glass")
@@ -473,27 +642,52 @@ fn the_requests_go_to_glassd_and_an_unsupported_answer_disables_the_card() {
         .take_log()
         .iter()
         .any(|l| l.contains("ERROR_CODE_UNSUPPORTED")));
-
-    // Paired over another transport: the name comes with the state, and forget is sent.
+    let (_, _, release) = next_frame(&m, &mut s, &mut a, |b| match b {
+        client_frame::Body::Screen(r) => Some(*r),
+        _ => None,
+    });
+    assert_eq!(release.action, screen_request::Action::ReleaseKeepOn as i32);
     m.publish_body(tap()); // closes the refusal
     pump_until(&mut s, &mut a, |a| a.overlay().is_none());
-    a.glassd_disconnected();
-    a.set_service(Some(service(&["companion-link"])));
-    a.settings_changed(radios(true, false));
+    assert_eq!(card_subtitle(&a, ids::PHONE), "Not available on this Glass");
+}
+
+#[test]
+fn a_bond_reported_by_glassd_is_questioned_and_a_refused_forget_is_shown() {
+    let (m, mut s, mut a) = on_mock();
+    // A phone bonds (over a QR dial: no pairing screen); glassd reports it.
     m.publish_body(Body::CompanionState(CompanionState {
         paired: true,
         paired_name: "Pixel 8".into(),
         ..Default::default()
     }));
-    pump_until(&mut s, &mut a, |a| a.companion().paired);
-    assert_eq!(a.companion().paired_name, "Pixel 8");
-    a.input(&InputEvent::gesture(GestureKind::Tap)); // "Forget the phone"
-    a.input(&InputEvent::gesture(GestureKind::Tap)); // the question, on "Cancel"
-    a.input(&InputEvent::gesture(GestureKind::SwipeForward));
-    a.step(1.0, ctx());
-    a.input(&InputEvent::gesture(GestureKind::Tap)); // "Yes, forget it"
+    pump_until(&mut s, &mut a, |a| a.bond_question().is_some());
+    assert_eq!(a.menu_labels(), QUESTION);
+    let (_, _, hold) = next_frame(&m, &mut s, &mut a, |b| match b {
+        client_frame::Body::Screen(r) => Some(*r),
+        _ => None,
+    });
+    assert_eq!(hold.action, screen_request::Action::KeepOn as i32);
+    assert_eq!(hold.duration_ms, pairing::QUESTION_KEEP_ON_MS);
+    for kind in [PKind::SwipeForward, PKind::SwipeForward, PKind::Tap] {
+        m.publish_body(Body::Gesture(Gesture {
+            kind: kind as i32,
+            fingers: 1,
+            velocity: 0.0,
+            timestamp_us: 1,
+        }));
+        pump_until(&mut s, &mut a, |_| true);
+        s.pump(&mut a, Some(Duration::from_millis(50))).unwrap();
+        a.step(1.0, ctx());
+    }
     next_frame(&m, &mut s, &mut a, |b| match b {
         client_frame::Body::CompanionForgetBond(_) => Some(()),
         _ => None,
+    });
+    // The mock cannot forget (no phone link): the owner is told the phone is still bonded.
+    pump_until(&mut s, &mut a, |a| {
+        a.pairing_screen().is_some_and(
+            |c| matches!(c, CardContent::Info { title, .. } if title == "Phone not forgotten"),
+        )
     });
 }
