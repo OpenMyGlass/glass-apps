@@ -23,8 +23,8 @@ minifb = "0.29"
 khronos-egl = { version = "6", features = ["dynamic"] }
 glow = "0.17"
 libloading = "0.8"
-# glassd client, types and in-process mock (glass-services, pinned to a main commit: the pairing mode, PR #41).
-glass-api = { git = "https://github.com/OpenMyGlass/glass-services", rev = "bdbbd221bde0b520da3ed4aaa98767428dec7f13" }
+# glassd client, types and in-process mock (glass-services, pinned to a main commit: the pairing mode, PRs #41 and #43).
+glass-api = { git = "https://github.com/OpenMyGlass/glass-services", rev = "cb795037c2104910140a46c297aea0d1a2865e60" }
 glass-gfx = { path = "crates/glass-gfx" }
 glass-gfx-gles = { path = "crates/glass-gfx-gles" }
 glass-ui = { path = "crates/glass-ui" }
